@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The interactive terminal front-end: a crossterm raw-mode loop driving the editor and an
-//! optional integrated terminal.
+//! optional integrated terminal panel.
 //!
 //! This is the only place that touches the real terminal. It enables raw mode + the alternate
 //! screen (restored on drop, even on panic), reads crossterm events, and routes them through
-//! an [`App`] that holds the [`Editor`] and a lazily-spawned [`PtyTerminal`]. `F12` toggles
-//! focus between editing and a full-screen shell; while the terminal is focused, keys are
-//! encoded to bytes and written to the PTY. Each frame is presented through a Penumbra
+//! an [`App`] that holds the [`Editor`] and a lazily-spawned [`PtyTerminal`]. The screen is laid
+//! out per `UI.md`: the editor area on top, a labelled **terminal panel** docked along the
+//! bottom (a tabbed divider in Steel Blue), and a one-row global status bar beneath it. `F12`
+//! spawns/toggles focus between the editor and the terminal panel; while the panel is focused,
+//! keys are encoded to bytes and written to the PTY. Each frame is presented through a Penumbra
 //! [`Screen`]. The editor model itself is backend-agnostic and tested headless.
 
 use std::io::{self, Write};
@@ -25,10 +27,16 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use keymaker::{KeyCode, KeyPress, Mods};
 use majestic_core::Editor;
 use majestic_term::PtyTerminal;
-use penumbra::{Buffer, Screen, Theme};
+use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
-/// The `F12` key toggles the integrated terminal (reassignable once the Architect lands at M3).
+/// The `F12` key spawns/toggles the integrated terminal (reassignable once the Architect lands at M3).
 const TERMINAL_TOGGLE: KeyCode = KeyCode::Function(12);
+
+/// Default height of the bottom terminal panel in rows (UI.md §5: 8–15, resizable later).
+const PANEL_ROWS: u16 = 10;
+
+/// Editor rows kept visible above the panel; below this total the panel is hidden.
+const MIN_EDITOR_ROWS: u16 = 3;
 
 /// Restores the terminal (cooked mode, main screen, visible cursor) when dropped.
 struct TerminalGuard;
@@ -81,19 +89,19 @@ impl App {
         }
     }
 
-    /// The terminal is "active" while focused and present.
-    fn terminal_active(&self) -> bool {
-        self.focus == Focus::Terminal && self.terminal.is_some()
+    /// `true` while a live shell exists (so the loop polls quickly for its output).
+    fn terminal_running(&self) -> bool {
+        self.terminal.as_ref().is_some_and(PtyTerminal::is_running)
     }
 
-    /// Returns to the editor if the focused shell has exited.
+    /// Closes the panel and returns to the editor once the shell has exited.
     fn reap_dead_terminal(&mut self) {
-        if self.focus == Focus::Terminal
-            && self
-                .terminal
-                .as_ref()
-                .is_some_and(|term| !term.is_running())
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|term| !term.is_running())
         {
+            self.terminal = None;
             self.focus = Focus::Editor;
         }
     }
@@ -102,20 +110,58 @@ impl App {
         self.editor.should_quit()
     }
 
+    /// Draws the editor area, the bottom terminal panel (when present), and the status bar.
     fn render(&mut self, surface: &mut Buffer, theme: &Theme) {
-        if self.focus == Focus::Terminal {
-            if let Some(term) = &self.terminal {
-                surface.clear(theme.base_style());
-                term.render(surface, theme);
-                return;
+        surface.clear(theme.base_style());
+        let (body, status) = surface.area().split_bottom(1);
+
+        if self.terminal.is_some() && body.height > MIN_EDITOR_ROWS + 1 {
+            let panel_rows = PANEL_ROWS.min(body.height - (MIN_EDITOR_ROWS + 1));
+            let (editor_area, block) = body.split_bottom(panel_rows + 1);
+            let (divider, panel_area) = block.split_top(1);
+
+            // Keep the shell sized to its panel so its grid matches what we draw.
+            if let Some(term) = self.terminal.as_mut() {
+                if term.columns() != usize::from(panel_area.width)
+                    || term.screen_lines() != usize::from(panel_area.height)
+                {
+                    term.resize(
+                        usize::from(panel_area.width),
+                        usize::from(panel_area.height),
+                    );
+                }
             }
+
+            self.editor
+                .render_in(surface, editor_area, theme, self.focus == Focus::Editor);
+            draw_panel_tab(surface, divider, theme, self.focus == Focus::Terminal);
+            if let Some(term) = self.terminal.as_ref() {
+                term.render_in(surface, panel_area, theme);
+            }
+        } else {
+            self.editor.render_in(surface, body, theme, true);
         }
-        self.editor.render(surface, theme);
+
+        self.draw_status_bar(surface, status.y, theme);
     }
 
-    fn resize(&mut self, columns: u16, lines: u16) {
-        if let Some(term) = self.terminal.as_mut() {
-            term.resize(usize::from(columns), usize::from(lines));
+    /// Draws the global status bar: the editor's status line plus a focus/terminal hint.
+    fn draw_status_bar(&self, surface: &mut Buffer, row: u16, theme: &Theme) {
+        let style = Style::new(theme.background, theme.accent);
+        for x in 0..surface.width() {
+            surface.set_char(x, row, ' ', style);
+        }
+        surface.set_str(0, row, &self.editor.status_line(), style);
+
+        let hint = match (self.terminal.is_some(), self.focus) {
+            (false, _) => "[F12: terminal]",
+            (true, Focus::Editor) => "[F12: ⇄ TERMINAL]",
+            (true, Focus::Terminal) => "[F12: ⇄ EDITOR]",
+        };
+        if let Ok(len) = u16::try_from(hint.chars().count()) {
+            if len < surface.width() {
+                surface.set_str(surface.width() - len - 1, row, hint, style);
+            }
         }
     }
 
@@ -148,21 +194,42 @@ impl App {
         Ok(())
     }
 
+    /// `F12`: spawn the shell on first use (focusing it), otherwise flip focus between the
+    /// editor and the (still-running) terminal panel — the shell session survives toggling.
     fn toggle_terminal(&mut self, columns: u16, lines: u16) {
-        match self.focus {
-            Focus::Terminal => self.focus = Focus::Editor,
-            Focus::Editor => {
-                let alive = self.terminal.as_ref().is_some_and(PtyTerminal::is_running);
-                if !alive {
-                    self.terminal =
-                        PtyTerminal::spawn(usize::from(columns), usize::from(lines)).ok();
-                }
-                if self.terminal.is_some() {
-                    self.focus = Focus::Terminal;
-                }
-            }
+        if self.terminal_running() {
+            self.focus = match self.focus {
+                Focus::Editor => Focus::Terminal,
+                Focus::Terminal => Focus::Editor,
+            };
+            return;
         }
+        // No live shell: (re)spawn one and focus the panel. It is resized to the panel on render.
+        self.terminal = PtyTerminal::spawn(usize::from(columns), usize::from(lines)).ok();
+        self.focus = if self.terminal.is_some() {
+            Focus::Terminal
+        } else {
+            Focus::Editor
+        };
     }
+}
+
+/// Draws the terminal panel's tabbed divider row: a Steel Blue rule with a `TERMINAL` tab,
+/// highlighted (reverse) when the panel holds focus (UI.md §5 bottom-panel tab bar).
+fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let rule = Style::new(theme.accent, theme.background); // Steel Blue box-drawing on Void Navy
+    for x in area.x..area.right() {
+        surface.set_char(x, area.y, '─', rule);
+    }
+    let label_style = if focused {
+        Style::new(theme.background, theme.accent) // active tab: Void Navy on Steel Blue
+    } else {
+        rule
+    };
+    surface.set_str(area.x.saturating_add(1), area.y, " TERMINAL ", label_style);
 }
 
 /// Runs the editor + terminal interactive loop until a quit command is issued.
@@ -183,8 +250,9 @@ pub(crate) fn run(editor: Editor) -> io::Result<()> {
         screen.present(&mut out)?;
         out.flush()?;
 
-        // Poll quickly while a terminal streams output; idle longer when only editing.
-        let timeout = if app.terminal_active() {
+        // Poll quickly while a shell streams output (even when the editor is focused); idle
+        // longer when only editing.
+        let timeout = if app.terminal_running() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(200)
@@ -199,7 +267,7 @@ pub(crate) fn run(editor: Editor) -> io::Result<()> {
                 }
                 Event::Resize(columns, lines) => {
                     screen.resize(columns, lines, theme.base_style());
-                    app.resize(columns, lines);
+                    // The terminal is re-sized to its panel on the next render.
                 }
                 Event::Paste(text) => app.paste(&text)?,
                 _ => {}
@@ -303,8 +371,38 @@ fn push_char(out: &mut Vec<u8>, c: char) {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_key, TERMINAL_TOGGLE};
+    use super::{encode_key, App, TERMINAL_TOGGLE};
     use keymaker::{KeyCode, KeyPress, Mods};
+    use majestic_core::Editor;
+    use penumbra::{Buffer, Theme};
+
+    #[test]
+    fn renders_editor_body_with_a_global_status_bar() {
+        // With no terminal, the editor fills the body and a status bar occupies the last row,
+        // drawn in the Steelbore accent (Steel Blue) background.
+        let theme = Theme::steelbore();
+        let mut editor = Editor::new();
+        editor.handle_key(KeyPress::char('h'));
+        editor.handle_key(KeyPress::char('i'));
+
+        let mut app = App::new(editor);
+        let mut surface = Buffer::new(24, 5, theme.base_style());
+        app.render(&mut surface, &theme);
+
+        // Editor content is drawn at the top-left of the body.
+        assert_eq!(surface.cell(0, 0).unwrap().symbol, 'h');
+        assert_eq!(surface.cell(1, 0).unwrap().symbol, 'i');
+        // The bottom row is the status bar: accent background, end-anchored F12 hint present.
+        let status_row = surface.height() - 1;
+        assert_eq!(surface.cell(0, status_row).unwrap().style.bg, theme.accent);
+        let tail: String = (0..surface.width())
+            .filter_map(|x| surface.cell(x, status_row).map(|c| c.symbol))
+            .collect();
+        assert!(
+            tail.contains("F12"),
+            "status bar shows the terminal hint: {tail:?}"
+        );
+    }
 
     #[test]
     fn printable_keys_encode_to_utf8() {

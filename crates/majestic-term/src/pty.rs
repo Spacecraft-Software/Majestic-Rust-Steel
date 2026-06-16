@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, Options, Shell};
-use penumbra::{Buffer, Theme};
+use penumbra::{Buffer, Rect, Theme};
 
 use crate::terminal::Terminal;
 
@@ -105,6 +105,11 @@ impl PtyTerminal {
     /// Renders the live terminal grid into `surface`.
     pub fn render(&self, surface: &mut Buffer, theme: &Theme) {
         lock(&self.terminal).render(surface, theme);
+    }
+
+    /// Renders the live terminal grid into `area` of `surface` (offset and clipped to it).
+    pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme) {
+        lock(&self.terminal).render_in(surface, area, theme);
     }
 
     /// Returns `true` while the child program is still running.

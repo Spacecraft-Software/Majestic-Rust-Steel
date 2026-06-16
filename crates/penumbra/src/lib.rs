@@ -38,11 +38,14 @@
 //! one column wide for now; `unicode-width` double-width/grapheme handling lands with it.
 
 mod buffer;
+mod layout;
 mod render;
 mod theme;
 
 #[doc(inline)]
 pub use buffer::{Buffer, Cell};
+#[doc(inline)]
+pub use layout::Rect;
 #[doc(inline)]
 pub use render::{render, Screen};
 #[doc(inline)]

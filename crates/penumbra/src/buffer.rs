@@ -11,6 +11,7 @@
 //! Cells are one column wide in this M0 core (ASCII, box-drawing, and BMP-narrow text);
 //! double-width/grapheme handling is layered on with `unicode-width`/`unicode-segmentation`.
 
+use crate::layout::Rect;
 use crate::theme::Style;
 
 /// A single screen cell: a character and its [`Style`].
@@ -82,6 +83,22 @@ impl Buffer {
         let blank = Cell::blank(fill);
         for cell in &mut self.cells {
             cell.clone_from(&blank);
+        }
+    }
+
+    /// The whole buffer as a [`Rect`] (origin `(0, 0)`).
+    #[must_use]
+    pub const fn area(&self) -> Rect {
+        Rect::new(0, 0, self.width, self.height)
+    }
+
+    /// Fills `rect`'s cells with blanks in `fill` (clipped to the buffer).
+    pub fn fill(&mut self, rect: Rect, fill: Style) {
+        let blank = Cell::blank(fill);
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                self.set(x, y, blank.clone());
+            }
         }
     }
 

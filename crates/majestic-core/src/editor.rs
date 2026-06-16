@@ -10,7 +10,7 @@
 //! The interactive `crossterm` loop and the `mj FILE` binary wire this up in M0 step 7.
 
 use keymaker::{cua, Dispatcher, KeyCode, Mods, Resolution};
-use penumbra::{Buffer as Surface, Cell, Style, Theme};
+use penumbra::{Buffer as Surface, Cell, Rect, Style, Theme};
 
 use stratum::{Point, SpanLayer};
 
@@ -171,21 +171,36 @@ impl Editor {
         }
     }
 
-    /// Draws the buffer, cursor, and status line into `surface`.
+    /// Draws the buffer and cursor over the whole `surface`, with a status line on the last row.
+    ///
+    /// This is the standalone full-screen path; [`Editor::render_in`] draws into a sub-region
+    /// (e.g. above an integrated terminal panel) without claiming a status row.
     pub fn render(&mut self, surface: &mut Surface, theme: &Theme) {
-        let (width, height) = (surface.width(), surface.height());
-        if width == 0 || height == 0 {
+        let height = surface.height();
+        if surface.width() == 0 || height == 0 {
             return;
         }
-        let text_rows = height.saturating_sub(1);
-        self.page_rows = usize::from(text_rows).max(1);
+        let (content, status) = surface.area().split_bottom(1);
+        self.render_in(surface, content, theme, true);
+        self.draw_status(surface, theme, status.y);
+    }
+
+    /// Draws the buffer within `area`, optionally drawing the cursor (when this pane is focused).
+    ///
+    /// Writes are offset to `area`'s origin and clipped to its extent, so the editor can occupy
+    /// any sub-rectangle of the screen. No status line is drawn — the host composes that.
+    pub fn render_in(&mut self, surface: &mut Surface, area: Rect, theme: &Theme, focused: bool) {
+        if area.is_empty() {
+            return;
+        }
+        self.page_rows = usize::from(area.height).max(1);
         self.refresh_highlights();
-        self.ensure_cursor_visible(text_rows);
-        surface.clear(theme.base_style());
+        self.ensure_cursor_visible(area.height);
+        surface.fill(area, theme.base_style());
 
         let base = theme.base_style();
         let rope = self.buffer.rope();
-        for row in 0..text_rows {
+        for row in 0..area.height {
             let line_index = self.viewport_top + usize::from(row);
             if line_index >= rope.len_lines() {
                 break;
@@ -195,16 +210,22 @@ impl Editor {
                 let Ok(col) = u16::try_from(index) else {
                     break;
                 };
-                if col >= width {
+                if col >= area.width {
                     break;
                 }
-                surface.set_char(col, row, ch, self.style_at(byte, base, theme));
+                surface.set_char(
+                    area.x + col,
+                    area.y + row,
+                    ch,
+                    self.style_at(byte, base, theme),
+                );
                 byte += ch.len_utf8();
             }
         }
 
-        self.draw_cursor(surface, theme, text_rows);
-        self.draw_status(surface, theme, height - 1);
+        if focused {
+            self.draw_cursor(surface, theme, area);
+        }
     }
 
     /// Re-runs the highlighter when the buffer has changed since the last highlight.
@@ -243,7 +264,7 @@ impl Editor {
         }
     }
 
-    fn draw_cursor(&self, surface: &mut Surface, theme: &Theme, text_rows: u16) {
+    fn draw_cursor(&self, surface: &mut Surface, theme: &Theme, area: Rect) {
         let row = self.buffer.cursor_point().row;
         if row < self.viewport_top {
             return;
@@ -253,17 +274,23 @@ impl Editor {
         let (Ok(cx), Ok(cy)) = (u16::try_from(column), u16::try_from(screen_row)) else {
             return;
         };
-        if cy >= text_rows || cx >= surface.width() {
+        if cy >= area.height || cx >= area.width {
             return;
         }
+        let (x, y) = (area.x + cx, area.y + cy);
         let (symbol, mut style) = surface
-            .cell(cx, cy)
+            .cell(x, y)
             .map_or((' ', theme.base_style()), |cell| (cell.symbol, cell.style));
         style.attrs.reverse = true;
-        surface.set(cx, cy, Cell::new(symbol, style));
+        surface.set(x, y, Cell::new(symbol, style));
     }
 
-    fn draw_status(&self, surface: &mut Surface, theme: &Theme, row: u16) {
+    /// The status-line text: file name, dirty marker, cursor position, and last status message.
+    ///
+    /// The host composes this into its status bar (the standalone [`Editor::render`] draws it on
+    /// the bottom row; the `mj` app folds it into a global status bar alongside a focus hint).
+    #[must_use]
+    pub fn status_line(&self) -> String {
         let point = self.buffer.cursor_point();
         let name = self
             .buffer
@@ -272,12 +299,16 @@ impl Editor {
             .and_then(|name| name.to_str())
             .unwrap_or("[scratch]");
         let dirty = if self.buffer.is_dirty() { " *" } else { "" };
-        let line = format!(
+        format!(
             " {name}{dirty}   Ln {}, Col {}   {}",
             point.row + 1,
             self.buffer.cursor_column() + 1,
             self.status,
-        );
+        )
+    }
+
+    fn draw_status(&self, surface: &mut Surface, theme: &Theme, row: u16) {
+        let line = self.status_line();
         let style = Style::new(theme.background, theme.accent);
         for x in 0..surface.width() {
             surface.set_char(x, row, ' ', style);

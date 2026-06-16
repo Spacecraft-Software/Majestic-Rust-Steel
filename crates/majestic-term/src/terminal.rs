@@ -16,7 +16,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
-use penumbra::{Buffer, Style, Theme};
+use penumbra::{Buffer, Rect, Style, Theme};
 
 use crate::color::resolve;
 
@@ -112,6 +112,14 @@ impl Terminal {
 
     /// Renders the visible grid into `surface` using `theme` for default colors.
     pub fn render(&self, surface: &mut Buffer, theme: &Theme) {
+        self.render_in(surface, surface.area(), theme);
+    }
+
+    /// Renders the visible grid into `area` of `surface`, offsetting and clipping to it.
+    ///
+    /// Cells outside `area` (the grid is wider/taller than the panel) are clipped; the host is
+    /// expected to keep the terminal sized to the panel via [`Terminal::resize`].
+    pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme) {
         for indexed in self.term.grid().display_iter() {
             let cell = indexed.cell;
             let (Ok(row), Ok(col)) = (
@@ -120,7 +128,7 @@ impl Terminal {
             ) else {
                 continue;
             };
-            if row >= surface.height() || col >= surface.width() {
+            if row >= area.height || col >= area.width {
                 continue;
             }
 
@@ -131,7 +139,7 @@ impl Terminal {
             style.attrs.reverse = cell.flags.contains(Flags::INVERSE);
 
             let symbol = if cell.c == '\0' { ' ' } else { cell.c };
-            surface.set_char(col, row, symbol, style);
+            surface.set_char(area.x + col, area.y + row, symbol, style);
         }
     }
 }
