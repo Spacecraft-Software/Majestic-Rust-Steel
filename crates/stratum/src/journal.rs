@@ -161,6 +161,29 @@ impl Journal {
         let (base_len, ops) = read_all(&mut file)?;
         Ok(Recovered { base_len, ops })
     }
+
+    /// Opens an existing journal to append further records (e.g. after recovery), keeping
+    /// its base content unchanged so the records already on disk stay valid.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be opened or does not begin with a valid header.
+    pub fn open_append(path: &Path) -> io::Result<Self> {
+        let mut header = [0u8; 8];
+        File::open(path)?.read_exact(&mut header)?;
+        if &header != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a Majestic journal",
+            ));
+        }
+        let file = OpenOptions::new().append(true).open(path)?;
+        Ok(Self {
+            file,
+            policy: FlushPolicy::default(),
+            ops_since_sync: 0,
+            last_sync: Instant::now(),
+        })
+    }
 }
 
 /// Replays `ops` onto `base`, returning the reconstructed rope.

@@ -14,6 +14,10 @@
 
 use std::process::ExitCode;
 
+use majestic_core::{Buffer, Editor};
+
+mod tui;
+
 /// Canonical program name (GNU `--version` discipline: a constant, never `argv[0]`).
 const PROGRAM: &str = "mj";
 
@@ -105,24 +109,35 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        Action::Empty => {
-            eprintln!("{PROGRAM}: interactive editor not yet implemented (M0 in progress).");
-            eprintln!("Try `{PROGRAM} --help`.");
-            ExitCode::FAILURE
-        }
-        Action::Open(paths) => {
-            eprintln!(
-                "{PROGRAM}: opening files is not yet implemented (M0 in progress): {}",
-                paths.join(", ")
-            );
-            ExitCode::FAILURE
-        }
+        Action::Empty => run_editor(None),
+        Action::Open(paths) => run_editor(paths.first().map(String::as_str)),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
         }
         Action::Unknown(opt) => {
             eprintln!("{PROGRAM}: unknown option `{opt}`. Try `{PROGRAM} --help`.");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Opens `path` (or a scratch buffer when `None`) and runs the interactive editor.
+fn run_editor(path: Option<&str>) -> ExitCode {
+    let editor = match path {
+        Some(path) => match Buffer::open(path) {
+            Ok(buffer) => Editor::with_buffer(buffer),
+            Err(error) => {
+                eprintln!("{PROGRAM}: cannot open {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => Editor::new(),
+    };
+    match tui::run(editor) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{PROGRAM}: terminal error: {error}");
             ExitCode::FAILURE
         }
     }

@@ -18,3 +18,9 @@ path = "src/main.rs"
 
 [lints]
 workspace = true
+
+[dependencies]
+crossterm = "0.28"
+keymaker = { version = "0.0.0", path = "../crates/keymaker" }
+majestic-core = { version = "0.0.0", path = "../crates/majestic-core" }
+penumbra = { version = "0.0.0", path = "../crates/penumbra" }

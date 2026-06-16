@@ -12,9 +12,9 @@ repository.workspace = true
 description = "Majestic core: buffers, windows, modes, commands, sessions."
 
 [dependencies]
-stratum = { path = "../stratum" }
-penumbra = { path = "../penumbra" }
-keymaker = { path = "../keymaker" }
+stratum = { version = "0.0.0", path = "../stratum" }
+penumbra = { version = "0.0.0", path = "../penumbra" }
+keymaker = { version = "0.0.0", path = "../keymaker" }
 
 [lints]
 workspace = true

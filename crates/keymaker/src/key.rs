@@ -6,7 +6,7 @@
 //! These are Majestic's own input types so the core depends on no terminal backend; the
 //! `crossterm` layer translates its `KeyEvent` into a [`KeyPress`] when it is wired in.
 
-use std::ops::BitOr;
+use std::ops::{BitOr, BitOrAssign};
 
 /// A set of modifier keys, stored as a bitset (so it is cheap, `Copy`, and orderable).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -42,6 +42,12 @@ impl BitOr for Mods {
 
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for Mods {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
     }
 }
 

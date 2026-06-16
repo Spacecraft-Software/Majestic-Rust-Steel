@@ -6,15 +6,16 @@
 //! A [`Buffer`] owns a [`stratum::UndoTree`] (whose current node is the live rope), a byte
 //! cursor kept on a `char` boundary, an optional selection anchor, and a goal column for
 //! vertical motion. Every edit goes through one path that records a new undo node and moves
-//! the cursor, so undo/redo and editing stay consistent. Crash-safe journaling and recovery
-//! are wired in with the editor loop (M0 step 7); this layer is pure in-memory + file I/O.
+//! the cursor, so undo/redo and editing stay consistent. Each edit is appended to a
+//! crash-safe journal; opening a file replays any journal a crashed session left behind
+//! (recovery), and saving checkpoints a fresh journal.
 
 use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use stratum::{Point, Rope, UndoTree};
+use stratum::{replay, EditOp, Journal, Point, Rope, UndoTree};
 
 /// An editable text document: content, cursor, selection, and undo history.
 #[derive(Debug)]
@@ -24,6 +25,9 @@ pub struct Buffer {
     selection_anchor: Option<usize>,
     goal_column: Option<usize>,
     path: Option<PathBuf>,
+    journal: Option<Journal>,
+    journal_error: Option<io::Error>,
+    recovered: bool,
     dirty: bool,
 }
 
@@ -47,6 +51,9 @@ impl Buffer {
             selection_anchor: None,
             goal_column: None,
             path,
+            journal: None,
+            journal_error: None,
+            recovered: false,
             dirty: false,
         }
     }
@@ -62,7 +69,32 @@ impl Buffer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        Ok(Self::from_rope(Rope::from(text.as_str()), Some(path)))
+        let base = Rope::from(text.as_str());
+        let base_len = base.len_bytes() as u64;
+        let jpath = journal_path(&path);
+
+        let (rope, journal, recovered) = if jpath.exists() {
+            let saved = Journal::recover(&jpath)?;
+            if saved.base_len == base_len && !saved.ops.is_empty() {
+                // A previous session left unsaved edits: replay them, keep appending.
+                (
+                    replay(&base, &saved.ops),
+                    Journal::open_append(&jpath)?,
+                    true,
+                )
+            } else {
+                // Stale or empty journal: start fresh from the file content.
+                (base, Journal::create(&jpath, base_len)?, false)
+            }
+        } else {
+            (base, Journal::create(&jpath, base_len)?, false)
+        };
+
+        let mut buffer = Self::from_rope(rope, Some(path));
+        buffer.journal = Some(journal);
+        buffer.recovered = recovered;
+        buffer.dirty = recovered; // recovered edits are unsaved
+        Ok(buffer)
     }
 
     /// Writes the buffer to its path and clears the dirty flag.
@@ -70,11 +102,18 @@ impl Buffer {
     /// # Errors
     /// Returns [`io::ErrorKind::InvalidInput`] if the buffer has no path, or any write error.
     pub fn save(&mut self) -> io::Result<()> {
-        let path = self
-            .path
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer has no path"))?;
-        fs::write(path, self.text())?;
+        let Some(path) = self.path.clone() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer has no path",
+            ));
+        };
+        fs::write(&path, self.text())?;
+        // Checkpoint: the file now holds the current content, so start a fresh journal.
+        let base_len = self.rope().len_bytes() as u64;
+        self.journal = Some(Journal::create(&journal_path(&path), base_len)?);
+        self.journal_error = None;
+        self.recovered = false;
         self.dirty = false;
         Ok(())
     }
@@ -123,6 +162,18 @@ impl Buffer {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Whether this buffer's content was recovered from a journal when opened.
+    #[must_use]
+    pub fn was_recovered(&self) -> bool {
+        self.recovered
+    }
+
+    /// The error that disabled journaling, if one occurred.
+    #[must_use]
+    pub fn journal_error(&self) -> Option<&io::Error> {
+        self.journal_error.as_ref()
     }
 
     /// The selected byte range, if a (non-empty) selection is active.
@@ -293,8 +344,16 @@ impl Buffer {
 
     fn apply_edit(&mut self, range: Range<usize>, text: &str) {
         let start = range.start;
+        let old_len = range.end - range.start;
         let (next, edit) = self.rope().edit(range, text);
         self.history.record(next, edit);
+        if let Some(journal) = self.journal.as_mut() {
+            if let Err(error) = journal.append(&EditOp::new(start, old_len, text)) {
+                // Degrade gracefully: stop journaling and keep the error to surface.
+                self.journal = None;
+                self.journal_error = Some(error);
+            }
+        }
         self.cursor = start + text.len();
         self.selection_anchor = None;
         self.goal_column = None;
@@ -352,6 +411,13 @@ impl Buffer {
             offset
         }
     }
+}
+
+/// The sidecar journal path for a document: `<path>.mjjournal`.
+fn journal_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".mjjournal");
+    PathBuf::from(name)
 }
 
 /// Returns the largest `char` boundary `<= offset` (and `<= len`).
@@ -441,12 +507,21 @@ mod tests {
         assert_eq!(buffer.text(), "hllo");
     }
 
+    /// A unique temp document path and its journal sidecar, both removed up front.
+    fn temp_doc(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("majestic-core-{tag}-{}.txt", std::process::id()));
+        let mut journal = path.clone().into_os_string();
+        journal.push(".mjjournal");
+        let journal = std::path::PathBuf::from(journal);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
+        (path, journal)
+    }
+
     #[test]
     fn open_missing_then_save_round_trip() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("majestic-core-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-
+        let (path, journal) = temp_doc("save");
         let mut buffer = Buffer::open(&path).unwrap();
         assert_eq!(buffer.text(), "");
         buffer.insert("saved content\n");
@@ -456,6 +531,98 @@ mod tests {
 
         let reopened = Buffer::open(&path).unwrap();
         assert_eq!(reopened.text(), "saved content\n");
+        assert!(!reopened.was_recovered());
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
+    }
+
+    #[test]
+    fn journal_recovers_unsaved_edits_after_crash() {
+        let (path, journal) = temp_doc("crash");
+        std::fs::write(&path, "base\n").unwrap();
+
+        // Session 1: open, edit, never save, then drop — the record is already on disk,
+        // so it survives a SIGKILL the same way (the kernel keeps written bytes).
+        let mut buffer = Buffer::open(&path).unwrap();
+        assert!(!buffer.was_recovered());
+        buffer.move_line_end(false);
+        buffer.insert("EDIT");
+        assert!(buffer.is_dirty());
+        drop(buffer); // close the journal file; the record persists on disk
+
+        // Session 2: reopen — the unsaved edit is recovered from the journal.
+        let recovered = Buffer::open(&path).unwrap();
+        assert!(recovered.was_recovered());
+        assert_eq!(recovered.text(), "baseEDIT\n");
+        // The file was never written, so on disk it still holds the original content.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "base\n");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
+    }
+
+    /// The PRD §7 exit criterion: a real `SIGKILL` mid-edit loses no journaled keystrokes.
+    ///
+    /// The test re-spawns itself as a "victim" that opens the file, edits, signals readiness,
+    /// then spins; the controller `SIGKILL`s it (via `Child::kill`) and asserts the reopened
+    /// buffer recovers the edit from the journal.
+    #[test]
+    fn cross_process_sigkill_preserves_journaled_edits() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        // Victim role (re-spawned with the env var set): edit, signal, then spin (bounded).
+        if let Ok(victim_path) = std::env::var("MJ_SIGKILL_VICTIM") {
+            let mut buffer = Buffer::open(&victim_path).unwrap();
+            buffer.move_line_end(false);
+            buffer.insert("EDITED");
+            std::fs::write(format!("{victim_path}.ready"), b"1").unwrap();
+            for _ in 0..600 {
+                std::thread::sleep(Duration::from_millis(50)); // up to 30s, then exit
+            }
+            return;
+        }
+
+        // Controller role.
+        let (path, journal) = temp_doc("sigkill");
+        std::fs::write(&path, "seed\n").unwrap();
+        let ready = {
+            let mut name = path.clone().into_os_string();
+            name.push(".ready");
+            std::path::PathBuf::from(name)
+        };
+        let _ = std::fs::remove_file(&ready);
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("cross_process_sigkill_preserves_journaled_edits")
+            .env("MJ_SIGKILL_VICTIM", &path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut signalled = false;
+        for _ in 0..500 {
+            if ready.exists() {
+                signalled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(signalled, "victim never signalled readiness");
+
+        child.kill().unwrap(); // SIGKILL on unix
+        let _ = child.wait();
+
+        let recovered = Buffer::open(&path).unwrap();
+        assert!(recovered.was_recovered(), "no recovery after SIGKILL");
+        assert!(
+            recovered.text().contains("EDITED"),
+            "edit lost across SIGKILL"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
+        let _ = std::fs::remove_file(&ready);
     }
 }
