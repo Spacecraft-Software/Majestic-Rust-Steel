@@ -30,6 +30,16 @@ designs and ideas directly informed it:
 | **xi-editor / Xile** | Front-end/back-end and snapshot-cache thinking (informs Concept #3; recorded here for the portfolio). |
 | **oh-my-pi** | Edit-format benchmark fixtures and the `str_replace`/`apply_patch` failure analysis behind the **hashline** primitive. |
 
+## Integrated dependencies (substantially built upon, §13.3)
+
+| Name | Author(s) | License | Source | Scope |
+|---|---|---|---|---|
+| `alacritty_terminal` | Alacritty contributors (Christian Dürr et al.) | Apache-2.0 | <https://github.com/alacritty/alacritty> | The VT engine and cell grid embedded by `majestic-term` (the integrated terminal) — escape parsing, the terminal grid, and scrollback. Integrated M1. |
+
+The `crossterm` crate (MIT, <https://github.com/crossterm-rs/crossterm>) provides the `mj`
+binary's terminal raw mode, input decoding, and screen control. It is a routine dependency
+surfaced mechanically via Cargo, noted here only for transparency.
+
 ## Planned upstream dependencies (itemized as each is integrated)
 
 The scaffold is dependency-free. Each crate below is added in the milestone noted, only
@@ -38,7 +48,6 @@ filled in here:
 
 | Dependency | License | Milestone | Role |
 |---|---|---|---|
-| `alacritty_terminal` | Apache-2.0 | M1 | Integrated terminal VT engine (majestic-term). |
 | Steel | Apache-2.0 / MIT | M1 | Embedded Scheme extension runtime (majestic-steel). |
 | Nickel (`nickel-lang-core`) | MIT | M1 | Manifest evaluation (majestic-config). |
 | tree-sitter (+ grammars) | MIT | M1/M2 | Incremental parsing / highlighting. |

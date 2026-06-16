@@ -13,3 +13,7 @@ description = "Majestic integrated terminal widget (wraps alacritty_terminal)."
 
 [lints]
 workspace = true
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+penumbra = { version = "0.0.0", path = "../penumbra" }
