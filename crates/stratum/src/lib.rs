@@ -31,9 +31,12 @@
 //! assert_eq!(doc.line(0), "// hi");
 //! ```
 
+mod anchor;
 mod rope;
 mod summary;
 
+#[doc(inline)]
+pub use anchor::{Anchor, Bias, Edit};
 #[doc(inline)]
 pub use rope::{Chunks, Rope};
 #[doc(inline)]

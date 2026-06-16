@@ -30,6 +30,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::anchor::Edit;
 use crate::summary::{Point, Summary};
 
 /// Maximum bytes held in a single leaf chunk before the builder splits it.
@@ -116,26 +117,42 @@ impl Rope {
 
     /// Returns a new rope with `range` (a byte range) replaced by `text`.
     ///
-    /// The original is left untouched (copy-on-write). Untouched nodes are shared.
+    /// The original is left untouched (copy-on-write); untouched nodes are shared. Use
+    /// [`Rope::edit`] instead when you also need the [`Edit`] delta to rebase anchors.
     ///
     /// # Panics
     /// Panics if `range` is out of bounds, inverted, or its endpoints do not fall on
     /// `char` boundaries — all of which are caller contract violations.
     #[must_use]
     pub fn replace(&self, range: Range<usize>, text: &str) -> Self {
+        self.edit(range, text).0
+    }
+
+    /// Like [`Rope::replace`], but also returns the [`Edit`] describing the change.
+    ///
+    /// The returned [`Edit`] lets callers carry [`Anchor`](crate::Anchor)s across the
+    /// change with [`Anchor::rebase`](crate::Anchor::rebase).
+    ///
+    /// # Panics
+    /// Panics if `range` is out of bounds, inverted, or its endpoints do not fall on
+    /// `char` boundaries.
+    #[must_use]
+    pub fn edit(&self, range: Range<usize>, text: &str) -> (Self, Edit) {
         let len = self.len_bytes();
         assert!(
             range.start <= range.end && range.end <= len,
-            "replace: range {range:?} out of bounds for rope of {len} bytes"
+            "edit: range {range:?} out of bounds for rope of {len} bytes"
         );
         self.assert_char_boundary(range.start);
         self.assert_char_boundary(range.end);
 
+        let old_len = range.end - range.start;
         let (left, rest) = split(&self.root, range.start);
-        let (_removed, right) = split(&rest, range.end - range.start);
+        let (_removed, right) = split(&rest, old_len);
         let middle = node_from_str(text);
         let root = concat(concat(left, middle), right);
-        Self { root }
+        let edit = Edit::new(range.start, old_len, text.len());
+        (Self { root }, edit)
     }
 
     /// Returns a new rope with `text` inserted at byte offset `at`.
