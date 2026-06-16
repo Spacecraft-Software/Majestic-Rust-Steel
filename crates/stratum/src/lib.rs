@@ -33,11 +33,14 @@
 
 mod anchor;
 mod rope;
+mod spans;
 mod summary;
 
 #[doc(inline)]
 pub use anchor::{Anchor, Bias, Edit};
 #[doc(inline)]
 pub use rope::{Chunks, Rope};
+#[doc(inline)]
+pub use spans::{Span, SpanLayer};
 #[doc(inline)]
 pub use summary::{Point, Summary};
