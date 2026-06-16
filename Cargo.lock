@@ -200,6 +200,7 @@ dependencies = [
  "crossterm",
  "keymaker",
  "majestic-core",
+ "majestic-term",
  "penumbra",
 ]
 
