@@ -28,14 +28,18 @@
 //! ```
 //!
 //! # Status (M1)
-//! The emulation core (feed / resize / render with color + attribute resolution) is
-//! implemented and tested headless. Spawning the user's `$SHELL` over a PTY and pumping its
-//! output into [`Terminal::feed`] on a background thread, copy mode, OSC 7 cwd tracking, and
-//! a visible cursor are the next steps. Cells are one column wide (wide-char handling lands
-//! with Penumbra's `unicode-width` support).
+//! The emulation core ([`Terminal`]: feed / resize / render with color + attribute
+//! resolution) and a live [`PtyTerminal`] (spawns `$SHELL` over a PTY, pumps its output in on
+//! a background reader thread, writes keystrokes back) are implemented and tested. Remaining:
+//! wiring the terminal into the editor's window tree, copy mode, OSC 7 cwd tracking, a visible
+//! cursor, and a `mio`/Morpheus-polled reader (the current one polls on a short sleep). Cells
+//! are one column wide (wide-char handling lands with Penumbra's `unicode-width` support).
 
 mod color;
+mod pty;
 mod terminal;
 
+#[doc(inline)]
+pub use pty::PtyTerminal;
 #[doc(inline)]
 pub use terminal::Terminal;
