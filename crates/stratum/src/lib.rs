@@ -35,6 +35,7 @@ mod anchor;
 mod rope;
 mod spans;
 mod summary;
+mod undo;
 
 #[doc(inline)]
 pub use anchor::{Anchor, Bias, Edit};
@@ -44,3 +45,5 @@ pub use rope::{Chunks, Rope};
 pub use spans::{Span, SpanLayer};
 #[doc(inline)]
 pub use summary::{Point, Summary};
+#[doc(inline)]
+pub use undo::{NodeId, NodeInfo, UndoTree};
