@@ -25,6 +25,11 @@ version = "0.0.0"
 [[package]]
 name = "majestic-core"
 version = "0.0.0"
+dependencies = [
+ "keymaker",
+ "penumbra",
+ "stratum",
+]
 
 [[package]]
 name = "majestic-steel"

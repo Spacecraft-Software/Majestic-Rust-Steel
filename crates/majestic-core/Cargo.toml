@@ -11,5 +11,10 @@ license.workspace = true
 repository.workspace = true
 description = "Majestic core: buffers, windows, modes, commands, sessions."
 
+[dependencies]
+stratum = { path = "../stratum" }
+penumbra = { path = "../penumbra" }
+keymaker = { path = "../keymaker" }
+
 [lints]
 workspace = true
