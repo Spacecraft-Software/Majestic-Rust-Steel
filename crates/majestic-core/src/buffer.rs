@@ -29,6 +29,7 @@ pub struct Buffer {
     journal_error: Option<io::Error>,
     recovered: bool,
     dirty: bool,
+    revision: u64,
 }
 
 impl Buffer {
@@ -55,6 +56,7 @@ impl Buffer {
             journal_error: None,
             recovered: false,
             dirty: false,
+            revision: 0,
         }
     }
 
@@ -162,6 +164,12 @@ impl Buffer {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// A counter that increments on every content change (for cache invalidation).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether this buffer's content was recovered from a journal when opened.
@@ -358,6 +366,7 @@ impl Buffer {
         self.selection_anchor = None;
         self.goal_column = None;
         self.dirty = true;
+        self.revision += 1;
     }
 
     fn after_history_move(&mut self) {
@@ -365,6 +374,7 @@ impl Buffer {
         self.selection_anchor = None;
         self.goal_column = None;
         self.dirty = true;
+        self.revision += 1;
     }
 
     fn start_motion(&mut self, extend: bool) {

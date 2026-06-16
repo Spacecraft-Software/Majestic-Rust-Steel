@@ -11,10 +11,19 @@ license.workspace = true
 repository.workspace = true
 description = "Majestic core: buffers, windows, modes, commands, sessions."
 
+# rustdoc does not link the native libraries that tree-sitter's build scripts produce, so
+# doctests fail to link (the unit-test harness links them fine). Examples are covered by
+# unit tests instead.
+[lib]
+doctest = false
+
 [dependencies]
 stratum = { version = "0.0.0", path = "../stratum" }
 penumbra = { version = "0.0.0", path = "../penumbra" }
 keymaker = { version = "0.0.0", path = "../keymaker" }
+tree-sitter = "0.26.9"
+tree-sitter-highlight = "0.26.9"
+tree-sitter-rust = "0.24.2"
 
 [lints]
 workspace = true

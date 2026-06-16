@@ -12,7 +12,10 @@
 use keymaker::{cua, Dispatcher, KeyCode, Mods, Resolution};
 use penumbra::{Buffer as Surface, Cell, Style, Theme};
 
+use stratum::{Point, SpanLayer};
+
 use crate::buffer::Buffer;
+use crate::syntax::{HighlightKind, SyntaxHighlighter};
 
 /// The editing session: a buffer, its keymaps, a clipboard, and the visible viewport.
 #[derive(Debug)]
@@ -24,6 +27,9 @@ pub struct Editor {
     page_rows: usize,
     status: String,
     quit: bool,
+    highlighter: Option<SyntaxHighlighter>,
+    highlights: SpanLayer<HighlightKind>,
+    highlighted_revision: Option<u64>,
 }
 
 impl Editor {
@@ -36,6 +42,7 @@ impl Editor {
     /// Creates an editor on `buffer` with the CUA keymap.
     #[must_use]
     pub fn with_buffer(buffer: Buffer) -> Self {
+        let highlighter = buffer.path().and_then(SyntaxHighlighter::for_path);
         Self {
             buffer,
             clipboard: String::new(),
@@ -44,6 +51,9 @@ impl Editor {
             page_rows: 1,
             status: String::new(),
             quit: false,
+            highlighter,
+            highlights: SpanLayer::new(),
+            highlighted_revision: None,
         }
     }
 
@@ -169,20 +179,55 @@ impl Editor {
         }
         let text_rows = height.saturating_sub(1);
         self.page_rows = usize::from(text_rows).max(1);
+        self.refresh_highlights();
         self.ensure_cursor_visible(text_rows);
         surface.clear(theme.base_style());
 
+        let base = theme.base_style();
         let rope = self.buffer.rope();
         for row in 0..text_rows {
             let line_index = self.viewport_top + usize::from(row);
             if line_index >= rope.len_lines() {
                 break;
             }
-            surface.set_str(0, row, &rope.line(line_index), theme.base_style());
+            let mut byte = rope.point_to_byte(Point::new(line_index, 0));
+            for (index, ch) in rope.line(line_index).chars().enumerate() {
+                let Ok(col) = u16::try_from(index) else {
+                    break;
+                };
+                if col >= width {
+                    break;
+                }
+                surface.set_char(col, row, ch, self.style_at(byte, base, theme));
+                byte += ch.len_utf8();
+            }
         }
 
         self.draw_cursor(surface, theme, text_rows);
         self.draw_status(surface, theme, height - 1);
+    }
+
+    /// Re-runs the highlighter when the buffer has changed since the last highlight.
+    fn refresh_highlights(&mut self) {
+        let revision = self.buffer.revision();
+        if self.highlighted_revision == Some(revision) {
+            return;
+        }
+        self.highlighted_revision = Some(revision);
+        if self.highlighter.is_some() {
+            let text = self.buffer.text();
+            if let Some(highlighter) = self.highlighter.as_mut() {
+                self.highlights = highlighter.highlight(text.as_bytes());
+            }
+        }
+    }
+
+    /// The style for the cell at byte `offset`: its highlight, or the base style.
+    fn style_at(&self, offset: usize, base: Style, theme: &Theme) -> Style {
+        self.highlights
+            .spans_in(offset..offset + 1)
+            .next()
+            .map_or(base, |span| span.value.style(theme))
     }
 
     fn ensure_cursor_visible(&mut self, text_rows: u16) {
@@ -315,5 +360,31 @@ mod tests {
         assert!(surface.cell(0, 0).unwrap().style.attrs.reverse);
         // Status line (row 2) is non-blank and reports line 1.
         assert_ne!(surface.cell(1, 2).unwrap().symbol, ' ');
+    }
+
+    #[test]
+    fn render_applies_syntax_highlighting() {
+        // Opening a `.rs` file attaches a tree-sitter highlighter; rendering must then style
+        // the `fn` keyword with the theme accent (UI.md §3), not the default foreground.
+        let mut path = std::env::temp_dir();
+        path.push(format!("majestic-hl-{}.rs", std::process::id()));
+        let mut journal = path.clone().into_os_string();
+        journal.push(".mjjournal");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let theme = Theme::steelbore();
+        let mut editor = Editor::with_buffer(Buffer::open(&path).unwrap());
+        let mut surface = Surface::new(20, 3, theme.base_style());
+        editor.render(&mut surface, &theme);
+
+        // `n` of the `fn` keyword (col 1, no cursor) is drawn in the accent color.
+        let cell = surface.cell(1, 0).unwrap();
+        assert_eq!(cell.symbol, 'n');
+        assert_eq!(cell.style.fg, theme.accent);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
     }
 }

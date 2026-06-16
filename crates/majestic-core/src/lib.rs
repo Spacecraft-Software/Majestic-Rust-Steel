@@ -32,6 +32,7 @@
 
 mod buffer;
 mod editor;
+mod syntax;
 
 #[doc(inline)]
 pub use buffer::Buffer;
