@@ -32,6 +32,7 @@
 //! ```
 
 mod anchor;
+mod journal;
 mod rope;
 mod spans;
 mod summary;
@@ -39,6 +40,8 @@ mod undo;
 
 #[doc(inline)]
 pub use anchor::{Anchor, Bias, Edit};
+#[doc(inline)]
+pub use journal::{replay, EditOp, FlushPolicy, Journal, Recovered};
 #[doc(inline)]
 pub use rope::{Chunks, Rope};
 #[doc(inline)]

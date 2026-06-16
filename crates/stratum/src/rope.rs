@@ -294,6 +294,12 @@ impl Rope {
         }
     }
 
+    /// Returns `true` if `byte` lies on a `char` boundary, or at the very end.
+    #[must_use]
+    pub fn is_char_boundary(&self, byte: usize) -> bool {
+        byte <= self.len_bytes() && is_char_boundary(&self.root, byte)
+    }
+
     /// Byte offset where line `row` begins.
     fn line_start(&self, row: usize) -> usize {
         if row == 0 {
