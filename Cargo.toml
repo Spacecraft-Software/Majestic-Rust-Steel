@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Majestic — Concept #1 (Rust + Steel). Cargo workspace.
+# One product, five concepts; this is the flagship/contract-carrier (PRD #1).
+# See MAJESTIC.md for the architecture and milestone roadmap.
+
+[workspace]
+resolver = "2"
+members = [
+    # Engine cores (reusable libraries; C3/C4 reuse these).
+    "crates/stratum",
+    "crates/penumbra",
+    "crates/nova",
+    "crates/keymaker",
+    "crates/oracle",
+    "crates/seraph",
+    "crates/architect",
+    "crates/morpheus",
+    "crates/majestic-term",
+    "crates/majestic-config",
+    "crates/majestic-steel",
+    "crates/majestic-core",
+    "crates/majestic-cli",
+    # The thin binary crate (package `majestic`, binary `mj`).
+    "mj",
+]
+
+[workspace.package]
+version = "0.0.0"                      # pre-M0; semver discipline begins at 1.0 (PRD §10 non-goal 6)
+authors = ["Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"]
+edition = "2021"
+rust-version = "1.85.0"               # MSRV — pinned and CI-enforced (PRD §6.1); stable toolchain only
+license = "GPL-3.0-or-later"
+repository = "https://Majestic.SpacecraftSoftware.org/"
+
+# Intended external dependencies are added *per milestone, when the feature lands*,
+# each gated by `cargo audit` first (Standard §3.3). The scaffold itself is
+# dependency-free so it builds offline and `just works` (M-OOBE). Planned set:
+#   stratum:        blake3, memchr, jiff (UTC, §12.5)
+#   morpheus:       smol, async-task, parking_lot
+#   penumbra:       crossterm, ratatui, unicode-width, unicode-segmentation
+#   majestic-term:  alacritty_terminal (Apache-2.0 — CREDITS.md)
+#   majestic-steel: steel-core / steel-interpreter
+#   majestic-config: nickel-lang-core
+#   nova (M4):      wgpu, cosmic-text
+#   majestic-cli:   clap, anyhow
+# (smol / async-task are not yet cached locally; Morpheus is a stub until M0 step 3.)
+
+# --- Lint discipline (Microsoft §08 M-STATIC-VERIFICATION + Spacecraft baseline) ---
+# CI runs `cargo clippy -- -D warnings`, so every crate must be warning-clean.
+# Crates opt in via `[lints]\nworkspace = true`.
+
+[workspace.lints.rust]
+unsafe_code = "deny"                  # PRD §6.1: #![deny(unsafe_code)] workspace-wide (C1 has no exceptions)
+missing_docs = "warn"                 # public items carry docs (Microsoft §03; Oracle docstring discipline)
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+# Major lint groups (priority -1 so individual lints below can override).
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+# Note: the `clippy::cargo` group is intentionally deferred until the crates are
+# published individually (post-1.0, PRD §6.2). Re-enable before first publish.
+
+# Selected `restriction` lints (Microsoft §08) — drive up consistency and rigor.
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+# `string_to_string` (Microsoft §08) was removed in clippy 1.96 — `pedantic`'s
+# `implicit_clone` now covers it, so it is intentionally omitted here.
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# May conflict with structured-logging message templates (Microsoft §08).
+literal_string_with_formatting_args = "allow"
+
+# --- Release profile ---
+# Pure-Rust LTO; stable, portable output for the musl release binaries (PRD §12).
+# `target-cpu=native` is deliberately NOT baked in here — it would break the
+# portable distributed binaries; set it via local RUSTFLAGS for self-builds only
+# (Standard §3.2 / §3.2.1: Stability outranks Performance; document platform flags).
+# On NixOS (Steelbore OS Bravais), if a future C-bearing dep (blake3 asm, alacritty)
+# makes LTO fail to link, select `-fuse-ld=mold` per Standard §3.2.1.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"                     # helps the ≤25 MB binary target (PRD §7)
+panic = "unwind"                      # required: Steel/extension faults are caught (catch_unwind), never crash the editor (PRD §6.7)

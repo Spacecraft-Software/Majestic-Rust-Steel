@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Steelbore — the canonical Majestic color contract (Standard §9 / §9.1).
+# Exactly six tokens. UI logic references tokens by name, never bare hex literals,
+# so a user theme substitutes cleanly. Every shipped token pairing is WCAG 2.1 AA
+# verified (Standard §11). Void Navy is the mandatory background.
+
+name = "steelbore"
+
+[tokens]
+background = "#000027"  # Void Navy      — background / canvas (mandatory)
+foreground = "#D98E32"  # Molten Amber   — primary text / active readout
+accent     = "#4B7EB0"  # Steel Blue     — primary accent / structural
+success    = "#50FA7B"  # Radium Green   — success / safe status
+error      = "#FF5C5C"  # Red Oxide      — warning / error status
+info       = "#8BE9FD"  # Liquid Coolant — info / links

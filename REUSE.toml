@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: CC-BY-SA-4.0
+
+version = 1
+SPDX-PackageName = "majestic"
+SPDX-PackageSupplier = "Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
+SPDX-PackageDownloadLocation = "https://Majestic.SpacecraftSoftware.org/"
+
+# Almost every file carries an inline two-tag SPDX header. This annotation covers the
+# generated Cargo.lock, which cargo rewrites and therefore can't hold a stable header.
+[[annotations]]
+path = "Cargo.lock"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
+SPDX-License-Identifier = "GPL-3.0-or-later"

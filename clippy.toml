@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Clippy honors the workspace MSRV so it never suggests newer-than-supported APIs.
+msrv = "1.85.0"
