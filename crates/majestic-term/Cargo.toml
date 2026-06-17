@@ -16,4 +16,5 @@ workspace = true
 
 [dependencies]
 alacritty_terminal = "0.26.0"
+mio = { version = "1.0", features = ["os-poll", "os-ext"] }
 penumbra = { version = "0.0.0", path = "../penumbra" }

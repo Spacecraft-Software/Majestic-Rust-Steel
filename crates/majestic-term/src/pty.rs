@@ -5,22 +5,32 @@
 //!
 //! [`PtyTerminal::spawn`] launches the user's `$SHELL` on a pseudo-terminal (via
 //! `alacritty_terminal`'s `tty`, so no `unsafe` enters this crate), then runs a background
-//! reader thread that pumps the child's output into a shared [`Terminal`]. Keystrokes are
-//! written back with [`PtyTerminal::write_input`], and [`PtyTerminal::render`] draws the live
-//! grid. Dropping it hangs up the child (`SIGHUP`) and joins the reader.
+//! reader thread that pumps the child's output into a shared [`Terminal`]. The reader blocks on
+//! a `mio` readiness poll rather than busy-waiting — it sleeps until the PTY has output (or the
+//! editor wakes it to shut down). Keystrokes are written back with [`PtyTerminal::write_input`],
+//! and [`PtyTerminal::render`] draws the live grid. Dropping it wakes and joins the reader, then
+//! hangs up the child (`SIGHUP`).
 
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, Options, Shell};
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token, Waker};
 use penumbra::{Buffer, Rect, Theme};
 
 use crate::terminal::Terminal;
+
+/// `mio` token for PTY-master read-readiness.
+const DATA: Token = Token(0);
+/// `mio` token for the shutdown [`Waker`].
+const WAKE: Token = Token(1);
 
 /// A live terminal session: a PTY child whose output drives an embedded [`Terminal`].
 pub struct PtyTerminal {
@@ -28,6 +38,8 @@ pub struct PtyTerminal {
     pty: Option<tty::Pty>,
     writer: File,
     reader: Option<JoinHandle<()>>,
+    waker: Waker,
+    stop: Arc<AtomicBool>,
     columns: usize,
     screen_lines: usize,
 }
@@ -71,13 +83,22 @@ impl PtyTerminal {
         let reader_file = pty.file().try_clone()?;
         let writer = pty.file().try_clone()?;
         let reader_terminal = Arc::clone(&terminal);
-        let reader = thread::spawn(move || pump(reader_file, &reader_terminal));
+
+        // Build the poller on the UI thread so the shutdown `Waker` is available to `Drop`; the
+        // `Poll` itself moves into the reader thread.
+        let poll = Poll::new()?;
+        let waker = Waker::new(poll.registry(), WAKE)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || pump(poll, reader_file, &reader_terminal, &reader_stop));
 
         Ok(Self {
             terminal,
             pty: Some(pty),
             writer,
             reader: Some(reader),
+            waker,
+            stop,
             columns,
             screen_lines,
         })
@@ -135,7 +156,10 @@ impl PtyTerminal {
 
 impl Drop for PtyTerminal {
     fn drop(&mut self) {
-        self.pty = None; // dropping the Pty SIGHUPs the child, so the reader hits EOF
+        // Ask the reader to stop and wake it out of its blocking poll, then hang up the child.
+        self.stop.store(true, Ordering::Release);
+        let _ = self.waker.wake();
+        self.pty = None; // dropping the Pty SIGHUPs the child
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -168,20 +192,38 @@ fn window_size(columns: usize, screen_lines: usize) -> WindowSize {
 
 /// Reads child output until the child exits, feeding it into the shared terminal.
 ///
-/// The PTY master is non-blocking (alacritty sets `O_NONBLOCK`), so a read with no data yet
-/// returns `WouldBlock`; we poll on a short sleep. When the child exits the master returns
-/// EOF or `EIO`, ending the loop. (A future swap to `mio`/Morpheus polling removes the spin.)
-fn pump(mut reader: File, terminal: &Arc<Mutex<Terminal>>) {
+/// The PTY master is non-blocking (`alacritty_terminal` sets `O_NONBLOCK`). Rather than spin on
+/// `WouldBlock`, the reader blocks in `mio`'s readiness poll and only runs when the master has
+/// output or the [`Waker`] fires for shutdown. On each readable wake it drains all available
+/// bytes; when the child exits, the master reports EOF/`EIO` and the loop ends.
+fn pump(mut poll: Poll, mut reader: File, terminal: &Arc<Mutex<Terminal>>, stop: &AtomicBool) {
+    let fd = reader.as_raw_fd();
+    if poll
+        .registry()
+        .register(&mut SourceFd(&fd), DATA, Interest::READABLE)
+        .is_err()
+    {
+        return;
+    }
+
+    let mut events = Events::with_capacity(8);
     let mut buffer = [0u8; 4096];
     loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => lock(terminal).feed(&buffer[..n]),
-            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(2));
+        if poll.poll(&mut events, None).is_err() {
+            return; // poller failure — give up rather than spin
+        }
+        if stop.load(Ordering::Acquire) {
+            return; // woken by Drop
+        }
+        // Drain everything currently available, then go back to sleep on the poll.
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return, // EOF — the child closed the PTY
+                Ok(n) => lock(terminal).feed(&buffer[..n]),
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return, // EIO etc. — the child is gone
             }
-            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break, // EIO etc. — the child is gone
         }
     }
 }
