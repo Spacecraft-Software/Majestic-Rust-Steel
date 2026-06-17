@@ -99,7 +99,7 @@ impl SyntaxHighlighter {
     pub fn supports(path: &Path) -> bool {
         matches!(
             path.extension().and_then(|extension| extension.to_str()),
-            Some("rs")
+            Some("rs" | "py" | "go" | "c" | "h" | "sh" | "bash" | "json")
         )
     }
 
@@ -111,6 +111,26 @@ impl SyntaxHighlighter {
             "rs" => (
                 tree_sitter_rust::LANGUAGE.into(),
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
+            ),
+            "py" => (
+                tree_sitter_python::LANGUAGE.into(),
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+            ),
+            "go" => (
+                tree_sitter_go::LANGUAGE.into(),
+                tree_sitter_go::HIGHLIGHTS_QUERY,
+            ),
+            "c" | "h" => (
+                tree_sitter_c::LANGUAGE.into(),
+                tree_sitter_c::HIGHLIGHT_QUERY,
+            ),
+            "sh" | "bash" => (
+                tree_sitter_bash::LANGUAGE.into(),
+                tree_sitter_bash::HIGHLIGHT_QUERY,
+            ),
+            "json" => (
+                tree_sitter_json::LANGUAGE.into(),
+                tree_sitter_json::HIGHLIGHTS_QUERY,
             ),
             _ => return None,
         };
@@ -330,6 +350,26 @@ mod tests {
     fn unknown_extension_has_no_highlighter() {
         assert!(SyntaxHighlighter::for_path(Path::new("notes.xyz")).is_none());
         assert!(SyntaxHighlighter::for_path(Path::new("noext")).is_none());
+    }
+
+    #[test]
+    fn highlights_each_supported_language() {
+        // Every wired grammar builds and produces spans for a representative snippet.
+        let cases: &[(&str, &[u8])] = &[
+            ("x.py", b"def f():\n    return 1\n"),
+            ("x.go", b"package main\nfunc main() {}\n"),
+            ("x.c", b"int main(void) { return 0; }\n"),
+            ("x.sh", b"echo hi\nif true; then ls; fi\n"),
+            ("x.json", b"{\"key\": true, \"n\": 1}\n"),
+        ];
+        for (name, source) in cases {
+            let mut highlighter =
+                SyntaxHighlighter::for_path(Path::new(name)).expect("highlighter for language");
+            assert!(
+                !highlighter.highlight(source).is_empty(),
+                "{name} should produce highlight spans"
+            );
+        }
     }
 
     #[test]

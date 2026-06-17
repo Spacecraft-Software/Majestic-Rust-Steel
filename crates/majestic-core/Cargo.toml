@@ -24,6 +24,11 @@ keymaker = { version = "0.0.0", path = "../keymaker" }
 tree-sitter = "0.26.9"
 tree-sitter-highlight = "0.26.9"
 tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-c = "0.24.2"
+tree-sitter-bash = "0.25.1"
+tree-sitter-json = "0.24.8"
 
 [lints]
 workspace = true
