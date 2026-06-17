@@ -130,7 +130,15 @@ impl Default for BackgroundExecutor {
 
 impl Drop for BackgroundExecutor {
     fn drop(&mut self) {
+        // Set the shutdown flag *while holding the queue lock*. A worker checks the flag under
+        // that same lock before parking on the condvar, so taking the lock here guarantees the
+        // flag is visible to any worker that has not yet parked: either it has not reached the
+        // check (and will see `true`), or it is already parked (and `notify_all` will wake it).
+        // Setting the flag outside the lock allowed a lost wakeup — a worker that read `false`
+        // and then parked *after* this `notify_all` would never wake, hanging `join`.
+        let queue = self.pool.lock_queue();
         self.pool.shutdown.store(true, Ordering::Release);
+        drop(queue); // release before waking the workers
         self.pool.available.notify_all();
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -171,6 +179,19 @@ mod tests {
     fn thread_count_is_clamped() {
         assert_eq!(BackgroundExecutor::with_threads(3).thread_count(), 3);
         assert_eq!(BackgroundExecutor::with_threads(0).thread_count(), 1);
+    }
+
+    #[test]
+    fn rapid_create_and_drop_does_not_deadlock() {
+        // Stress the shutdown path: workers race to park on the condvar while `Drop` sets the
+        // shutdown flag and notifies. A lost wakeup there would hang `join` (see `Drop`). Many
+        // small executors with idle and busy workers maximize the chance of hitting the window.
+        for _ in 0..400 {
+            let executor = BackgroundExecutor::with_threads(8);
+            let task = executor.spawn(|_| 1_i32 + 1);
+            let _ = task.join();
+            drop(executor);
+        }
     }
 
     #[test]
