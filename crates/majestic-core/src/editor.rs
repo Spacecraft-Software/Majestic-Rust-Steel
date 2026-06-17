@@ -15,7 +15,7 @@ use penumbra::{Buffer as Surface, Cell, Rect, Style, Theme};
 use stratum::{Point, SpanLayer};
 
 use crate::buffer::Buffer;
-use crate::syntax::{HighlightKind, SyntaxHighlighter};
+use crate::syntax::{HighlightKind, HighlightWorker};
 
 /// The editing session: a buffer, its keymaps, a clipboard, and the visible viewport.
 #[derive(Debug)]
@@ -27,9 +27,10 @@ pub struct Editor {
     page_rows: usize,
     status: String,
     quit: bool,
-    highlighter: Option<SyntaxHighlighter>,
+    highlighter: Option<HighlightWorker>,
     highlights: SpanLayer<HighlightKind>,
     highlighted_revision: Option<u64>,
+    requested_revision: Option<u64>,
     tab_width: usize,
 }
 
@@ -46,7 +47,7 @@ impl Editor {
     /// Creates an editor on `buffer` with the CUA keymap.
     #[must_use]
     pub fn with_buffer(buffer: Buffer) -> Self {
-        let highlighter = buffer.path().and_then(SyntaxHighlighter::for_path);
+        let highlighter = buffer.path().and_then(HighlightWorker::for_path);
         Self {
             buffer,
             clipboard: String::new(),
@@ -58,6 +59,7 @@ impl Editor {
             highlighter,
             highlights: SpanLayer::new(),
             highlighted_revision: None,
+            requested_revision: None,
             tab_width: DEFAULT_TAB_WIDTH,
         }
     }
@@ -265,18 +267,44 @@ impl Editor {
         }
     }
 
-    /// Re-runs the highlighter when the buffer has changed since the last highlight.
+    /// Reconciles highlights with the background worker — never blocks the render path.
+    ///
+    /// Applies any finished result (newest wins) and, if the buffer has changed since the last
+    /// request, sends a fresh snapshot (a cheap `Rope` clone). A frame paints with whatever
+    /// highlights are current; during fast typing they trail by a frame or two and then catch up.
     fn refresh_highlights(&mut self) {
-        let revision = self.buffer.revision();
-        if self.highlighted_revision == Some(revision) {
-            return;
+        if let Some(done) = self.highlighter.as_ref().and_then(HighlightWorker::poll) {
+            self.highlights = done.layer;
+            self.highlighted_revision = Some(done.revision);
         }
-        self.highlighted_revision = Some(revision);
-        if self.highlighter.is_some() {
-            let text = self.buffer.text();
-            if let Some(highlighter) = self.highlighter.as_mut() {
-                self.highlights = highlighter.highlight(text.as_bytes());
+        let revision = self.buffer.revision();
+        if self.requested_revision != Some(revision) {
+            if let Some(worker) = self.highlighter.as_ref() {
+                worker.request(revision, self.buffer.rope().clone());
             }
+            self.requested_revision = Some(revision);
+        }
+    }
+
+    /// Blocks until highlights reflect the current buffer revision (a no-op without a worker).
+    ///
+    /// For deterministic, non-interactive rendering — tests and the perf harness — where the
+    /// frame must show finished highlights rather than the asynchronous steady state.
+    pub fn flush_highlights(&mut self) {
+        let revision = self.buffer.revision();
+        if self.requested_revision != Some(revision) {
+            if let Some(worker) = self.highlighter.as_ref() {
+                worker.request(revision, self.buffer.rope().clone());
+            }
+            self.requested_revision = Some(revision);
+        }
+        if let Some(done) = self
+            .highlighter
+            .as_ref()
+            .and_then(|worker| worker.wait_for(revision))
+        {
+            self.highlights = done.layer;
+            self.highlighted_revision = Some(done.revision);
         }
     }
 
@@ -464,6 +492,7 @@ mod tests {
         let theme = Theme::steelbore();
         let mut editor = Editor::with_buffer(Buffer::open(&path).unwrap());
         let mut surface = Surface::new(20, 3, theme.base_style());
+        editor.flush_highlights(); // highlighting is asynchronous; wait for the first result
         editor.render(&mut surface, &theme);
 
         // `n` of the `fn` keyword (col 1, no cursor) is drawn in the accent color.

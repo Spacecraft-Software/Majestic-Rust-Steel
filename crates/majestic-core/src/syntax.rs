@@ -11,9 +11,11 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 
 use penumbra::{Rgb, Style, Theme};
-use stratum::{Span, SpanLayer};
+use stratum::{Rope, Span, SpanLayer};
 use tree_sitter::Language;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -92,6 +94,15 @@ pub struct SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
+    /// Whether `path`'s extension maps to a supported language (cheap; no construction).
+    #[must_use]
+    pub fn supports(path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("rs")
+        )
+    }
+
     /// Builds a highlighter for `path`'s file type, or `None` if unsupported.
     #[must_use]
     pub fn for_path(path: &Path) -> Option<Self> {
@@ -171,6 +182,119 @@ fn dim(fg: Rgb, bg: Rgb) -> Rgb {
     )
 }
 
+/// A finished highlight result, tagged with the buffer revision it was computed from.
+pub(crate) struct Highlighted {
+    /// The buffer revision the snapshot reflected.
+    pub revision: u64,
+    /// The styled span layer for that revision.
+    pub layer: SpanLayer<HighlightKind>,
+}
+
+/// A request to highlight one buffer snapshot. The snapshot is a cheap [`Rope`] clone (an `Arc`
+/// bump), so the UI thread does no text copying — the worker materializes the text itself.
+struct Request {
+    revision: u64,
+    snapshot: Rope,
+}
+
+/// A background worker that highlights buffer snapshots off the UI thread (PRD §6.4 snapshot
+/// ping-pong, §6.9).
+///
+/// The editor sends `(revision, snapshot)` over a channel and polls results; the worker owns the
+/// tree-sitter highlighter and coalesces superseded requests (only the newest pending snapshot is
+/// parsed — older ones are dropped, which is the cancellation signal). One thread per highlighted
+/// buffer; a shared Morpheus pool is a later refinement.
+#[derive(Debug)]
+pub(crate) struct HighlightWorker {
+    requests: Option<Sender<Request>>,
+    results: Receiver<Highlighted>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HighlightWorker {
+    /// Spawns a worker for `path`'s language, or `None` if the file type is unsupported.
+    #[must_use]
+    pub(crate) fn for_path(path: &Path) -> Option<Self> {
+        if !SyntaxHighlighter::supports(path) {
+            return None;
+        }
+        let path = path.to_path_buf();
+        let (request_tx, request_rx) = mpsc::channel::<Request>();
+        let (result_tx, result_rx) = mpsc::channel::<Highlighted>();
+        let handle = std::thread::Builder::new()
+            .name("majestic-highlight".to_owned())
+            .spawn(move || run_worker(&path, &request_rx, &result_tx))
+            .ok()?;
+        Some(Self {
+            requests: Some(request_tx),
+            results: result_rx,
+            handle: Some(handle),
+        })
+    }
+
+    /// Queues a snapshot to highlight in the background. Non-blocking; never waits on the worker.
+    pub(crate) fn request(&self, revision: u64, snapshot: Rope) {
+        if let Some(requests) = &self.requests {
+            let _ = requests.send(Request { revision, snapshot });
+        }
+    }
+
+    /// Returns the most recent finished result, discarding any older ones (non-blocking).
+    pub(crate) fn poll(&self) -> Option<Highlighted> {
+        let mut latest = None;
+        while let Ok(done) = self.results.try_recv() {
+            latest = Some(done);
+        }
+        latest
+    }
+
+    /// Blocks until a result for `revision` (or newer) arrives, or the worker stops. Used by
+    /// deterministic, non-interactive rendering (tests, the perf harness).
+    pub(crate) fn wait_for(&self, revision: u64) -> Option<Highlighted> {
+        while let Ok(done) = self.results.recv() {
+            if done.revision >= revision {
+                return Some(done);
+            }
+        }
+        None
+    }
+}
+
+impl Drop for HighlightWorker {
+    fn drop(&mut self) {
+        // Dropping the request sender ends the worker's `recv` loop; then join the thread.
+        self.requests = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The worker thread body: own a highlighter, then highlight the newest pending snapshot in a
+/// loop, streaming results back until the editor (and its request sender) is gone.
+fn run_worker(path: &Path, requests: &Receiver<Request>, results: &Sender<Highlighted>) {
+    let Some(mut highlighter) = SyntaxHighlighter::for_path(path) else {
+        return; // unsupported despite `supports` — exit; the editor simply gets no highlights
+    };
+    while let Ok(request) = requests.recv() {
+        // Coalesce: skip snapshots already superseded by a newer pending one (cancellation).
+        let mut latest = request;
+        while let Ok(newer) = requests.try_recv() {
+            latest = newer;
+        }
+        let layer = highlighter.highlight(latest.snapshot.to_string().as_bytes());
+        if results
+            .send(Highlighted {
+                revision: latest.revision,
+                layer,
+            })
+            .is_err()
+        {
+            break; // the editor is gone
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{HighlightKind, SyntaxHighlighter};
@@ -206,5 +330,22 @@ mod tests {
     fn unknown_extension_has_no_highlighter() {
         assert!(SyntaxHighlighter::for_path(Path::new("notes.xyz")).is_none());
         assert!(SyntaxHighlighter::for_path(Path::new("noext")).is_none());
+    }
+
+    #[test]
+    fn background_worker_highlights_a_snapshot() {
+        use super::HighlightWorker;
+        use stratum::Rope;
+        let worker = HighlightWorker::for_path(Path::new("x.rs")).unwrap();
+        worker.request(7, Rope::from("fn main() {}\n"));
+        let done = worker.wait_for(7).expect("worker should deliver a result");
+        assert_eq!(done.revision, 7);
+        assert!(!done.layer.is_empty(), "expected highlight spans");
+    }
+
+    #[test]
+    fn background_worker_is_none_for_unsupported() {
+        use super::HighlightWorker;
+        assert!(HighlightWorker::for_path(Path::new("notes.txt")).is_none());
     }
 }

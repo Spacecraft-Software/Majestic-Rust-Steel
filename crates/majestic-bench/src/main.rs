@@ -40,7 +40,7 @@ fn main() -> ExitCode {
     let outcomes = vec![
         cold_start(),
         keypress("keypress (plain, 800 lines)", false, 800, true),
-        keypress("keypress (highlighted .rs, 800 lines)", true, 800, false),
+        keypress("keypress (highlighted .rs, 800 lines)", true, 800, true),
         scroll_highlighted(5_000),
         open_large(32),
     ];
@@ -129,9 +129,9 @@ fn cold_start() -> Outcome {
 /// Keypress → screen update latency: self-insert characters, rendering after each, and report
 /// the per-keystroke percentiles.
 ///
-/// The highlighted variant is `gated = false` (tracked, not enforced): it re-highlights the whole
-/// buffer synchronously on every keystroke, which needs incremental/background parsing (PRD §6.9)
-/// — a larger optimization than the per-frame style/build fixes already landed.
+/// The highlighted variant stays on budget because highlighting runs on a background worker
+/// (PRD §6.4/§6.9): the keystroke only takes a cheap `Rope` snapshot and renders with the latest
+/// finished spans, so re-highlighting never blocks the UI thread.
 fn keypress(name: &'static str, highlighted: bool, lines: usize, gated: bool) -> Outcome {
     let theme = Theme::steelbore();
     let mut surface = blank_surface(&theme);
@@ -185,6 +185,9 @@ fn scroll_highlighted(lines: usize) -> Outcome {
     let mut workspace = Workspace::new(Editor::with_buffer(
         Buffer::open(source.path()).expect("open temp source"),
     ));
+    // Wait for the background highlighter once so the scenario measures *highlighted* rendering;
+    // scrolling does not edit the buffer, so no further re-highlight is triggered.
+    workspace.active_mut().flush_highlights();
 
     let page = KeyPress::key(keymaker::KeyCode::PageDown);
     let mut samples = Vec::with_capacity(256);
