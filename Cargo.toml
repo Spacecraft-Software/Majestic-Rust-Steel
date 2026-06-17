@@ -30,7 +30,8 @@ members = [
 version = "0.0.0"                      # pre-M0; semver discipline begins at 1.0 (PRD §10 non-goal 6)
 authors = ["Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"]
 edition = "2021"
-rust-version = "1.85.0"               # MSRV — pinned and CI-enforced (PRD §6.1); stable toolchain only
+rust-version = "1.90.0"               # MSRV — pinned and CI-enforced (PRD §6.1); stable toolchain only.
+                                      # Raised 1.85→1.90 for nickel-lang-core (malachite-base needs 1.90).
 license = "GPL-3.0-or-later"
 repository = "https://Majestic.SpacecraftSoftware.org/"
 

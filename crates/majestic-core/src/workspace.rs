@@ -40,6 +40,8 @@ pub struct Workspace {
     focused: usize,
     /// Shared clipboard, mirrored into every editor so copy/paste crosses panes.
     clipboard: String,
+    /// Indent width (columns) applied to every editor, including newly opened ones.
+    tab_width: usize,
     /// Latched once a quit command is issued.
     quit: bool,
 }
@@ -64,8 +66,22 @@ impl Workspace {
             split: Split::Columns,
             focused: 0,
             clipboard: String::new(),
+            tab_width: 4, // matches Editor's default; overridden by `set_tab_width` from config
             quit: false,
         }
+    }
+
+    /// Sets the indent width for every open editor and any opened later (applied from config).
+    pub fn set_tab_width(&mut self, width: usize) {
+        self.tab_width = width;
+        for editor in &mut self.editors {
+            editor.set_tab_width(width);
+        }
+    }
+
+    /// Sets the focused editor's status-line message (e.g. a startup notice from the host).
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.active_mut().set_status(message);
     }
 
     /// Whether a quit command has been issued.
@@ -110,7 +126,8 @@ impl Workspace {
 
     /// Opens `editor` as a new buffer and shows it in the focused pane (its previous buffer
     /// stays open as a background tab). Used by the explorer and the fuzzy file finder.
-    pub fn open(&mut self, editor: Editor) {
+    pub fn open(&mut self, mut editor: Editor) {
+        editor.set_tab_width(self.tab_width);
         self.editors.push(editor);
         self.panes[self.focused] = self.editors.len() - 1;
     }
@@ -405,6 +422,18 @@ mod tests {
         assert_eq!(workspace.active().buffer().text(), "two");
         workspace.handle_key(alt(KeyCode::Left));
         assert_eq!(workspace.active().buffer().text(), "one");
+    }
+
+    #[test]
+    fn set_tab_width_reaches_every_pane_and_new_buffers() {
+        let mut workspace = Workspace::new(Editor::new());
+        workspace.set_tab_width(3);
+        workspace.active_mut().execute("indent");
+        assert_eq!(workspace.active().buffer().text(), "   ");
+        // A buffer opened afterwards inherits the configured width.
+        workspace.open(Editor::new());
+        workspace.active_mut().execute("indent");
+        assert_eq!(workspace.active().buffer().text(), "   ");
     }
 
     #[test]

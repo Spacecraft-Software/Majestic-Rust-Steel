@@ -8,25 +8,51 @@
 version = 2
 yanked = "deny"
 # `cargo audit` (RustSec) is the primary advisory gate; cargo-deny double-checks.
+# Unmaintained (not vulnerable) transitive crates pulled only by nickel-lang-core's
+# REPL/markdown stack. Reviewed 2026-06-17: no safe upgrade exists; no known vulnerability.
+ignore = [
+    "RUSTSEC-2024-0320", # yaml-rust unmaintained (syntect <- comrak <- nickel-lang-core)
+    "RUSTSEC-2024-0436", # paste unmaintained (nickel-lang-core)
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained (syntect <- comrak <- nickel-lang-core)
+]
 
 [licenses]
 version = 2
-# GPL-compatible licenses only (Standard §4.2). The project itself is GPL-3.0-or-later;
-# permissive upstreams are allowed and their texts shipped verbatim in LICENSES/.
+# GPL-3.0-compatible licenses only (Standard §4.2; full catalog in license/ALLOWED_LICENSES.md).
+# The project is GPL-3.0-or-later and can incorporate every license below; permissive upstream
+# texts ship verbatim in LICENSES/. Tiered by obligation so copyleft additions stay conscious.
 allow = [
+    # Project artifacts (§4.1.1)
     "GPL-3.0-or-later",
     "CC-BY-SA-4.0",
+    # Permissive
+    "MIT",
+    "MITNFA",
+    "X11",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSD-3-Clause-Clear",
+    "BSD-2-Clause-Patent",
+    "0BSD",
     "ISC",
     "Zlib",
+    "zlib-acknowledgement",
+    "BSL-1.0",
+    "NCSA",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "Unicode-DFS-2015",
     "CC0-1.0",
+    "CC-PDDC",
+    "Unlicense",
+    # Weak copyleft (GPL-compatible; component-level source obligations)
     "MPL-2.0",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
 ]
 confidence-threshold = 0.9
 

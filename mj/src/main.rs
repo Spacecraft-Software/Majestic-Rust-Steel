@@ -14,6 +14,7 @@
 
 use std::process::ExitCode;
 
+use majestic_config::Config;
 use majestic_core::{Buffer, Editor, Workspace};
 
 mod tui;
@@ -92,6 +93,7 @@ COMMANDS:
 OPTIONS:
     -h, --help       Print this help
     -V, --version    Print version and attribution
+        --safe       Skip the user configuration (Nickel manifest)
 
 Maintained by Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 https://Majestic.SpacecraftSoftware.org/"
@@ -99,7 +101,11 @@ https://Majestic.SpacecraftSoftware.org/"
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // `--safe` is a global flag: skip the user configuration (Standard §5 safe mode). It is
+    // stripped before noun-verb classification so it can appear anywhere on the line.
+    let safe_mode = raw.iter().any(|arg| arg == "--safe");
+    let args: Vec<String> = raw.into_iter().filter(|arg| arg != "--safe").collect();
     match classify(&args) {
         Action::Version => {
             print_version();
@@ -109,8 +115,8 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        Action::Empty => run_editor(&[]),
-        Action::Open(paths) => run_editor(&paths),
+        Action::Empty => run_editor(&[], safe_mode),
+        Action::Open(paths) => run_editor(&paths, safe_mode),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -126,7 +132,8 @@ fn main() -> ExitCode {
 ///
 /// Each file becomes a tab; the first is shown in the sole pane and the rest are background
 /// tabs (`Alt+←/→` to switch, `Ctrl+\` to split). Any path that fails to open aborts startup.
-fn run_editor(paths: &[String]) -> ExitCode {
+/// Unless `safe_mode` is set, the Nickel manifest is loaded and applied before launch.
+fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
     let mut editors = Vec::with_capacity(paths.len());
     for path in paths {
         match Buffer::open(path) {
@@ -140,11 +147,40 @@ fn run_editor(paths: &[String]) -> ExitCode {
     if editors.is_empty() {
         editors.push(Editor::new());
     }
-    match tui::run(Workspace::from_editors(editors)) {
+    let mut workspace = Workspace::from_editors(editors);
+    if !safe_mode {
+        apply_config(&mut workspace);
+    }
+    match tui::run(workspace) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Loads the discovered Nickel manifest and applies it to `workspace`.
+///
+/// Fail-soft: a missing manifest is normal (defaults stand); a malformed one keeps the defaults
+/// and surfaces a short notice in the status bar (run with `--safe` to skip the manifest).
+fn apply_config(workspace: &mut Workspace) {
+    let Some(path) = Config::discover() else {
+        return; // no manifest -> built-in defaults
+    };
+    match Config::load(&path) {
+        Ok(config) => workspace.set_tab_width(config.tab_width()),
+        Err(error) => {
+            // Flatten the (multi-line) Nickel diagnostic into one status-bar line.
+            let detail = error
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            workspace.set_status(format!(
+                "config {} invalid — using defaults; --safe to skip. {detail}",
+                path.display(),
+            ));
         }
     }
 }

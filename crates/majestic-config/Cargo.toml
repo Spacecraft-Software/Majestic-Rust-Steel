@@ -13,3 +13,7 @@ description = "Majestic configuration: Nickel manifest plus Steel config loader,
 
 [lints]
 workspace = true
+
+[dependencies]
+nickel-lang-core = "0.18"
+serde = { version = "1.0.228", features = ["derive"] }

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Stable toolchain only — no nightly features (PRD §6.1). MSRV (1.85.0) is pinned
+# Stable toolchain only — no nightly features (PRD §6.1). MSRV (1.90.0) is pinned
 # in the workspace `Cargo.toml` and enforced separately in CI.
 [toolchain]
 channel = "stable"

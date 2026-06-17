@@ -30,7 +30,11 @@ pub struct Editor {
     highlighter: Option<SyntaxHighlighter>,
     highlights: SpanLayer<HighlightKind>,
     highlighted_revision: Option<u64>,
+    tab_width: usize,
 }
+
+/// Default indent width in columns (CUA convention; overridden by `majestic-config`).
+const DEFAULT_TAB_WIDTH: usize = 4;
 
 impl Editor {
     /// The command names [`Editor::execute`] understands — the command palette's catalog.
@@ -84,7 +88,13 @@ impl Editor {
             highlighter,
             highlights: SpanLayer::new(),
             highlighted_revision: None,
+            tab_width: DEFAULT_TAB_WIDTH,
         }
+    }
+
+    /// Sets the indent width (columns), clamped to a sane `1..=16` range. Applied from config.
+    pub fn set_tab_width(&mut self, width: usize) {
+        self.tab_width = width.clamp(1, 16);
     }
 
     /// The active buffer.
@@ -108,6 +118,11 @@ impl Editor {
     #[must_use]
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    /// Sets the status-line message (e.g. a startup notice from the host).
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status = message.into();
     }
 
     /// The clipboard contents.
@@ -178,7 +193,7 @@ impl Editor {
             "delete-backward" => self.buffer.backspace(),
             "delete-forward" => self.buffer.delete_forward(),
             "insert-newline" => self.buffer.insert("\n"),
-            "indent" => self.buffer.insert("    "),
+            "indent" => self.buffer.insert(&" ".repeat(self.tab_width)),
             "undo" => {
                 self.buffer.undo();
             }
@@ -386,6 +401,14 @@ mod tests {
         editor.handle_key(KeyPress::char('h'));
         editor.handle_key(KeyPress::char('i'));
         assert_eq!(editor.buffer().text(), "hi");
+    }
+
+    #[test]
+    fn indent_uses_the_configured_tab_width() {
+        let mut editor = Editor::new();
+        editor.set_tab_width(2);
+        editor.execute("indent");
+        assert_eq!(editor.buffer().text(), "  ");
     }
 
     #[test]

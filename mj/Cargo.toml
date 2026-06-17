@@ -22,6 +22,7 @@ workspace = true
 [dependencies]
 crossterm = "0.28"
 keymaker = { version = "0.0.0", path = "../crates/keymaker" }
+majestic-config = { version = "0.0.0", path = "../crates/majestic-config" }
 majestic-core = { version = "0.0.0", path = "../crates/majestic-core" }
 majestic-term = { version = "0.0.0", path = "../crates/majestic-term" }
 penumbra = { version = "0.0.0", path = "../crates/penumbra" }

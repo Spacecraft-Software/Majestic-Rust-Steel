@@ -37,6 +37,7 @@ designs and ideas directly informed it:
 | `alacritty_terminal` | Alacritty contributors (Christian Dürr et al.) | Apache-2.0 | <https://github.com/alacritty/alacritty> | The VT engine and cell grid embedded by `majestic-term` (the integrated terminal) — escape parsing, the terminal grid, and scrollback. Integrated M1. |
 | `tree-sitter` + `tree-sitter-highlight` | Max Brunsfeld and tree-sitter contributors | MIT | <https://github.com/tree-sitter/tree-sitter> | The incremental parser and highlight engine behind `majestic-core`'s `SyntaxHighlighter` — parses a buffer and emits the capture events Majestic maps onto theme-styled span layers. Integrated M1. |
 | `tree-sitter-rust` (grammar) | tree-sitter contributors | MIT | <https://github.com/tree-sitter/tree-sitter-rust> | The Rust grammar and highlight query driving `.rs` syntax highlighting. Integrated M1. |
+| `nickel-lang-core` | Nickel contributors (Tweag) | MIT | <https://github.com/tweag/nickel> | The Nickel language evaluator behind `majestic-config` — evaluates the user manifest (merged onto a schema contract) and deserializes it into the typed settings. Integrated M1. Its tree carries weak-copyleft/unmaintained transitives accepted per `deny.toml` (see `license/ALLOWED_LICENSES.md`) and raises the workspace MSRV to 1.90. |
 
 The `crossterm` crate (MIT, <https://github.com/crossterm-rs/crossterm>) provides the `mj`
 binary's terminal raw mode, input decoding, and screen control. It is a routine dependency
@@ -51,7 +52,6 @@ filled in here:
 | Dependency | License | Milestone | Role |
 |---|---|---|---|
 | Steel | Apache-2.0 / MIT | M1 | Embedded Scheme extension runtime (majestic-steel). |
-| Nickel (`nickel-lang-core`) | MIT | M1 | Manifest evaluation (majestic-config). |
 | `blake3` | CC0-1.0 / Apache-2.0 | M0 | Hashline line tags. |
 | `cosmic-text` | MIT | M4 | GPU text shaping (Nova). |
 | Material Symbols (icon font) | Apache-2.0 | M4 | GUI iconography, vendored in-tree (no runtime fetch). |
