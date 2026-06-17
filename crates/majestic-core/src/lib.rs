@@ -35,6 +35,7 @@ mod editor;
 mod files;
 mod finder;
 mod fuzzy;
+mod git;
 mod syntax;
 mod workspace;
 

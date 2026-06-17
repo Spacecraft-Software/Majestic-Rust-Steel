@@ -12,11 +12,14 @@
 //! navigation (`select_up`/`select_down`/`activate`); the host opens the file `activate`
 //! returns and routes the rest of the UI.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
+
+use crate::git::{self, GitStatus};
 
 /// One visible line of the tree: a file or directory at a given nesting depth.
 #[derive(Clone, Debug)]
@@ -32,6 +35,8 @@ pub struct FileTree {
     root: PathBuf,
     expanded: Vec<PathBuf>,
     rows: Vec<Row>,
+    /// Changed paths under `root`, by git status — snapshotted at build/refresh time.
+    git: HashMap<PathBuf, GitStatus>,
     selected: usize,
     top: usize,
 }
@@ -43,6 +48,7 @@ impl FileTree {
         let root = root.into();
         let mut tree = Self {
             expanded: vec![root.clone()],
+            git: git::statuses(&root),
             root,
             rows: Vec::new(),
             selected: 0,
@@ -85,14 +91,28 @@ impl FileTree {
         }
     }
 
-    /// Rescans the tree from disk, preserving the expanded set and the selected path.
+    /// Rescans the tree and git status from disk, preserving the expanded set and selection.
     pub fn refresh(&mut self) {
         let selected = self.rows.get(self.selected).map(|row| row.path.clone());
+        self.git = git::statuses(&self.root);
         self.rebuild();
         if let Some(path) = selected {
             if let Some(index) = self.rows.iter().position(|row| row.path == path) {
                 self.selected = index;
             }
+        }
+    }
+
+    /// The git status to color a row by: a file's own status, or — for a directory — whether any
+    /// changed path lives under it.
+    fn status_for(&self, row: &Row) -> Option<GitStatus> {
+        if row.is_dir {
+            self.git
+                .keys()
+                .any(|path| path.starts_with(&row.path))
+                .then_some(GitStatus::Modified)
+        } else {
+            self.git.get(&row.path).copied()
         }
     }
 
@@ -163,7 +183,8 @@ impl FileTree {
             };
             let y = list.y + i;
             let selected = row_index == self.selected;
-            let style = row_style(row, selected, focused, theme);
+            let status = self.status_for(row);
+            let style = row_style(row, selected, focused, status, theme);
             for x in list.x..list.right() {
                 surface.set_char(x, y, ' ', style);
             }
@@ -193,18 +214,29 @@ impl FileTree {
     }
 }
 
-/// The style for a tree row: selected (when focused) inverts to the accent; directories use the
-/// accent, files the foreground.
-fn row_style(row: &Row, selected: bool, focused: bool, theme: &Theme) -> Style {
+/// The style for a tree row. Selected rows take the selection highlight; otherwise the foreground
+/// is tinted by git status (Red Oxide = modified/deleted, Radium Green = added/untracked), falling
+/// back to Steel Blue for directories and Molten Amber for clean files (UI.md §2).
+fn row_style(
+    row: &Row,
+    selected: bool,
+    focused: bool,
+    status: Option<GitStatus>,
+    theme: &Theme,
+) -> Style {
     if selected && focused {
-        Style::new(theme.background, theme.accent)
-    } else if selected {
-        Style::new(theme.background, theme.foreground)
-    } else if row.is_dir {
-        Style::new(theme.accent, theme.background)
-    } else {
-        Style::new(theme.foreground, theme.background)
+        return Style::new(theme.background, theme.accent);
     }
+    if selected {
+        return Style::new(theme.background, theme.foreground);
+    }
+    let fg = match status {
+        Some(GitStatus::Modified | GitStatus::Deleted) => theme.error,
+        Some(GitStatus::Added | GitStatus::Untracked) => theme.success,
+        None if row.is_dir => theme.accent,
+        None => theme.foreground,
+    };
+    Style::new(fg, theme.background)
 }
 
 /// Reads `dir`'s entries (skipping dot-entries), sorted directories-first then case-insensitively.
@@ -299,6 +331,48 @@ mod tests {
         // `src` (directory) sorts before the files; files are alphabetical.
         assert_eq!(names(&tree), vec!["src", "README.md", "zebra.txt"]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn untracked_files_render_in_the_git_added_color() {
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("majestic-tree-git-{}-{unique}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .arg("init")
+            .output();
+        if !init.is_ok_and(|out| out.status.success()) {
+            eprintln!("skipping: git unavailable");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        // Two untracked files: row 0 is selected (takes the selection highlight), so check the
+        // non-selected one carries the git "added/untracked" foreground (Radium Green).
+        fs::write(dir.join("alpha.txt"), "x").unwrap();
+        fs::write(dir.join("beta.txt"), "y").unwrap();
+
+        let theme = Theme::steelbore();
+        let mut tree = FileTree::new(&dir);
+        let mut surface = Surface::new(30, 6, theme.base_style());
+        let area = surface.area();
+        tree.render(&mut surface, area, &theme, false);
+
+        let has_green = (1..surface.height()).any(|y| {
+            (0..surface.width()).any(|x| {
+                surface
+                    .cell(x, y)
+                    .is_some_and(|cell| cell.symbol != ' ' && cell.style.fg == theme.success)
+            })
+        });
+        assert!(
+            has_green,
+            "an untracked file should render in the success color"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

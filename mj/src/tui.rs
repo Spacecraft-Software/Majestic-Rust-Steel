@@ -300,7 +300,10 @@ impl App {
     /// `Ctrl+B`: open+focus the sidebar, focus it if already shown, or hide it when focused.
     fn toggle_sidebar(&mut self) {
         if !self.sidebar_visible {
-            if self.explorer.is_none() {
+            if let Some(explorer) = self.explorer.as_mut() {
+                // Re-opening: rescan the tree and git status so decorations are current.
+                explorer.refresh();
+            } else {
                 let root =
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 self.explorer = Some(FileTree::new(root));
