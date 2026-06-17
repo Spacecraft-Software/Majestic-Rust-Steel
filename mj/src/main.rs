@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use majestic_config::Config;
 use majestic_core::{Buffer, Editor, Workspace};
+use majestic_steel::Runtime as SteelRuntime;
 
 mod tui;
 
@@ -93,7 +94,7 @@ COMMANDS:
 OPTIONS:
     -h, --help       Print this help
     -V, --version    Print version and attribution
-        --safe       Skip the user configuration (Nickel manifest)
+        --safe       Skip the user configuration (Nickel manifest and config.scm)
 
 Maintained by Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 https://Majestic.SpacecraftSoftware.org/"
@@ -160,29 +161,63 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
     }
 }
 
-/// Loads the discovered Nickel manifest and applies it to `workspace`.
+/// Loads the hybrid configuration and applies it to `workspace`.
 ///
-/// Fail-soft: a missing manifest is normal (defaults stand); a malformed one keeps the defaults
-/// and surfaces a short notice in the status bar (run with `--safe` to skip the manifest).
+/// The declarative Nickel manifest sets the base; the imperative Steel `config.scm` then layers
+/// overrides on top (last writer wins). Fail-soft: missing files are normal (defaults stand); a
+/// malformed manifest or script keeps the working settings and surfaces a one-line status notice
+/// (run with `--safe` to skip configuration entirely).
 fn apply_config(workspace: &mut Workspace) {
-    let Some(path) = Config::discover() else {
-        return; // no manifest -> built-in defaults
-    };
-    match Config::load(&path) {
-        Ok(config) => workspace.set_tab_width(config.tab_width()),
-        Err(error) => {
-            // Flatten the (multi-line) Nickel diagnostic into one status-bar line.
-            let detail = error
-                .to_string()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            workspace.set_status(format!(
-                "config {} invalid — using defaults; --safe to skip. {detail}",
+    let mut tab_width: Option<usize> = None;
+    let mut notices: Vec<String> = Vec::new();
+
+    // 1. Declarative half — the Nickel manifest.
+    if let Some(path) = Config::discover() {
+        match Config::load(&path) {
+            Ok(config) => tab_width = Some(config.tab_width()),
+            Err(error) => notices.push(format!(
+                "manifest {} invalid ({})",
                 path.display(),
-            ));
+                one_line(&error)
+            )),
         }
     }
+
+    // 2. Imperative half — the Steel config.scm, layered on top.
+    if let Some(path) = SteelRuntime::discover() {
+        let mut runtime = SteelRuntime::new();
+        match runtime.run_file(&path) {
+            Ok(()) => {
+                if let Some(columns) = runtime.settings().tab_width {
+                    tab_width = Some(columns.clamp(1, 16));
+                }
+            }
+            Err(error) => notices.push(format!(
+                "config.scm {} failed ({})",
+                path.display(),
+                one_line(&error)
+            )),
+        }
+    }
+
+    if let Some(columns) = tab_width {
+        workspace.set_tab_width(columns);
+    }
+    if !notices.is_empty() {
+        workspace.set_status(format!(
+            "{} — using defaults; --safe to skip",
+            notices.join("; ")
+        ));
+    }
+}
+
+/// Flattens a multi-line diagnostic into a single status-bar line.
+fn one_line(error: &dyn std::fmt::Display) -> String {
+    error
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]

@@ -13,3 +13,6 @@ description = "Majestic Steel runtime embedding plus extension API surface."
 
 [lints]
 workspace = true
+
+[dependencies]
+steel-core = "0.8.2"
