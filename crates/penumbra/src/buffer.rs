@@ -11,8 +11,25 @@
 //! Cells are one column wide in this M0 core (ASCII, box-drawing, and BMP-narrow text);
 //! double-width/grapheme handling is layered on with `unicode-width`/`unicode-segmentation`.
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::layout::Rect;
 use crate::theme::Style;
+
+/// The sentinel symbol marking a cell that is the second half of a double-width glyph to its
+/// left. Such cells are never emitted by the renderer — the wide glyph already covers them.
+const CONTINUATION: char = '\0';
+
+/// The display width of `ch` in terminal cells: `2` for double-width glyphs (CJK, many emoji),
+/// otherwise `1`. Combining and control characters collapse to a single cell in this model
+/// (full grapheme/zero-width handling is layered on with `unicode-segmentation` later).
+#[must_use]
+pub fn char_width(ch: char) -> u16 {
+    match UnicodeWidthChar::width(ch) {
+        Some(2) => 2,
+        _ => 1,
+    }
+}
 
 /// A single screen cell: a character and its [`Style`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +51,18 @@ impl Cell {
     #[must_use]
     pub const fn blank(style: Style) -> Self {
         Self::new(' ', style)
+    }
+
+    /// Creates a continuation cell — the second column of a double-width glyph to its left.
+    #[must_use]
+    pub(crate) const fn continuation(style: Style) -> Self {
+        Self::new(CONTINUATION, style)
+    }
+
+    /// Whether this cell is the trailing half of a double-width glyph (never emitted on its own).
+    #[must_use]
+    pub(crate) const fn is_continuation(&self) -> bool {
+        matches!(self.symbol, CONTINUATION)
     }
 }
 
@@ -116,13 +145,22 @@ impl Buffer {
     }
 
     /// Writes `symbol` in `style` at `(x, y)` (clipped).
+    ///
+    /// A double-width glyph also writes a continuation cell at `x + 1` so the column it covers is
+    /// not redrawn or emitted separately. An incoming `NUL` is mapped to a space so it can never
+    /// be mistaken for the internal continuation sentinel.
     pub fn set_char(&mut self, x: u16, y: u16, symbol: char, style: Style) {
+        let symbol = if symbol == CONTINUATION { ' ' } else { symbol };
         self.set(x, y, Cell::new(symbol, style));
+        if char_width(symbol) == 2 {
+            self.set(x.saturating_add(1), y, Cell::continuation(style));
+        }
     }
 
     /// Writes `text` starting at `(x, y)`, clipping at the row's end.
     ///
-    /// Returns the column just past the last character written.
+    /// Returns the column just past the last character written, advancing by each glyph's
+    /// display width (so double-width glyphs occupy two columns).
     pub fn set_str(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
         let mut col = x;
         for ch in text.chars() {
@@ -130,7 +168,7 @@ impl Buffer {
                 break;
             }
             self.set_char(col, y, ch, style);
-            col += 1;
+            col = col.saturating_add(char_width(ch));
         }
         col
     }
@@ -143,11 +181,26 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::Buffer;
+    use super::{char_width, Buffer};
     use crate::theme::Theme;
 
     fn style() -> crate::theme::Style {
         Theme::steelbore().base_style()
+    }
+
+    #[test]
+    fn wide_glyph_occupies_two_columns() {
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width('世'), 2);
+
+        let mut buffer = Buffer::new(6, 1, style());
+        // "a" (1) + "世" (2) + "b" (1) = next column 4.
+        let next = buffer.set_str(0, 0, "a世b", style());
+        assert_eq!(next, 4);
+        assert_eq!(buffer.cell(0, 0).unwrap().symbol, 'a');
+        assert_eq!(buffer.cell(1, 0).unwrap().symbol, '世');
+        assert!(buffer.cell(2, 0).unwrap().is_continuation());
+        assert_eq!(buffer.cell(3, 0).unwrap().symbol, 'b');
     }
 
     #[test]

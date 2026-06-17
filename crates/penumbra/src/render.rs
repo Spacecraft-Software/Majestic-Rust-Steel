@@ -11,7 +11,7 @@
 
 use std::io::{self, Write};
 
-use crate::buffer::Buffer;
+use crate::buffer::{char_width, Buffer};
 use crate::theme::Style;
 
 /// A double-buffered surface: draw into the back buffer, then [`present`](Screen::present).
@@ -80,6 +80,11 @@ pub fn render(prev: &Buffer, next: &Buffer, out: &mut impl Write) -> io::Result<
             let Some(cell) = next.cell(x, y) else {
                 continue;
             };
+            // The trailing half of a double-width glyph is covered by the glyph itself — never
+            // emit it (doing so would desync the terminal cursor by a column).
+            if cell.is_continuation() {
+                continue;
+            }
             let changed = full_redraw || prev.cell(x, y) != Some(cell);
             if !changed {
                 continue;
@@ -96,9 +101,10 @@ pub fn render(prev: &Buffer, next: &Buffer, out: &mut impl Write) -> io::Result<
             let mut utf8 = [0u8; 4];
             out.write_all(cell.symbol.encode_utf8(&mut utf8).as_bytes())?;
 
-            // The terminal advances the cursor one column; force a reposition at row end
-            // to avoid depending on autowrap behavior.
-            cursor = (x + 1 < next.width()).then(|| (x + 1, y));
+            // Advance by the glyph's display width (a wide glyph moves the cursor two columns);
+            // force a reposition at row end to avoid depending on autowrap behavior.
+            let next_x = x.saturating_add(char_width(cell.symbol));
+            cursor = (next_x < next.width()).then_some((next_x, y));
         }
     }
     out.flush()
@@ -255,6 +261,24 @@ mod tests {
         let mut out = Vec::new();
         render(&prev, &next, &mut out).unwrap();
         assert_eq!(reconstruct(&prev, &out), next);
+    }
+
+    #[test]
+    fn wide_glyph_emits_once_without_continuation() {
+        let prev = Buffer::new(8, 1, base());
+        let mut next = prev.clone();
+        next.set_str(0, 0, "世", base());
+        let mut out = Vec::new();
+        render(&prev, &next, &mut out).unwrap();
+        // The wide glyph is emitted, and its continuation cell (NUL) never is.
+        assert!(
+            out.windows(3).any(|window| window == "世".as_bytes()),
+            "expected the wide glyph in the output"
+        );
+        assert!(
+            !out.contains(&0u8),
+            "the continuation cell must never be emitted"
+        );
     }
 
     #[test]

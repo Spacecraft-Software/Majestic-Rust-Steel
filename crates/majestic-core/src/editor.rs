@@ -10,7 +10,7 @@
 //! The interactive `crossterm` loop and the `mj FILE` binary wire this up in M0 step 7.
 
 use keymaker::{cua, Dispatcher, KeyCode, Mods, Resolution};
-use penumbra::{Buffer as Surface, Cell, Rect, Style, Theme};
+use penumbra::{char_width, Buffer as Surface, Cell, Rect, Style, Theme};
 
 use stratum::{Point, SpanLayer};
 
@@ -249,15 +249,14 @@ impl Editor {
                 break;
             }
             let mut byte = rope.point_to_byte(Point::new(line_index, 0));
-            for (index, ch) in rope.line(line_index).chars().enumerate() {
-                let Ok(col) = u16::try_from(index) else {
-                    break;
-                };
+            let mut col: u16 = 0;
+            for ch in rope.line(line_index).chars() {
                 if col >= area.width {
                     break;
                 }
                 let style = styles.get(byte - start_byte).copied().unwrap_or(base);
                 surface.set_char(area.x + col, area.y + row, ch, style);
+                col = col.saturating_add(char_width(ch));
                 byte += ch.len_utf8();
             }
         }
@@ -351,7 +350,7 @@ impl Editor {
             return;
         }
         let screen_row = row - self.viewport_top;
-        let column = self.buffer.cursor_column();
+        let column = self.cursor_display_column();
         let (Ok(cx), Ok(cy)) = (u16::try_from(column), u16::try_from(screen_row)) else {
             return;
         };
@@ -364,6 +363,20 @@ impl Editor {
             .map_or((' ', theme.base_style()), |cell| (cell.symbol, cell.style));
         style.attrs.reverse = true;
         surface.set(x, y, Cell::new(symbol, style));
+    }
+
+    /// The cursor's display column: the sum of glyph widths before it on its line, so the cursor
+    /// lands under the right cell when the line contains double-width glyphs.
+    fn cursor_display_column(&self) -> usize {
+        let point = self.buffer.cursor_point();
+        let chars_before = self.buffer.cursor_column();
+        self.buffer
+            .rope()
+            .line(point.row)
+            .chars()
+            .take(chars_before)
+            .map(|ch| usize::from(char_width(ch)))
+            .sum()
     }
 
     /// The status-line text: file name, dirty marker, cursor position, and last status message.
@@ -502,5 +515,36 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&journal);
+    }
+
+    #[test]
+    fn renders_wide_glyphs_across_two_columns() {
+        // A double-width glyph takes two cells, so following text stays aligned.
+        let theme = Theme::steelbore();
+        let mut editor = Editor::with_buffer(Buffer::from_text("a世b"));
+        let mut surface = Surface::new(20, 2, theme.base_style());
+        editor.render(&mut surface, &theme);
+
+        assert_eq!(surface.cell(0, 0).unwrap().symbol, 'a');
+        assert_eq!(surface.cell(1, 0).unwrap().symbol, '世');
+        // Column 2 is the wide glyph's continuation; `b` lands at column 3, not 2.
+        assert_eq!(surface.cell(3, 0).unwrap().symbol, 'b');
+    }
+
+    #[test]
+    fn cursor_lands_after_a_wide_glyph() {
+        let theme = Theme::steelbore();
+        let mut editor = Editor::with_buffer(Buffer::from_text("世x"));
+        editor.handle_key(KeyPress::key(KeyCode::Right)); // char col 0 -> 1 (onto `x`)
+        let mut surface = Surface::new(20, 2, theme.base_style());
+        editor.render(&mut surface, &theme);
+
+        // `世` is two columns wide, so the cursor sits at display column 2, on `x`.
+        let cell = surface.cell(2, 0).unwrap();
+        assert_eq!(cell.symbol, 'x');
+        assert!(
+            cell.style.attrs.reverse,
+            "cursor should highlight `x` at column 2"
+        );
     }
 }

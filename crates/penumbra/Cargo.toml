@@ -13,3 +13,6 @@ description = "Majestic TTY renderer: framebuffer-diff over crossterm + ratatui.
 
 [lints]
 workspace = true
+
+[dependencies]
+unicode-width = "0.1"

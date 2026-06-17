@@ -122,6 +122,14 @@ impl Terminal {
     pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme) {
         for indexed in self.term.grid().display_iter() {
             let cell = indexed.cell;
+            // Skip alacritty's spacer cells after a wide glyph — Penumbra's `set_char` on the
+            // wide glyph itself already writes the continuation column.
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
             let (Ok(row), Ok(col)) = (
                 u16::try_from(indexed.point.line.0),
                 u16::try_from(indexed.point.column.0),
@@ -182,6 +190,17 @@ mod tests {
         let mut terminal = Terminal::new(10, 3);
         terminal.feed(b"hello");
         assert_eq!(row_text(&rendered(&terminal, &theme), 0), "hello     ");
+    }
+
+    #[test]
+    fn wide_glyph_occupies_two_grid_cells() {
+        let theme = Theme::steelbore();
+        let mut terminal = Terminal::new(6, 2);
+        terminal.feed("世x".as_bytes());
+        let surface = rendered(&terminal, &theme);
+        assert_eq!(surface.cell(0, 0).unwrap().symbol, '世');
+        // Column 1 is the continuation (alacritty's spacer is skipped); `x` lands at column 2.
+        assert_eq!(surface.cell(2, 0).unwrap().symbol, 'x');
     }
 
     #[test]
