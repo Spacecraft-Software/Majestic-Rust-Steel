@@ -14,6 +14,7 @@
 //! [`Screen`]. The editor model itself is backend-agnostic and tested headless.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use crossterm::cursor;
@@ -25,7 +26,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods};
-use majestic_core::Workspace;
+use majestic_core::{Editor, FileTree, Workspace};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -37,6 +38,12 @@ const PANEL_ROWS: u16 = 10;
 
 /// Editor rows kept visible above the panel; below this total the panel is hidden.
 const MIN_EDITOR_ROWS: u16 = 3;
+
+/// Width of the explorer sidebar in columns (UI.md §2: 20–35, resizable later).
+const SIDEBAR_COLS: u16 = 28;
+
+/// Editor columns kept usable beside the sidebar; below this the sidebar is not drawn.
+const MIN_MAIN_COLS: u16 = 24;
 
 /// Restores the terminal (cooked mode, main screen, visible cursor) when dropped.
 struct TerminalGuard;
@@ -70,12 +77,19 @@ impl Drop for TerminalGuard {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Editor,
+    Explorer,
     Terminal,
 }
 
-/// The running application: the editor workspace plus an optional integrated terminal.
+/// The `Ctrl+B` key toggles the explorer sidebar (VS Code convention).
+const SIDEBAR_TOGGLE: KeyPress = KeyPress::ctrl('b');
+
+/// The running application: the editor workspace, an optional explorer sidebar, and an optional
+/// integrated terminal.
 struct App {
     workspace: Workspace,
+    explorer: Option<FileTree>,
+    sidebar_visible: bool,
     terminal: Option<PtyTerminal>,
     focus: Focus,
 }
@@ -84,6 +98,8 @@ impl App {
     fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
+            explorer: None,
+            sidebar_visible: false,
             terminal: None,
             focus: Focus::Editor,
         }
@@ -110,14 +126,16 @@ impl App {
         self.workspace.should_quit()
     }
 
-    /// Draws the editor area, the bottom terminal panel (when present), and the status bar.
+    /// Draws the sidebar, the editor area, the bottom terminal panel (when present), and the
+    /// status bar — the full UI.md layout.
     fn render(&mut self, surface: &mut Buffer, theme: &Theme) {
         surface.clear(theme.base_style());
         let (body, status) = surface.area().split_bottom(1);
+        let main = self.render_sidebar(surface, body, theme);
 
-        if self.terminal.is_some() && body.height > MIN_EDITOR_ROWS + 1 {
-            let panel_rows = PANEL_ROWS.min(body.height - (MIN_EDITOR_ROWS + 1));
-            let (editor_area, block) = body.split_bottom(panel_rows + 1);
+        if self.terminal.is_some() && main.height > MIN_EDITOR_ROWS + 1 {
+            let panel_rows = PANEL_ROWS.min(main.height - (MIN_EDITOR_ROWS + 1));
+            let (editor_area, block) = main.split_bottom(panel_rows + 1);
             let (divider, panel_area) = block.split_top(1);
 
             // Keep the shell sized to its panel so its grid matches what we draw.
@@ -139,10 +157,35 @@ impl App {
                 term.render_in(surface, panel_area, theme);
             }
         } else {
-            self.workspace.render(surface, body, theme, true);
+            self.workspace
+                .render(surface, main, theme, self.focus == Focus::Editor);
         }
 
         self.draw_status_bar(surface, status.y, theme);
+    }
+
+    /// Draws the explorer sidebar on the left (when shown and wide enough), returning the
+    /// remaining region for the editor/terminal stack.
+    fn render_sidebar(&mut self, surface: &mut Buffer, body: Rect, theme: &Theme) -> Rect {
+        if !self.sidebar_visible {
+            return body;
+        }
+        let focused = self.focus == Focus::Explorer;
+        let Some(explorer) = self.explorer.as_mut() else {
+            return body;
+        };
+        let sidebar_cols = SIDEBAR_COLS.min(body.width.saturating_sub(MIN_MAIN_COLS + 1));
+        if sidebar_cols == 0 {
+            return body; // too narrow to show the sidebar; keep the full main area
+        }
+        let (sidebar, rest) = body.split_left(sidebar_cols);
+        let (divider, main) = rest.split_left(1);
+        explorer.render(surface, sidebar, theme, focused);
+        let rule = Style::new(theme.accent, theme.background); // Steel Blue
+        for y in divider.y..divider.bottom() {
+            surface.set_char(divider.x, y, '│', rule);
+        }
+        main
     }
 
     /// Draws the global status bar: the editor's status line plus a focus/terminal hint.
@@ -153,10 +196,14 @@ impl App {
         }
         surface.set_str(0, row, &self.workspace.status_line(), style);
 
-        let hint = match (self.terminal.is_some(), self.focus) {
-            (false, _) => "[F12: terminal]",
-            (true, Focus::Editor) => "[F12: ⇄ TERMINAL]",
-            (true, Focus::Terminal) => "[F12: ⇄ EDITOR]",
+        let hint = if self.terminal.is_some() {
+            if self.focus == Focus::Terminal {
+                "[F12: ⇄ EDITOR  Ctrl+B: files]"
+            } else {
+                "[F12: ⇄ TERMINAL  Ctrl+B: files]"
+            }
+        } else {
+            "[F12: terminal  Ctrl+B: files]"
         };
         if let Ok(len) = u16::try_from(hint.chars().count()) {
             if len < surface.width() {
@@ -170,16 +217,77 @@ impl App {
             self.toggle_terminal(columns, lines);
             return Ok(());
         }
-        if self.focus == Focus::Terminal {
-            if let Some(term) = self.terminal.as_mut() {
-                if let Some(bytes) = encode_key(key) {
-                    term.write_input(&bytes)?;
-                }
-                return Ok(());
-            }
+        if key == SIDEBAR_TOGGLE {
+            self.toggle_sidebar();
+            return Ok(());
         }
-        self.workspace.handle_key(key);
+        match self.focus {
+            Focus::Terminal => {
+                if let Some(term) = self.terminal.as_mut() {
+                    if let Some(bytes) = encode_key(key) {
+                        term.write_input(&bytes)?;
+                    }
+                }
+            }
+            Focus::Explorer => self.explorer_key(key),
+            Focus::Editor => self.workspace.handle_key(key),
+        }
         Ok(())
+    }
+
+    /// Routes a key to the explorer: arrow navigation, `Enter` to open/expand, `Esc` to leave.
+    fn explorer_key(&mut self, key: KeyPress) {
+        if key.code == KeyCode::Escape {
+            self.focus = Focus::Editor;
+            return;
+        }
+        let opened = if let Some(explorer) = self.explorer.as_mut() {
+            match key.code {
+                KeyCode::Up => {
+                    explorer.select_up();
+                    None
+                }
+                KeyCode::Down => {
+                    explorer.select_down();
+                    None
+                }
+                KeyCode::Enter => explorer.activate(),
+                _ => None,
+            }
+        } else {
+            self.focus = Focus::Editor;
+            None
+        };
+        if let Some(path) = opened {
+            self.open_path(&path);
+        }
+    }
+
+    /// Opens `path` as a new buffer in the workspace and moves focus to the editor.
+    fn open_path(&mut self, path: &Path) {
+        if let Ok(buffer) = majestic_core::Buffer::open(path) {
+            self.workspace.open(Editor::with_buffer(buffer));
+            self.focus = Focus::Editor;
+        }
+        // A failed open keeps focus on the explorer; surfaced errors arrive with the minibuffer.
+    }
+
+    /// `Ctrl+B`: open+focus the sidebar, focus it if already shown, or hide it when focused.
+    fn toggle_sidebar(&mut self) {
+        if !self.sidebar_visible {
+            if self.explorer.is_none() {
+                let root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                self.explorer = Some(FileTree::new(root));
+            }
+            self.sidebar_visible = true;
+            self.focus = Focus::Explorer;
+        } else if self.focus == Focus::Explorer {
+            self.sidebar_visible = false;
+            self.focus = Focus::Editor;
+        } else {
+            self.focus = Focus::Explorer;
+        }
     }
 
     fn paste(&mut self, text: &str) -> io::Result<()> {
@@ -193,12 +301,13 @@ impl App {
     }
 
     /// `F12`: spawn the shell on first use (focusing it), otherwise flip focus between the
-    /// editor and the (still-running) terminal panel — the shell session survives toggling.
+    /// terminal panel and the editor — the shell session survives toggling.
     fn toggle_terminal(&mut self, columns: u16, lines: u16) {
         if self.terminal_running() {
-            self.focus = match self.focus {
-                Focus::Editor => Focus::Terminal,
-                Focus::Terminal => Focus::Editor,
+            self.focus = if self.focus == Focus::Terminal {
+                Focus::Editor
+            } else {
+                Focus::Terminal
             };
             return;
         }
@@ -384,7 +493,7 @@ mod tests {
         editor.handle_key(KeyPress::char('i'));
 
         let mut app = App::new(Workspace::new(editor));
-        let mut surface = Buffer::new(24, 6, theme.base_style());
+        let mut surface = Buffer::new(60, 6, theme.base_style());
         app.render(&mut surface, &theme);
 
         // Row 0 is the tab bar; the scratch buffer is listed there.

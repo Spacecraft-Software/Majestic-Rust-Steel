@@ -108,6 +108,13 @@ impl Workspace {
         }
     }
 
+    /// Opens `editor` as a new buffer and shows it in the focused pane (its previous buffer
+    /// stays open as a background tab). Used by the explorer and the fuzzy file finder.
+    pub fn open(&mut self, editor: Editor) {
+        self.editors.push(editor);
+        self.panes[self.focused] = self.editors.len() - 1;
+    }
+
     /// Feeds a key: runs a window command, or forwards it to the focused editor.
     pub fn handle_key(&mut self, key: KeyPress) {
         if self.window_command(key) {

@@ -96,6 +96,23 @@ impl Rect {
         );
         (top, bottom)
     }
+
+    /// Splits the left `cols` off, returning `(left, right)`.
+    ///
+    /// `left` is the first `cols` columns (clamped to this region's width); `right` is what
+    /// remains. Asking for more columns than exist yields an empty `right`.
+    #[must_use]
+    pub const fn split_left(self, cols: u16) -> (Self, Self) {
+        let cols = if cols > self.width { self.width } else { cols };
+        let left = Self::new(self.x, self.y, cols, self.height);
+        let right = Self::new(
+            self.x.saturating_add(cols),
+            self.y,
+            self.width - cols,
+            self.height,
+        );
+        (left, right)
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +159,17 @@ mod tests {
         let (top, bottom) = Rect::new(1, 2, 8, 10).split_top(3);
         assert_eq!(top, Rect::new(1, 2, 8, 3));
         assert_eq!(bottom, Rect::new(1, 5, 8, 7));
+    }
+
+    #[test]
+    fn split_left_partitions_width() {
+        let (left, right) = Rect::new(0, 0, 30, 12).split_left(8);
+        assert_eq!(left, Rect::new(0, 0, 8, 12));
+        assert_eq!(right, Rect::new(8, 0, 22, 12));
+        assert_eq!(left.right(), right.x);
+
+        let (left, right) = Rect::new(0, 0, 4, 4).split_left(9);
+        assert_eq!(left, Rect::new(0, 0, 4, 4));
+        assert!(right.is_empty());
     }
 }

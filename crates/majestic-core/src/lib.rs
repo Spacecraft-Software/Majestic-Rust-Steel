@@ -32,6 +32,7 @@
 
 mod buffer;
 mod editor;
+mod files;
 mod syntax;
 mod workspace;
 
@@ -39,5 +40,7 @@ mod workspace;
 pub use buffer::Buffer;
 #[doc(inline)]
 pub use editor::Editor;
+#[doc(inline)]
+pub use files::FileTree;
 #[doc(inline)]
 pub use workspace::{Split, Workspace};
