@@ -14,9 +14,9 @@ use std::fmt;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
-use penumbra::{Buffer, Rect, Style, Theme};
+use penumbra::{Buffer, Cell, Rect, Style, Theme};
 
 use crate::color::resolve;
 
@@ -110,16 +110,19 @@ impl Terminal {
         &self.term
     }
 
-    /// Renders the visible grid into `surface` using `theme` for default colors.
+    /// Renders the visible grid into `surface` using `theme` for default colors (no cursor).
     pub fn render(&self, surface: &mut Buffer, theme: &Theme) {
-        self.render_in(surface, surface.area(), theme);
+        let area = surface.area();
+        self.render_in(surface, area, theme, false);
     }
 
-    /// Renders the visible grid into `area` of `surface`, offsetting and clipping to it.
+    /// Renders the visible grid into `area` of `surface`, offsetting and clipping to it. When
+    /// `focused`, a block cursor is drawn at the terminal's cursor position (if the child has not
+    /// hidden it), so the user can see where typing lands.
     ///
     /// Cells outside `area` (the grid is wider/taller than the panel) are clipped; the host is
     /// expected to keep the terminal sized to the panel via [`Terminal::resize`].
-    pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme) {
+    pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool) {
         for indexed in self.term.grid().display_iter() {
             let cell = indexed.cell;
             // Skip alacritty's spacer cells after a wide glyph — Penumbra's `set_char` on the
@@ -149,6 +152,33 @@ impl Terminal {
             let symbol = if cell.c == '\0' { ' ' } else { cell.c };
             surface.set_char(area.x + col, area.y + row, symbol, style);
         }
+
+        if focused {
+            self.draw_cursor(surface, area, theme);
+        }
+    }
+
+    /// Draws a block cursor (reverse video) at the terminal's cursor cell, unless the child has
+    /// hidden it (`DECTCEM`) or it has scrolled out of the visible `area`.
+    fn draw_cursor(&self, surface: &mut Buffer, area: Rect, theme: &Theme) {
+        if !self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            return;
+        }
+        let point = self.term.grid().cursor.point;
+        let (Ok(row), Ok(col)) = (u16::try_from(point.line.0), u16::try_from(point.column.0))
+        else {
+            return;
+        };
+        if row >= area.height || col >= area.width {
+            return;
+        }
+        let (x, y) = (area.x + col, area.y + row);
+        let (symbol, mut style) = surface
+            .cell(x, y)
+            .map_or((' ', theme.base_style()), |cell| (cell.symbol, cell.style));
+        // Toggle reverse so the block cursor stands out whatever the cell's own styling.
+        style.attrs.reverse = !style.attrs.reverse;
+        surface.set(x, y, Cell::new(symbol, style));
     }
 }
 
@@ -190,6 +220,28 @@ mod tests {
         let mut terminal = Terminal::new(10, 3);
         terminal.feed(b"hello");
         assert_eq!(row_text(&rendered(&terminal, &theme), 0), "hello     ");
+    }
+
+    #[test]
+    fn focused_terminal_shows_a_block_cursor() {
+        let theme = Theme::steelbore();
+        let mut terminal = Terminal::new(6, 2);
+        terminal.feed(b"ab"); // cursor advances to column 2 on row 0
+        let area = Buffer::new(6, 2, theme.base_style()).area();
+
+        let mut focused = Buffer::new(6, 2, theme.base_style());
+        terminal.render_in(&mut focused, area, &theme, true);
+        assert!(
+            focused.cell(2, 0).unwrap().style.attrs.reverse,
+            "focused terminal draws a block cursor at column 2"
+        );
+
+        let mut unfocused = Buffer::new(6, 2, theme.base_style());
+        terminal.render_in(&mut unfocused, area, &theme, false);
+        assert!(
+            !unfocused.cell(2, 0).unwrap().style.attrs.reverse,
+            "unfocused terminal draws no cursor"
+        );
     }
 
     #[test]

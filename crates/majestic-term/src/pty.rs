@@ -128,9 +128,10 @@ impl PtyTerminal {
         lock(&self.terminal).render(surface, theme);
     }
 
-    /// Renders the live terminal grid into `area` of `surface` (offset and clipped to it).
-    pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme) {
-        lock(&self.terminal).render_in(surface, area, theme);
+    /// Renders the live terminal grid into `area` of `surface` (offset and clipped to it). When
+    /// `focused`, a block cursor marks the terminal's cursor position.
+    pub fn render_in(&self, surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool) {
+        lock(&self.terminal).render_in(surface, area, theme, focused);
     }
 
     /// Returns `true` while the child program is still running.

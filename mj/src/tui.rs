@@ -159,7 +159,7 @@ impl App {
                 .render(surface, editor_area, theme, self.focus == Focus::Editor);
             draw_panel_tab(surface, divider, theme, self.focus == Focus::Terminal);
             if let Some(term) = self.terminal.as_ref() {
-                term.render_in(surface, panel_area, theme);
+                term.render_in(surface, panel_area, theme, self.focus == Focus::Terminal);
             }
         } else {
             self.workspace
