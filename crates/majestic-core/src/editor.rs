@@ -24,6 +24,7 @@ pub struct Editor {
     clipboard: String,
     dispatcher: Dispatcher,
     viewport_top: usize,
+    viewport_left: usize,
     page_rows: usize,
     status: String,
     quit: bool,
@@ -53,6 +54,7 @@ impl Editor {
             clipboard: String::new(),
             dispatcher: Dispatcher::new(vec![cua()]),
             viewport_top: 0,
+            viewport_left: 0,
             page_rows: 1,
             status: String::new(),
             quit: false,
@@ -228,7 +230,7 @@ impl Editor {
         }
         self.page_rows = usize::from(area.height).max(1);
         self.refresh_highlights();
-        self.ensure_cursor_visible(area.height);
+        self.ensure_cursor_visible(area);
         surface.fill(area, theme.base_style());
 
         let base = theme.base_style();
@@ -249,14 +251,21 @@ impl Editor {
                 break;
             }
             let mut byte = rope.point_to_byte(Point::new(line_index, 0));
-            let mut col: u16 = 0;
+            let mut display = 0usize; // absolute display column within the line
             for ch in rope.line(line_index).chars() {
-                if col >= area.width {
-                    break;
+                if display >= self.viewport_left {
+                    let screen = display - self.viewport_left;
+                    if screen >= usize::from(area.width) {
+                        break; // the rest of the line is off the right edge
+                    }
+                    if let Ok(col) = u16::try_from(screen) {
+                        let style = styles.get(byte - start_byte).copied().unwrap_or(base);
+                        surface.set_char(area.x + col, area.y + row, ch, style);
+                    }
                 }
-                let style = styles.get(byte - start_byte).copied().unwrap_or(base);
-                surface.set_char(area.x + col, area.y + row, ch, style);
-                col = col.saturating_add(char_width(ch));
+                // Glyphs left of the viewport (or a wide glyph straddling its left edge) are
+                // skipped — only their width is accounted for.
+                display += usize::from(char_width(ch));
                 byte += ch.len_utf8();
             }
         }
@@ -331,16 +340,24 @@ impl Editor {
         styles
     }
 
-    fn ensure_cursor_visible(&mut self, text_rows: u16) {
-        let rows = usize::from(text_rows);
-        if rows == 0 {
-            return;
+    fn ensure_cursor_visible(&mut self, area: Rect) {
+        let rows = usize::from(area.height);
+        if rows > 0 {
+            let row = self.buffer.cursor_point().row;
+            if row < self.viewport_top {
+                self.viewport_top = row;
+            } else if row >= self.viewport_top + rows {
+                self.viewport_top = row + 1 - rows;
+            }
         }
-        let row = self.buffer.cursor_point().row;
-        if row < self.viewport_top {
-            self.viewport_top = row;
-        } else if row >= self.viewport_top + rows {
-            self.viewport_top = row + 1 - rows;
+        let cols = usize::from(area.width);
+        if cols > 0 {
+            let col = self.cursor_display_column();
+            if col < self.viewport_left {
+                self.viewport_left = col;
+            } else if col >= self.viewport_left + cols {
+                self.viewport_left = col + 1 - cols;
+            }
         }
     }
 
@@ -351,7 +368,11 @@ impl Editor {
         }
         let screen_row = row - self.viewport_top;
         let column = self.cursor_display_column();
-        let (Ok(cx), Ok(cy)) = (u16::try_from(column), u16::try_from(screen_row)) else {
+        if column < self.viewport_left {
+            return; // cursor scrolled off the left edge
+        }
+        let screen_col = column - self.viewport_left;
+        let (Ok(cx), Ok(cy)) = (u16::try_from(screen_col), u16::try_from(screen_row)) else {
             return;
         };
         if cy >= area.height || cx >= area.width {
@@ -529,6 +550,25 @@ mod tests {
         assert_eq!(surface.cell(1, 0).unwrap().symbol, '世');
         // Column 2 is the wide glyph's continuation; `b` lands at column 3, not 2.
         assert_eq!(surface.cell(3, 0).unwrap().symbol, 'b');
+    }
+
+    #[test]
+    fn long_line_scrolls_horizontally_to_follow_the_cursor() {
+        let theme = Theme::steelbore();
+        // 16 single-width glyphs in an 8-column viewport.
+        let mut editor = Editor::with_buffer(Buffer::from_text("0123456789ABCDEF"));
+        editor.handle_key(KeyPress::key(KeyCode::End)); // cursor to display column 16
+        let mut surface = Surface::new(8, 2, theme.base_style());
+        editor.render(&mut surface, &theme);
+
+        // viewport_left = 16 + 1 - 8 = 9, so columns 9..16 ("9ABCDEF") are shown.
+        assert_eq!(surface.cell(0, 0).unwrap().symbol, '9');
+        assert_eq!(surface.cell(6, 0).unwrap().symbol, 'F');
+        // The cursor (display column 16) lands at the last screen column.
+        assert!(
+            surface.cell(7, 0).unwrap().style.attrs.reverse,
+            "cursor at the right edge"
+        );
     }
 
     #[test]
