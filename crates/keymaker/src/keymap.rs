@@ -100,6 +100,34 @@ impl Keymap {
             Lookup::Prefix
         }
     }
+
+    /// Returns every bound key sequence paired with its command, in key order.
+    ///
+    /// This lets introspection (Oracle) read the live keymap directly, so help is always
+    /// accurate for the running image rather than a hand-maintained copy.
+    #[must_use]
+    pub fn bindings(&self) -> Vec<(Vec<KeyPress>, Command)> {
+        let mut bindings = Vec::new();
+        let mut prefix = Vec::new();
+        collect_bindings(&self.root, &mut prefix, &mut bindings);
+        bindings
+    }
+}
+
+/// Depth-first walk collecting `(sequence, command)` for every node that binds a command.
+fn collect_bindings(
+    node: &Node,
+    prefix: &mut Vec<KeyPress>,
+    out: &mut Vec<(Vec<KeyPress>, Command)>,
+) {
+    if let Some(command) = &node.command {
+        out.push((prefix.clone(), command.clone()));
+    }
+    for (key, child) in &node.children {
+        prefix.push(*key);
+        collect_bindings(child, prefix, out);
+        prefix.pop();
+    }
 }
 
 fn bind_node(node: &Node, sequence: &[KeyPress], command: Command) -> Node {
@@ -134,6 +162,24 @@ mod tests {
             Lookup::Bound(Command::new("save"))
         );
         assert_eq!(keymap.lookup(&[KeyPress::ctrl('q')]), Lookup::Unbound);
+    }
+
+    #[test]
+    fn bindings_enumerates_every_bound_sequence() {
+        let keymap = Keymap::new()
+            .bind(&[KeyPress::ctrl('s')], Command::new("save"))
+            .bind(
+                &[KeyPress::ctrl('x'), KeyPress::ctrl('c')],
+                Command::new("quit"),
+            );
+        let bindings = keymap.bindings();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings
+            .iter()
+            .any(|(seq, cmd)| seq.as_slice() == [KeyPress::ctrl('s')] && cmd.name() == "save"));
+        assert!(bindings
+            .iter()
+            .any(|(seq, cmd)| seq.len() == 2 && cmd.name() == "quit"));
     }
 
     #[test]

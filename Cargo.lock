@@ -1593,6 +1593,7 @@ dependencies = [
  "majestic-core",
  "majestic-steel",
  "majestic-term",
+ "oracle",
  "penumbra",
 ]
 
@@ -1997,6 +1998,9 @@ dependencies = [
 [[package]]
 name = "oracle"
 version = "0.0.0"
+dependencies = [
+ "keymaker",
+]
 
 [[package]]
 name = "ordered-float"

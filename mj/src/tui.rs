@@ -230,7 +230,7 @@ impl App {
             return Ok(());
         }
         if is_command_palette(key) {
-            self.finder = Some(Finder::commands(Editor::COMMANDS));
+            self.finder = Some(Finder::commands(&oracle::command_names()));
             return Ok(());
         }
         if key == FILE_FINDER {

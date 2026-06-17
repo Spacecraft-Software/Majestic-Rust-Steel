@@ -26,4 +26,5 @@ majestic-config = { version = "0.0.0", path = "../crates/majestic-config" }
 majestic-core = { version = "0.0.0", path = "../crates/majestic-core" }
 majestic-steel = { version = "0.0.0", path = "../crates/majestic-steel" }
 majestic-term = { version = "0.0.0", path = "../crates/majestic-term" }
+oracle = { version = "0.0.0", path = "../crates/oracle" }
 penumbra = { version = "0.0.0", path = "../crates/penumbra" }

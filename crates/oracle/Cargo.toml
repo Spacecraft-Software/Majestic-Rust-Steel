@@ -13,3 +13,6 @@ description = "Majestic live help and introspection registries."
 
 [lints]
 workspace = true
+
+[dependencies]
+keymaker = { version = "0.0.0", path = "../keymaker" }

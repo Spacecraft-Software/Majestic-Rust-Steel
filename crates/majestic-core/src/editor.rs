@@ -37,36 +37,6 @@ pub struct Editor {
 const DEFAULT_TAB_WIDTH: usize = 4;
 
 impl Editor {
-    /// The command names [`Editor::execute`] understands — the command palette's catalog.
-    pub const COMMANDS: &'static [&'static str] = &[
-        "move-left",
-        "move-right",
-        "move-up",
-        "move-down",
-        "move-line-start",
-        "move-line-end",
-        "page-up",
-        "page-down",
-        "select-left",
-        "select-right",
-        "select-up",
-        "select-down",
-        "select-all",
-        "delete-backward",
-        "delete-forward",
-        "insert-newline",
-        "indent",
-        "undo",
-        "redo",
-        "copy",
-        "cut",
-        "paste",
-        "save",
-        "find",
-        "quit",
-        "close-buffer",
-    ];
-
     /// Creates an editor on a scratch buffer with the CUA keymap.
     #[must_use]
     pub fn new() -> Self {

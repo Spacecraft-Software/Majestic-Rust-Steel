@@ -35,6 +35,10 @@ enum Action {
     Help,
     /// Open the given paths in the editor (not yet implemented at scaffold stage).
     Open(Vec<String>),
+    /// Oracle: describe a command/variable, or (with no argument) list keybindings.
+    Describe(Option<String>),
+    /// Oracle: search commands by keyword.
+    Apropos(Option<String>),
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -53,8 +57,11 @@ fn classify(args: &[String]) -> Action {
     match first.as_str() {
         "--version" | "-V" => Action::Version,
         "--help" | "-h" => Action::Help,
+        // Oracle introspection from the shell (PRD §5.2.2).
+        "describe" => Action::Describe(args.get(1).cloned()),
+        "apropos" => Action::Apropos(args.get(1).cloned()),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
-        "config" | "session" | "describe" | "ed" => Action::Pending(first.clone()),
+        "config" | "session" | "ed" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
         "--" => Action::Open(args[1..].to_vec()),
         other if other.starts_with('-') => Action::Unknown(other.to_owned()),
@@ -86,10 +93,11 @@ USAGE:
     {PROGRAM} <COMMAND> [ARGS]     Run a subcommand
 
 COMMANDS:
-    config     Validate/inspect configuration (M1)
-    session    Manage daemon sessions (M2)
-    describe   Oracle introspection from the shell (M1)
-    ed         Line-editor mode (M4)
+    describe [NAME]    Help for a command/variable, or list keybindings (Oracle)
+    apropos <WORD>     Search commands by keyword (Oracle)
+    config             Validate/inspect configuration (M1)
+    session            Manage daemon sessions (M2)
+    ed                 Line-editor mode (M4)
 
 OPTIONS:
     -h, --help       Print this help
@@ -118,6 +126,8 @@ fn main() -> ExitCode {
         }
         Action::Empty => run_editor(&[], safe_mode),
         Action::Open(paths) => run_editor(&paths, safe_mode),
+        Action::Describe(query) => run_describe(query.as_deref()),
+        Action::Apropos(query) => run_apropos(query.as_deref()),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -220,6 +230,33 @@ fn one_line(error: &dyn std::fmt::Display) -> String {
         .join(" ")
 }
 
+/// `mj describe [NAME]` — Oracle help printed to stdout, read from the live CUA keymap.
+///
+/// With a name, describes that command (or variable); with none, lists every key binding.
+fn run_describe(query: Option<&str>) -> ExitCode {
+    let keymap = keymaker::cua();
+    let output = match query {
+        None => oracle::describe_bindings(&keymap),
+        Some(name) if oracle::command_doc(name).is_some() => {
+            oracle::describe_function(&keymap, name)
+        }
+        Some(name) if oracle::variable_doc(name).is_some() => oracle::describe_variable(name),
+        Some(name) => oracle::describe_function(&keymap, name), // renders the "no command" notice
+    };
+    println!("{output}");
+    ExitCode::SUCCESS
+}
+
+/// `mj apropos <WORD>` — Oracle keyword search printed to stdout.
+fn run_apropos(query: Option<&str>) -> ExitCode {
+    let Some(word) = query else {
+        eprintln!("{PROGRAM}: apropos needs a keyword. Try `{PROGRAM} apropos save`.");
+        return ExitCode::FAILURE;
+    };
+    println!("{}", oracle::apropos(word));
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify, Action};
@@ -259,5 +296,33 @@ mod tests {
             classify(&owned(&["--nope"])),
             Action::Unknown("--nope".to_owned())
         );
+    }
+
+    #[test]
+    fn oracle_subcommands_classify() {
+        assert_eq!(
+            classify(&owned(&["describe", "save"])),
+            Action::Describe(Some("save".to_owned()))
+        );
+        assert_eq!(classify(&owned(&["describe"])), Action::Describe(None));
+        assert_eq!(
+            classify(&owned(&["apropos", "select"])),
+            Action::Apropos(Some("select".to_owned()))
+        );
+    }
+
+    #[test]
+    fn every_oracle_command_is_handled_by_the_editor() {
+        // Cross-check that Oracle's catalog and `Editor::execute` stay in lockstep: a registered
+        // command that `execute` does not handle would set an "unbound command" status.
+        use majestic_core::Editor;
+        for name in oracle::command_names() {
+            let mut editor = Editor::new();
+            editor.execute(name);
+            assert!(
+                !editor.status().starts_with("unbound command"),
+                "`{name}` is in Oracle's catalog but not handled by Editor::execute"
+            );
+        }
     }
 }
