@@ -22,6 +22,8 @@ members = [
     "crates/majestic-steel",
     "crates/majestic-core",
     "crates/majestic-cli",
+    # Tooling (not shipped with `mj`): the §7 performance harness.
+    "crates/majestic-bench",
     # The thin binary crate (package `majestic`, binary `mj`).
     "mj",
 ]

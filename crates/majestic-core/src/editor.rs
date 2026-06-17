@@ -231,8 +231,18 @@ impl Editor {
 
         let base = theme.base_style();
         let rope = self.buffer.rope();
+        let first_line = self.viewport_top;
+        let start_byte = rope.point_to_byte(Point::new(first_line, 0));
+        let last_line = (first_line + usize::from(area.height)).min(rope.len_lines());
+        let end_byte = if last_line >= rope.len_lines() {
+            rope.len_bytes()
+        } else {
+            rope.point_to_byte(Point::new(last_line, 0))
+        };
+        let styles = self.visible_styles(start_byte, end_byte, base, theme);
+
         for row in 0..area.height {
-            let line_index = self.viewport_top + usize::from(row);
+            let line_index = first_line + usize::from(row);
             if line_index >= rope.len_lines() {
                 break;
             }
@@ -244,12 +254,8 @@ impl Editor {
                 if col >= area.width {
                     break;
                 }
-                surface.set_char(
-                    area.x + col,
-                    area.y + row,
-                    ch,
-                    self.style_at(byte, base, theme),
-                );
+                let style = styles.get(byte - start_byte).copied().unwrap_or(base);
+                surface.set_char(area.x + col, area.y + row, ch, style);
                 byte += ch.len_utf8();
             }
         }
@@ -274,12 +280,28 @@ impl Editor {
         }
     }
 
-    /// The style for the cell at byte `offset`: its highlight, or the base style.
-    fn style_at(&self, offset: usize, base: Style, theme: &Theme) -> Style {
-        self.highlights
-            .spans_in(offset..offset + 1)
-            .next()
-            .map_or(base, |span| span.value.style(theme))
+    /// Precomputes a per-byte [`Style`] array for the visible byte range `[start, end)` in a
+    /// single pass over the highlight spans.
+    ///
+    /// This replaces a per-glyph span scan: rendering a frame is then `O(glyphs + spans)` rather
+    /// than `O(glyphs × spans)` — the hot path the §7 harness flagged (keypress/scroll p99 went
+    /// from hundreds of milliseconds to well under one frame).
+    fn visible_styles(&self, start: usize, end: usize, base: Style, theme: &Theme) -> Vec<Style> {
+        let len = end.saturating_sub(start);
+        let mut styles = vec![base; len];
+        if len == 0 {
+            return styles;
+        }
+        for span in self.highlights.spans_in(start..end) {
+            let style = span.value.style(theme);
+            let range = span.range();
+            let from = range.start.max(start) - start;
+            let to = range.end.min(end) - start;
+            for slot in &mut styles[from..to] {
+                *slot = style;
+            }
+        }
+        styles
     }
 
     fn ensure_cursor_visible(&mut self, text_rows: u16) {

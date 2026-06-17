@@ -76,3 +76,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  perf:
+    name: §7 performance harness + binary size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Latency/throughput budgets (release, regression-gated). Known breaches are tracked,
+      # not enforced (see majestic-bench output).
+      - run: cargo run --release -p majestic-bench -- --check
+      # Binary-size ceiling (§7: ≤ 25 MB target / 40 MB ceiling). Gate on the ceiling.
+      - name: mj binary size <= 40 MB ceiling
+        run: |
+          cargo build --release -p majestic
+          bytes=$(stat -c%s target/release/mj)
+          echo "mj release binary: $bytes bytes (~$((bytes / 1048576)) MB)"
+          test "$bytes" -le 41943040

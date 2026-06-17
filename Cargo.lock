@@ -1598,6 +1598,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "majestic-bench"
+version = "0.0.0"
+dependencies = [
+ "keymaker",
+ "majestic-core",
+ "penumbra",
+]
+
+[[package]]
 name = "majestic-cli"
 version = "0.0.0"
 

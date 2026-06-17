@@ -120,14 +120,17 @@ impl SyntaxHighlighter {
     /// Highlights `source`, returning a layer of styled spans (empty on parse error).
     #[must_use]
     pub fn highlight(&mut self, source: &[u8]) -> SpanLayer<HighlightKind> {
-        let mut layer = SpanLayer::new();
         let Ok(events) = self
             .highlighter
             .highlight(&self.config, source, None, |_| None)
         else {
-            return layer;
+            return SpanLayer::new();
         };
 
+        // `tree_sitter_highlight` emits `Source` ranges in increasing start order, so the spans
+        // are collected already sorted and bulk-loaded in O(n) (vs. O(n²) repeated inserts —
+        // the hot path the §7 harness flagged).
+        let mut spans = Vec::new();
         let mut stack: Vec<HighlightKind> = Vec::new();
         for event in events {
             match event {
@@ -142,14 +145,14 @@ impl SyntaxHighlighter {
                 Ok(HighlightEvent::Source { start, end }) => {
                     if end > start {
                         if let Some(&kind) = stack.last() {
-                            layer.insert(Span::with_offsets(start, end, kind));
+                            spans.push(Span::with_offsets(start, end, kind));
                         }
                     }
                 }
                 Err(_) => break,
             }
         }
-        layer
+        SpanLayer::from_sorted(spans)
     }
 }
 

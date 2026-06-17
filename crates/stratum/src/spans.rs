@@ -121,6 +121,22 @@ impl<T> SpanLayer<T> {
         self.spans.insert(at, span);
     }
 
+    /// Builds a layer from spans already ordered by start offset — `O(n)`, versus `O(n²)` for
+    /// repeated [`SpanLayer::insert`]. Used to bulk-load a freshly computed layer (e.g. a
+    /// syntax highlighter emitting spans in source order).
+    ///
+    /// The caller guarantees the order; it is `debug_assert`ed but not enforced in release.
+    #[must_use]
+    pub fn from_sorted(spans: Vec<Span<T>>) -> Self {
+        debug_assert!(
+            spans
+                .windows(2)
+                .all(|pair| pair[0].start.offset() <= pair[1].start.offset()),
+            "from_sorted requires spans ordered by start offset",
+        );
+        Self { spans }
+    }
+
     /// Iterates the spans in start-offset order.
     pub fn iter(&self) -> impl Iterator<Item = &Span<T>> {
         self.spans.iter()
@@ -171,6 +187,25 @@ mod tests {
         // Insert exactly at the end boundary: span must not grow.
         let edited = layer.rebase(&Rope::from("0123456789").edit(6..6, "ZZ").1);
         assert_eq!(edited.iter().next().unwrap().range(), 3..6);
+    }
+
+    #[test]
+    fn from_sorted_matches_repeated_insert() {
+        // Bulk-loading pre-sorted spans yields the same layer as inserting them one by one.
+        let spans = vec![
+            Span::with_offsets(0, 2, "a"),
+            Span::with_offsets(2, 5, "b"),
+            Span::with_offsets(5, 9, "c"),
+        ];
+        let bulk = SpanLayer::from_sorted(spans.clone());
+        let mut incremental = SpanLayer::new();
+        for span in spans {
+            incremental.insert(span);
+        }
+        let bulk_ranges: Vec<_> = bulk.iter().map(super::Span::range).collect();
+        let inc_ranges: Vec<_> = incremental.iter().map(super::Span::range).collect();
+        assert_eq!(bulk_ranges, inc_ranges);
+        assert_eq!(bulk.len(), 3);
     }
 
     #[test]

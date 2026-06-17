@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "majestic-bench"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Majestic §7 latency/throughput harness (not shipped with the mj binary)."
+publish = false
+
+# A standalone tool, separate from the `mj` package so `cargo install majestic` never ships it.
+[[bin]]
+name = "majestic-bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+keymaker = { version = "0.0.0", path = "../keymaker" }
+majestic-core = { version = "0.0.0", path = "../majestic-core" }
+penumbra = { version = "0.0.0", path = "../penumbra" }
