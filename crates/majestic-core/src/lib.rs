@@ -33,8 +33,11 @@
 mod buffer;
 mod editor;
 mod syntax;
+mod workspace;
 
 #[doc(inline)]
 pub use buffer::Buffer;
 #[doc(inline)]
 pub use editor::Editor;
+#[doc(inline)]
+pub use workspace::{Split, Workspace};

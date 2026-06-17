@@ -86,6 +86,22 @@ impl Editor {
         &self.clipboard
     }
 
+    /// Replaces the clipboard contents (used to mirror one shared kill-ring across panes).
+    pub fn set_clipboard(&mut self, text: &str) {
+        self.clipboard.clear();
+        self.clipboard.push_str(text);
+    }
+
+    /// The buffer's display name: its file name, or `[scratch]` for an unsaved buffer.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.buffer
+            .path()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("[scratch]")
+    }
+
     /// Feeds one key: runs the resolved command, waits on a prefix, or self-inserts.
     pub fn handle_key(&mut self, key: keymaker::KeyPress) -> Resolution {
         let resolution = self.dispatcher.feed(key);
@@ -292,15 +308,10 @@ impl Editor {
     #[must_use]
     pub fn status_line(&self) -> String {
         let point = self.buffer.cursor_point();
-        let name = self
-            .buffer
-            .path()
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("[scratch]");
         let dirty = if self.buffer.is_dirty() { " *" } else { "" };
         format!(
-            " {name}{dirty}   Ln {}, Col {}   {}",
+            " {}{dirty}   Ln {}, Col {}   {}",
+            self.display_name(),
             point.row + 1,
             self.buffer.cursor_column() + 1,
             self.status,

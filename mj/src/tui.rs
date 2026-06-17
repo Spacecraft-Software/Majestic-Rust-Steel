@@ -25,7 +25,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods};
-use majestic_core::Editor;
+use majestic_core::Workspace;
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -73,17 +73,17 @@ enum Focus {
     Terminal,
 }
 
-/// The running application: the editor plus an optional integrated terminal.
+/// The running application: the editor workspace plus an optional integrated terminal.
 struct App {
-    editor: Editor,
+    workspace: Workspace,
     terminal: Option<PtyTerminal>,
     focus: Focus,
 }
 
 impl App {
-    fn new(editor: Editor) -> Self {
+    fn new(workspace: Workspace) -> Self {
         Self {
-            editor,
+            workspace,
             terminal: None,
             focus: Focus::Editor,
         }
@@ -107,7 +107,7 @@ impl App {
     }
 
     fn should_quit(&self) -> bool {
-        self.editor.should_quit()
+        self.workspace.should_quit()
     }
 
     /// Draws the editor area, the bottom terminal panel (when present), and the status bar.
@@ -132,14 +132,14 @@ impl App {
                 }
             }
 
-            self.editor
-                .render_in(surface, editor_area, theme, self.focus == Focus::Editor);
+            self.workspace
+                .render(surface, editor_area, theme, self.focus == Focus::Editor);
             draw_panel_tab(surface, divider, theme, self.focus == Focus::Terminal);
             if let Some(term) = self.terminal.as_ref() {
                 term.render_in(surface, panel_area, theme);
             }
         } else {
-            self.editor.render_in(surface, body, theme, true);
+            self.workspace.render(surface, body, theme, true);
         }
 
         self.draw_status_bar(surface, status.y, theme);
@@ -151,7 +151,7 @@ impl App {
         for x in 0..surface.width() {
             surface.set_char(x, row, ' ', style);
         }
-        surface.set_str(0, row, &self.editor.status_line(), style);
+        surface.set_str(0, row, &self.workspace.status_line(), style);
 
         let hint = match (self.terminal.is_some(), self.focus) {
             (false, _) => "[F12: terminal]",
@@ -178,7 +178,7 @@ impl App {
                 return Ok(());
             }
         }
-        self.editor.handle_key(key);
+        self.workspace.handle_key(key);
         Ok(())
     }
 
@@ -188,9 +188,7 @@ impl App {
                 return term.write_input(text.as_bytes());
             }
         }
-        for ch in text.chars() {
-            self.editor.self_insert(ch);
-        }
+        self.workspace.insert_text(text);
         Ok(())
     }
 
@@ -236,13 +234,13 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
 ///
 /// # Errors
 /// Returns any terminal I/O error from setup, reading events, or rendering.
-pub(crate) fn run(editor: Editor) -> io::Result<()> {
+pub(crate) fn run(workspace: Workspace) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let theme = Theme::steelbore();
     let (columns, lines) = terminal::size()?;
     let mut screen = Screen::new(columns, lines, theme.base_style());
     let mut out = io::stdout();
-    let mut app = App::new(editor);
+    let mut app = App::new(workspace);
 
     loop {
         app.reap_dead_terminal();
@@ -373,25 +371,33 @@ fn push_char(out: &mut Vec<u8>, c: char) {
 mod tests {
     use super::{encode_key, App, TERMINAL_TOGGLE};
     use keymaker::{KeyCode, KeyPress, Mods};
-    use majestic_core::Editor;
+    use majestic_core::{Editor, Workspace};
     use penumbra::{Buffer, Theme};
 
     #[test]
-    fn renders_editor_body_with_a_global_status_bar() {
-        // With no terminal, the editor fills the body and a status bar occupies the last row,
-        // drawn in the Steelbore accent (Steel Blue) background.
+    fn renders_workspace_with_tab_bar_and_global_status_bar() {
+        // With no terminal: row 0 is the workspace tab bar, the editor body sits below it, and
+        // the last row is the global status bar (Steelbore accent background).
         let theme = Theme::steelbore();
         let mut editor = Editor::new();
         editor.handle_key(KeyPress::char('h'));
         editor.handle_key(KeyPress::char('i'));
 
-        let mut app = App::new(editor);
-        let mut surface = Buffer::new(24, 5, theme.base_style());
+        let mut app = App::new(Workspace::new(editor));
+        let mut surface = Buffer::new(24, 6, theme.base_style());
         app.render(&mut surface, &theme);
 
-        // Editor content is drawn at the top-left of the body.
-        assert_eq!(surface.cell(0, 0).unwrap().symbol, 'h');
-        assert_eq!(surface.cell(1, 0).unwrap().symbol, 'i');
+        // Row 0 is the tab bar; the scratch buffer is listed there.
+        let tabs: String = (0..surface.width())
+            .filter_map(|x| surface.cell(x, 0).map(|c| c.symbol))
+            .collect();
+        assert!(
+            tabs.contains("scratch"),
+            "tab bar lists the buffer: {tabs:?}"
+        );
+        // Editor content is drawn just below the tab bar.
+        assert_eq!(surface.cell(0, 1).unwrap().symbol, 'h');
+        assert_eq!(surface.cell(1, 1).unwrap().symbol, 'i');
         // The bottom row is the status bar: accent background, end-anchored F12 hint present.
         let status_row = surface.height() - 1;
         assert_eq!(surface.cell(0, status_row).unwrap().style.bg, theme.accent);

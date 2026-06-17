@@ -14,7 +14,7 @@
 
 use std::process::ExitCode;
 
-use majestic_core::{Buffer, Editor};
+use majestic_core::{Buffer, Editor, Workspace};
 
 mod tui;
 
@@ -109,8 +109,8 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        Action::Empty => run_editor(None),
-        Action::Open(paths) => run_editor(paths.first().map(String::as_str)),
+        Action::Empty => run_editor(&[]),
+        Action::Open(paths) => run_editor(&paths),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -122,19 +122,25 @@ fn main() -> ExitCode {
     }
 }
 
-/// Opens `path` (or a scratch buffer when `None`) and runs the interactive editor.
-fn run_editor(path: Option<&str>) -> ExitCode {
-    let editor = match path {
-        Some(path) => match Buffer::open(path) {
-            Ok(buffer) => Editor::with_buffer(buffer),
+/// Opens every `path` as a buffer (a scratch buffer when none) and runs the interactive editor.
+///
+/// Each file becomes a tab; the first is shown in the sole pane and the rest are background
+/// tabs (`Alt+←/→` to switch, `Ctrl+\` to split). Any path that fails to open aborts startup.
+fn run_editor(paths: &[String]) -> ExitCode {
+    let mut editors = Vec::with_capacity(paths.len());
+    for path in paths {
+        match Buffer::open(path) {
+            Ok(buffer) => editors.push(Editor::with_buffer(buffer)),
             Err(error) => {
                 eprintln!("{PROGRAM}: cannot open {path}: {error}");
                 return ExitCode::FAILURE;
             }
-        },
-        None => Editor::new(),
-    };
-    match tui::run(editor) {
+        }
+    }
+    if editors.is_empty() {
+        editors.push(Editor::new());
+    }
+    match tui::run(Workspace::from_editors(editors)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
