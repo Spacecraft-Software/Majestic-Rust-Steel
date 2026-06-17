@@ -236,6 +236,32 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Collects up to `limit` file paths under `root` (recursive, dot-entries skipped).
+///
+/// The traversal is bounded by `limit` so a huge tree cannot stall the fuzzy file finder;
+/// unreadable directories are skipped rather than fatal. Order is unspecified — the finder
+/// ranks results by fuzzy score regardless.
+pub fn collect_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= limit {
+            break;
+        }
+        let Ok(entries) = read_sorted(&dir) else {
+            continue; // skip directories we cannot read
+        };
+        for (path, is_dir) in entries {
+            if is_dir {
+                stack.push(path);
+            } else if files.len() < limit {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::FileTree;

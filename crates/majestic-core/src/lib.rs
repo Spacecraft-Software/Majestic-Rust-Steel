@@ -33,6 +33,8 @@
 mod buffer;
 mod editor;
 mod files;
+mod finder;
+mod fuzzy;
 mod syntax;
 mod workspace;
 
@@ -42,5 +44,7 @@ pub use buffer::Buffer;
 pub use editor::Editor;
 #[doc(inline)]
 pub use files::FileTree;
+#[doc(inline)]
+pub use finder::{Action, Finder};
 #[doc(inline)]
 pub use workspace::{Split, Workspace};

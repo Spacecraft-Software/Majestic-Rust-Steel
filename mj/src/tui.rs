@@ -14,7 +14,7 @@
 //! [`Screen`]. The editor model itself is backend-agnostic and tested headless.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::cursor;
@@ -26,7 +26,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods};
-use majestic_core::{Editor, FileTree, Workspace};
+use majestic_core::{Action, Editor, FileTree, Finder, Workspace};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -84,6 +84,9 @@ enum Focus {
 /// The `Ctrl+B` key toggles the explorer sidebar (VS Code convention).
 const SIDEBAR_TOGGLE: KeyPress = KeyPress::ctrl('b');
 
+/// The `Ctrl+P` key opens the fuzzy file finder (the command palette is `Ctrl+Shift+P`).
+const FILE_FINDER: KeyPress = KeyPress::ctrl('p');
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -91,6 +94,7 @@ struct App {
     explorer: Option<FileTree>,
     sidebar_visible: bool,
     terminal: Option<PtyTerminal>,
+    finder: Option<Finder>,
     focus: Focus,
 }
 
@@ -101,6 +105,7 @@ impl App {
             explorer: None,
             sidebar_visible: false,
             terminal: None,
+            finder: None,
             focus: Focus::Editor,
         }
     }
@@ -162,6 +167,12 @@ impl App {
         }
 
         self.draw_status_bar(surface, status.y, theme);
+
+        // The fuzzy finder is a modal overlay, drawn last over everything else.
+        if let Some(finder) = self.finder.as_ref() {
+            let area = surface.area();
+            finder.render(surface, area, theme);
+        }
     }
 
     /// Draws the explorer sidebar on the left (when shown and wide enough), returning the
@@ -213,6 +224,20 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
+        // The fuzzy finder is modal: while open it captures every key.
+        if self.finder.is_some() {
+            self.finder_key(key);
+            return Ok(());
+        }
+        if is_command_palette(key) {
+            self.finder = Some(Finder::commands(Editor::COMMANDS));
+            return Ok(());
+        }
+        if key == FILE_FINDER {
+            let root = self.project_root();
+            self.finder = Some(Finder::files(&root));
+            return Ok(());
+        }
         if key.code == TERMINAL_TOGGLE {
             self.toggle_terminal(columns, lines);
             return Ok(());
@@ -287,6 +312,61 @@ impl App {
             self.focus = Focus::Editor;
         } else {
             self.focus = Focus::Explorer;
+        }
+    }
+
+    /// The directory the fuzzy file finder searches: the explorer root, else the working dir.
+    fn project_root(&self) -> PathBuf {
+        self.explorer.as_ref().map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            |explorer| explorer.root().to_path_buf(),
+        )
+    }
+
+    /// Routes a key to the open finder modal: type to filter, arrows to move, Enter/Esc to
+    /// accept/cancel.
+    fn finder_key(&mut self, key: KeyPress) {
+        match key.code {
+            KeyCode::Escape => self.finder = None,
+            KeyCode::Enter => self.finder_accept(),
+            KeyCode::Up => {
+                if let Some(finder) = self.finder.as_mut() {
+                    finder.select_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(finder) = self.finder.as_mut() {
+                    finder.select_down();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(finder) = self.finder.as_mut() {
+                    finder.backspace();
+                }
+            }
+            KeyCode::Char(c)
+                if !key.mods.contains(Mods::CTRL)
+                    && !key.mods.contains(Mods::ALT)
+                    && !key.mods.contains(Mods::SUPER) =>
+            {
+                if let Some(finder) = self.finder.as_mut() {
+                    finder.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Performs the selected finder action (open a file / run a command) and closes the modal.
+    fn finder_accept(&mut self) {
+        let Some(action) = self.finder.as_ref().and_then(Finder::accept).cloned() else {
+            self.finder = None;
+            return;
+        };
+        self.finder = None;
+        match action {
+            Action::OpenFile(path) => self.open_path(&path),
+            Action::RunCommand(name) => self.workspace.active_mut().execute(&name),
         }
     }
 
@@ -386,6 +466,14 @@ pub(crate) fn run(workspace: Workspace) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `key` is `Ctrl+Shift+P` (the command palette), tolerant of the terminal reporting
+/// the letter as either case.
+fn is_command_palette(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && key.mods.contains(Mods::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p'))
 }
 
 /// Translates a crossterm key event into a Keymaker [`KeyPress`], if it maps to one.
