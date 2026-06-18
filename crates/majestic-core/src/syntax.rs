@@ -99,7 +99,27 @@ impl SyntaxHighlighter {
     pub fn supports(path: &Path) -> bool {
         matches!(
             path.extension().and_then(|extension| extension.to_str()),
-            Some("rs" | "py" | "go" | "c" | "h" | "sh" | "bash" | "json")
+            Some(
+                "rs" | "py"
+                    | "go"
+                    | "c"
+                    | "h"
+                    | "sh"
+                    | "bash"
+                    | "json"
+                    | "nix"
+                    | "scm"
+                    | "ss"
+                    | "ex"
+                    | "exs"
+                    | "erl"
+                    | "hrl"
+                    | "ps1"
+                    | "psm1"
+                    | "psd1"
+                    | "ts"
+                    | "tsx"
+            )
         )
     }
 
@@ -131,6 +151,35 @@ impl SyntaxHighlighter {
             "json" => (
                 tree_sitter_json::LANGUAGE.into(),
                 tree_sitter_json::HIGHLIGHTS_QUERY,
+            ),
+            "nix" => (
+                tree_sitter_nix::LANGUAGE.into(),
+                tree_sitter_nix::HIGHLIGHTS_QUERY,
+            ),
+            // Generic Scheme grammar — covers GNU Guile (`.scm`/`.ss`).
+            "scm" | "ss" => (
+                tree_sitter_scheme::LANGUAGE.into(),
+                tree_sitter_scheme::HIGHLIGHTS_QUERY,
+            ),
+            "ex" | "exs" => (
+                tree_sitter_elixir::LANGUAGE.into(),
+                tree_sitter_elixir::HIGHLIGHTS_QUERY,
+            ),
+            "erl" | "hrl" => (
+                tree_sitter_erlang::LANGUAGE.into(),
+                tree_sitter_erlang::HIGHLIGHTS_QUERY,
+            ),
+            "ps1" | "psm1" | "psd1" => (
+                tree_sitter_powershell::LANGUAGE.into(),
+                tree_sitter_powershell::HIGHLIGHTS_QUERY,
+            ),
+            "ts" => (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            ),
+            "tsx" => (
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ),
             _ => return None,
         };
@@ -361,15 +410,26 @@ mod tests {
             ("x.c", b"int main(void) { return 0; }\n"),
             ("x.sh", b"echo hi\nif true; then ls; fi\n"),
             ("x.json", b"{\"key\": true, \"n\": 1}\n"),
+            ("x.nix", b"{ a = 1; b = \"x\"; }\n"),
+            ("x.scm", b"(define (square x) (* x x))\n"),
+            ("x.ex", b"defmodule M do\n  def f, do: 1\nend\n"),
+            ("x.erl", b"-module(m).\nf() -> 1.\n"),
+            ("x.ps1", b"function Get-X { param($a) $a }\n"),
+            ("x.ts", b"const x: number = 1;\n"),
+            (
+                "x.tsx",
+                b"const x: number = 1;\nfunction f() { return x; }\n",
+            ),
         ];
+        let mut failed = Vec::new();
         for (name, source) in cases {
-            let mut highlighter =
-                SyntaxHighlighter::for_path(Path::new(name)).expect("highlighter for language");
-            assert!(
-                !highlighter.highlight(source).is_empty(),
-                "{name} should produce highlight spans"
-            );
+            let ok = SyntaxHighlighter::for_path(Path::new(name))
+                .is_some_and(|mut highlighter| !highlighter.highlight(source).is_empty());
+            if !ok {
+                failed.push(*name);
+            }
         }
+        assert!(failed.is_empty(), "no highlight spans for: {failed:?}");
     }
 
     #[test]
