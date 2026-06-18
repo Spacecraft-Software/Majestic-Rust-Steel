@@ -95,32 +95,63 @@ pub struct SyntaxHighlighter {
 
 impl SyntaxHighlighter {
     /// Whether `path`'s extension maps to a supported language (cheap; no construction).
+    ///
+    /// The recognised extensions follow the enabled grammar features (see `Cargo.toml`): an
+    /// extension only counts when its language is compiled in.
     #[must_use]
     pub fn supports(path: &Path) -> bool {
-        matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some(
-                "rs" | "py"
-                    | "go"
-                    | "c"
-                    | "h"
-                    | "sh"
-                    | "bash"
-                    | "json"
-                    | "nix"
-                    | "scm"
-                    | "ss"
-                    | "ex"
-                    | "exs"
-                    | "erl"
-                    | "hrl"
-                    | "ps1"
-                    | "psm1"
-                    | "psd1"
-                    | "ts"
-                    | "tsx"
-            )
-        )
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            return false;
+        };
+        #[cfg(feature = "lang-rust")]
+        if extension == "rs" {
+            return true;
+        }
+        #[cfg(feature = "lang-python")]
+        if extension == "py" {
+            return true;
+        }
+        #[cfg(feature = "lang-go")]
+        if extension == "go" {
+            return true;
+        }
+        #[cfg(feature = "lang-c")]
+        if matches!(extension, "c" | "h") {
+            return true;
+        }
+        #[cfg(feature = "lang-bash")]
+        if matches!(extension, "sh" | "bash") {
+            return true;
+        }
+        #[cfg(feature = "lang-json")]
+        if extension == "json" {
+            return true;
+        }
+        #[cfg(feature = "lang-nix")]
+        if extension == "nix" {
+            return true;
+        }
+        #[cfg(feature = "lang-scheme")]
+        if matches!(extension, "scm" | "ss") {
+            return true;
+        }
+        #[cfg(feature = "lang-elixir")]
+        if matches!(extension, "ex" | "exs") {
+            return true;
+        }
+        #[cfg(feature = "lang-erlang")]
+        if matches!(extension, "erl" | "hrl") {
+            return true;
+        }
+        #[cfg(feature = "lang-powershell")]
+        if matches!(extension, "ps1" | "psm1" | "psd1") {
+            return true;
+        }
+        #[cfg(feature = "lang-typescript")]
+        if matches!(extension, "ts" | "tsx") {
+            return true;
+        }
+        false
     }
 
     /// Builds a highlighter for `path`'s file type, or `None` if unsupported.
@@ -128,55 +159,68 @@ impl SyntaxHighlighter {
     pub fn for_path(path: &Path) -> Option<Self> {
         let extension = path.extension()?.to_str()?;
         let (language, query): (Language, &str) = match extension {
+            #[cfg(feature = "lang-rust")]
             "rs" => (
                 tree_sitter_rust::LANGUAGE.into(),
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-python")]
             "py" => (
                 tree_sitter_python::LANGUAGE.into(),
                 tree_sitter_python::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-go")]
             "go" => (
                 tree_sitter_go::LANGUAGE.into(),
                 tree_sitter_go::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-c")]
             "c" | "h" => (
                 tree_sitter_c::LANGUAGE.into(),
                 tree_sitter_c::HIGHLIGHT_QUERY,
             ),
+            #[cfg(feature = "lang-bash")]
             "sh" | "bash" => (
                 tree_sitter_bash::LANGUAGE.into(),
                 tree_sitter_bash::HIGHLIGHT_QUERY,
             ),
+            #[cfg(feature = "lang-json")]
             "json" => (
                 tree_sitter_json::LANGUAGE.into(),
                 tree_sitter_json::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-nix")]
             "nix" => (
                 tree_sitter_nix::LANGUAGE.into(),
                 tree_sitter_nix::HIGHLIGHTS_QUERY,
             ),
             // Generic Scheme grammar — covers GNU Guile (`.scm`/`.ss`).
+            #[cfg(feature = "lang-scheme")]
             "scm" | "ss" => (
                 tree_sitter_scheme::LANGUAGE.into(),
                 tree_sitter_scheme::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-elixir")]
             "ex" | "exs" => (
                 tree_sitter_elixir::LANGUAGE.into(),
                 tree_sitter_elixir::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-erlang")]
             "erl" | "hrl" => (
                 tree_sitter_erlang::LANGUAGE.into(),
                 tree_sitter_erlang::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-powershell")]
             "ps1" | "psm1" | "psd1" => (
                 tree_sitter_powershell::LANGUAGE.into(),
                 tree_sitter_powershell::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-typescript")]
             "ts" => (
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ),
+            #[cfg(feature = "lang-typescript")]
             "tsx" => (
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
@@ -369,6 +413,7 @@ mod tests {
     use super::{HighlightKind, SyntaxHighlighter};
     use std::path::Path;
 
+    #[cfg(feature = "lang-rust")]
     #[test]
     fn highlights_rust_keywords_and_strings() {
         let mut highlighter = SyntaxHighlighter::for_path(Path::new("x.rs")).unwrap();
@@ -402,27 +447,46 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::vec_init_then_push,
+        reason = "cases are pushed under #[cfg]; a vec! literal cannot gate elements"
+    )]
     fn highlights_each_supported_language() {
-        // Every wired grammar builds and produces spans for a representative snippet.
-        let cases: &[(&str, &[u8])] = &[
-            ("x.py", b"def f():\n    return 1\n"),
-            ("x.go", b"package main\nfunc main() {}\n"),
-            ("x.c", b"int main(void) { return 0; }\n"),
-            ("x.sh", b"echo hi\nif true; then ls; fi\n"),
-            ("x.json", b"{\"key\": true, \"n\": 1}\n"),
-            ("x.nix", b"{ a = 1; b = \"x\"; }\n"),
-            ("x.scm", b"(define (square x) (* x x))\n"),
-            ("x.ex", b"defmodule M do\n  def f, do: 1\nend\n"),
-            ("x.erl", b"-module(m).\nf() -> 1.\n"),
-            ("x.ps1", b"function Get-X { param($a) $a }\n"),
-            ("x.ts", b"const x: number = 1;\n"),
-            (
-                "x.tsx",
-                b"const x: number = 1;\nfunction f() { return x; }\n",
-            ),
-        ];
+        // Each *enabled* grammar builds and produces spans for a representative snippet. Cases are
+        // gated by feature so the test adapts to whatever grammar set the build compiled in.
+        let mut cases: Vec<(&str, &[u8])> = Vec::new();
+        #[cfg(feature = "lang-rust")]
+        cases.push(("x.rs", b"fn main() {}\n" as &[u8]));
+        #[cfg(feature = "lang-python")]
+        cases.push(("x.py", b"def f():\n    return 1\n" as &[u8]));
+        #[cfg(feature = "lang-go")]
+        cases.push(("x.go", b"package main\nfunc main() {}\n" as &[u8]));
+        #[cfg(feature = "lang-c")]
+        cases.push(("x.c", b"int main(void) { return 0; }\n" as &[u8]));
+        #[cfg(feature = "lang-bash")]
+        cases.push(("x.sh", b"echo hi\nif true; then ls; fi\n" as &[u8]));
+        #[cfg(feature = "lang-json")]
+        cases.push(("x.json", b"{\"key\": true, \"n\": 1}\n" as &[u8]));
+        #[cfg(feature = "lang-nix")]
+        cases.push(("x.nix", b"{ a = 1; b = \"x\"; }\n" as &[u8]));
+        #[cfg(feature = "lang-scheme")]
+        cases.push(("x.scm", b"(define (square x) (* x x))\n" as &[u8]));
+        #[cfg(feature = "lang-elixir")]
+        cases.push(("x.ex", b"defmodule M do\n  def f, do: 1\nend\n" as &[u8]));
+        #[cfg(feature = "lang-erlang")]
+        cases.push(("x.erl", b"-module(m).\nf() -> 1.\n" as &[u8]));
+        #[cfg(feature = "lang-powershell")]
+        cases.push(("x.ps1", b"function Get-X { param($a) $a }\n" as &[u8]));
+        #[cfg(feature = "lang-typescript")]
+        cases.push(("x.ts", b"const x: number = 1;\n" as &[u8]));
+        #[cfg(feature = "lang-typescript")]
+        cases.push((
+            "x.tsx",
+            b"const x: number = 1;\nfunction f() { return x; }\n" as &[u8],
+        ));
+
         let mut failed = Vec::new();
-        for (name, source) in cases {
+        for (name, source) in &cases {
             let ok = SyntaxHighlighter::for_path(Path::new(name))
                 .is_some_and(|mut highlighter| !highlighter.highlight(source).is_empty());
             if !ok {
@@ -432,6 +496,7 @@ mod tests {
         assert!(failed.is_empty(), "no highlight spans for: {failed:?}");
     }
 
+    #[cfg(feature = "lang-rust")]
     #[test]
     fn background_worker_highlights_a_snapshot() {
         use super::HighlightWorker;

@@ -19,6 +19,15 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# Grammar selection is forwarded to majestic-core. The default inherits its lean
+# `grammars-common` set (§7 binary-size target); build `--features grammars-all` (or
+# `grammars-extra`, or any `lang-*`) for more languages.
+[features]
+default = []
+grammars-common = ["majestic-core/grammars-common"]
+grammars-extra = ["majestic-core/grammars-extra"]
+grammars-all = ["majestic-core/grammars-all"]
+
 [dependencies]
 crossterm = "0.28"
 keymaker = { version = "0.0.0", path = "../crates/keymaker" }
