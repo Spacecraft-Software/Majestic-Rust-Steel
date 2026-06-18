@@ -46,6 +46,6 @@ pub use editor::Editor;
 #[doc(inline)]
 pub use files::FileTree;
 #[doc(inline)]
-pub use finder::{Action, Finder};
+pub use finder::{Action, Finder, HelpOverlay};
 #[doc(inline)]
 pub use workspace::{Split, Workspace};

@@ -26,7 +26,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods};
-use majestic_core::{Action, Editor, FileTree, Finder, Workspace};
+use majestic_core::{Action, Editor, FileTree, Finder, HelpOverlay, Workspace};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -87,6 +87,9 @@ const SIDEBAR_TOGGLE: KeyPress = KeyPress::ctrl('b');
 /// The `Ctrl+P` key opens the fuzzy file finder (the command palette is `Ctrl+Shift+P`).
 const FILE_FINDER: KeyPress = KeyPress::ctrl('p');
 
+/// The `F1` key opens (and closes) the Oracle key-bindings help overlay.
+const HELP_KEY: KeyPress = KeyPress::key(KeyCode::Function(1));
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -95,6 +98,7 @@ struct App {
     sidebar_visible: bool,
     terminal: Option<PtyTerminal>,
     finder: Option<Finder>,
+    help: Option<HelpOverlay>,
     focus: Focus,
 }
 
@@ -106,6 +110,7 @@ impl App {
             sidebar_visible: false,
             terminal: None,
             finder: None,
+            help: None,
             focus: Focus::Editor,
         }
     }
@@ -168,10 +173,13 @@ impl App {
 
         self.draw_status_bar(surface, status.y, theme);
 
-        // The fuzzy finder is a modal overlay, drawn last over everything else.
+        // Modal overlays are drawn last, over everything else.
+        let area = surface.area();
         if let Some(finder) = self.finder.as_ref() {
-            let area = surface.area();
             finder.render(surface, area, theme);
+        }
+        if let Some(help) = self.help.as_ref() {
+            help.render(surface, area, theme);
         }
     }
 
@@ -209,12 +217,12 @@ impl App {
 
         let hint = if self.terminal.is_some() {
             if self.focus == Focus::Terminal {
-                "[F12: ⇄ EDITOR  Ctrl+B: files]"
+                "[F1 help · F12 ⇄ EDITOR · Ctrl+B files]"
             } else {
-                "[F12: ⇄ TERMINAL  Ctrl+B: files]"
+                "[F1 help · F12 ⇄ TERMINAL · Ctrl+B files]"
             }
         } else {
-            "[F12: terminal  Ctrl+B: files]"
+            "[F1 help · F12 terminal · Ctrl+B files]"
         };
         if let Ok(len) = u16::try_from(hint.chars().count()) {
             if len < surface.width() {
@@ -224,9 +232,20 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
-        // The fuzzy finder is modal: while open it captures every key.
+        // The help overlay and the fuzzy finder are modal: while open they capture every key.
+        if self.help.is_some() {
+            self.help_key(key);
+            return Ok(());
+        }
         if self.finder.is_some() {
             self.finder_key(key);
+            return Ok(());
+        }
+        if key == HELP_KEY {
+            self.help = Some(HelpOverlay::new(
+                "Key Bindings (Esc to close)",
+                &oracle::describe_bindings(&keymaker::cua()),
+            ));
             return Ok(());
         }
         if is_command_palette(key) {
@@ -370,6 +389,23 @@ impl App {
         match action {
             Action::OpenFile(path) => self.open_path(&path),
             Action::RunCommand(name) => self.workspace.active_mut().execute(&name),
+        }
+    }
+
+    /// Routes a key to the open help overlay: arrows/Page scroll, Esc or F1 close.
+    fn help_key(&mut self, key: KeyPress) {
+        if key.code == KeyCode::Escape || key == HELP_KEY {
+            self.help = None;
+            return;
+        }
+        if let Some(help) = self.help.as_mut() {
+            match key.code {
+                KeyCode::Up => help.scroll_up(1),
+                KeyCode::Down => help.scroll_down(1),
+                KeyCode::PageUp => help.scroll_up(10),
+                KeyCode::PageDown => help.scroll_down(10),
+                _ => {}
+            }
         }
     }
 

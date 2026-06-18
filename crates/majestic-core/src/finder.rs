@@ -195,6 +195,68 @@ impl Finder {
     }
 }
 
+/// A read-only, scrollable modal showing pre-rendered text — the in-editor surface for Oracle
+/// help (`describe-bindings`, etc.). Shares the finder's centred bordered box.
+#[derive(Clone, Debug)]
+pub struct HelpOverlay {
+    title: String,
+    lines: Vec<String>,
+    scroll: usize,
+}
+
+impl HelpOverlay {
+    /// Creates an overlay titled `title` showing `body` (split into lines).
+    #[must_use]
+    pub fn new(title: impl Into<String>, body: &str) -> Self {
+        Self {
+            title: title.into(),
+            lines: body.lines().map(str::to_owned).collect(),
+            scroll: 0,
+        }
+    }
+
+    /// Scrolls down by `rows`, keeping at least the last line on screen.
+    pub fn scroll_down(&mut self, rows: usize) {
+        let last = self.lines.len().saturating_sub(1);
+        self.scroll = (self.scroll + rows).min(last);
+    }
+
+    /// Scrolls up by `rows`.
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    /// Draws the overlay as a centred modal box over `area`.
+    pub fn render(&self, surface: &mut Surface, area: Rect, theme: &Theme) {
+        if area.width < 3 || area.height < 3 {
+            return;
+        }
+        let width = area.width.min(72);
+        let height = area.height.min(22);
+        let box_area = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        draw_box(surface, box_area, theme, &self.title);
+
+        let inner = Rect::new(
+            box_area.x + 1,
+            box_area.y + 1,
+            box_area.width - 2,
+            box_area.height - 2,
+        );
+        let style = Style::new(theme.foreground, theme.background);
+        for row in 0..inner.height {
+            let Some(line) = self.lines.get(self.scroll + usize::from(row)) else {
+                break;
+            };
+            surface.set_str(inner.x, inner.y + row, line, style);
+        }
+    }
+}
+
 /// Draws a bordered box (Steel-Blue rules on Void Navy) with `title` on the top edge.
 fn draw_box(surface: &mut Surface, area: Rect, theme: &Theme, title: &str) {
     let border = Style::new(theme.accent, theme.background);
@@ -279,5 +341,43 @@ mod tests {
         assert!(text.contains("Command Palette"), "modal shows its title");
         assert!(text.contains("save"), "modal lists the candidates");
         assert!(text.contains('┌'), "modal has a box border");
+    }
+
+    #[test]
+    fn help_overlay_renders_title_and_scrolls() {
+        use super::HelpOverlay;
+        let theme = Theme::steelbore();
+        let mut overlay = HelpOverlay::new("Key Bindings", "alpha\nbeta\ngamma\ndelta");
+
+        let render_text = |overlay: &HelpOverlay| -> String {
+            let mut surface = Surface::new(40, 4, theme.base_style());
+            let area = surface.area();
+            overlay.render(&mut surface, area, &theme);
+            let mut text = String::new();
+            for y in 0..surface.height() {
+                for x in 0..surface.width() {
+                    if let Some(cell) = surface.cell(x, y) {
+                        text.push(cell.symbol);
+                    }
+                }
+            }
+            text
+        };
+
+        let top = render_text(&overlay);
+        assert!(top.contains("Key Bindings"), "shows the title");
+        assert!(top.contains("alpha"), "shows the first line");
+
+        overlay.scroll_down(2);
+        let scrolled = render_text(&overlay);
+        assert!(scrolled.contains("gamma"), "scrolled body is visible");
+        assert!(!scrolled.contains("alpha"), "first line scrolled off");
+
+        overlay.scroll_down(100); // clamps without panic
+        overlay.scroll_up(100);
+        assert!(
+            render_text(&overlay).contains("alpha"),
+            "scrolled back to top"
+        );
     }
 }
