@@ -11,7 +11,7 @@
 //! Window keys split the focused pane (either axis), move focus, resize, cycle the focused pane
 //! through background tabs, and close panes. One shared clipboard is mirrored across panes.
 
-use keymaker::{KeyCode, KeyPress, Mods};
+use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
 use crate::editor::Editor;
@@ -226,6 +226,8 @@ pub struct Workspace {
     clipboard: String,
     /// Indent width (columns) applied to every editor, including newly opened ones.
     tab_width: usize,
+    /// Keybinding profile applied to every editor, including newly opened ones.
+    profile: Profile,
     /// Latched once a quit command is issued.
     quit: bool,
 }
@@ -250,6 +252,7 @@ impl Workspace {
             focused: 0,
             clipboard: String::new(),
             tab_width: 4, // matches Editor's default; overridden by `set_tab_width` from config
+            profile: Profile::Cua, // matches Editor's default; overridden by `set_profile`
             quit: false,
         }
     }
@@ -260,6 +263,22 @@ impl Workspace {
         for editor in &mut self.editors {
             editor.set_tab_width(width);
         }
+    }
+
+    /// Sets the keybinding profile for every open editor and any opened later. Applied from the
+    /// `keymap` config field at startup and by the profile-switch commands at runtime; switching
+    /// live never drops a keystroke (dispatch is synchronous — see [`Editor::set_profile`]).
+    pub fn set_profile(&mut self, profile: Profile) {
+        self.profile = profile;
+        for editor in &mut self.editors {
+            editor.set_profile(profile);
+        }
+    }
+
+    /// The active keybinding profile (applied to every pane).
+    #[must_use]
+    pub fn profile(&self) -> Profile {
+        self.profile
     }
 
     /// Sets the focused editor's status-line message (e.g. a startup notice from the host).
@@ -323,6 +342,7 @@ impl Workspace {
     /// open as a background tab). Used by the explorer and the fuzzy file finder.
     pub fn open(&mut self, mut editor: Editor) {
         editor.set_tab_width(self.tab_width);
+        editor.set_profile(self.profile);
         self.editors.push(editor);
         let index = self.editors.len() - 1;
         self.root.set_nth_editor(self.focused, index);
@@ -604,7 +624,7 @@ mod tests {
     use super::{first_size, split_area, Node, Split, Workspace};
     use crate::buffer::Buffer;
     use crate::editor::Editor;
-    use keymaker::{KeyCode, KeyPress, Mods};
+    use keymaker::{KeyCode, KeyPress, Mods, Profile};
     use penumbra::{Buffer as Surface, Rect, Theme};
 
     fn alt(code: KeyCode) -> KeyPress {
@@ -751,6 +771,23 @@ mod tests {
         let mut workspace = Workspace::new(Editor::new());
         workspace.handle_key(KeyPress::ctrl('\\')); // a window command, not a backslash insert
         assert_eq!(workspace.active().buffer().text(), "");
+    }
+
+    #[test]
+    fn set_profile_reaches_every_pane_and_new_buffers() {
+        let mut workspace = Workspace::new(Editor::new());
+        workspace.set_profile(Profile::Vim);
+        assert_eq!(workspace.profile(), Profile::Vim);
+        // The existing pane is now in Vim Normal mode: `i` switches to Insert, then text inserts.
+        workspace.handle_key(KeyPress::char('x')); // Normal mode: swallowed
+        assert_eq!(workspace.active().buffer().text(), "");
+        // A newly opened buffer inherits the workspace profile (still Vim/Normal).
+        workspace.open(Editor::new());
+        workspace.handle_key(KeyPress::char('x')); // Normal mode: swallowed
+        assert_eq!(workspace.active().buffer().text(), "");
+        workspace.handle_key(KeyPress::char('i')); // enter Insert
+        workspace.handle_key(KeyPress::char('x'));
+        assert_eq!(workspace.active().buffer().text(), "x");
     }
 
     #[test]

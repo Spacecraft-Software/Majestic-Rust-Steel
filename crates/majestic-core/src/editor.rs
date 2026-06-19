@@ -12,7 +12,8 @@
 use std::path::Path;
 
 use keymaker::{
-    cua, vim_insert, vim_normal, vim_visual, Dispatcher, KeyCode, Keymap, Mods, Resolution,
+    cua, emacs, vim_insert, vim_normal, vim_visual, Dispatcher, KeyCode, Keymap, Mods, Profile,
+    Resolution,
 };
 use penumbra::{char_width, Buffer as Surface, Cell, Rect, Style, Theme};
 
@@ -130,11 +131,27 @@ impl Editor {
         self.tab_width = width.clamp(1, 16);
     }
 
-    /// Switches this editor to the Vim profile, starting in Normal mode.
-    ///
-    /// Profile selection from config and live profile-switching land in the next chunk; this
-    /// installs the three modal keymaps and enters Normal mode so the modal dispatch and
-    /// self-insert gating are exercised end-to-end.
+    /// Switches this editor to `profile`, live. Dispatch is synchronous (one key is fully handled
+    /// before the next), so swapping the keymap between keystrokes drops nothing in flight — the
+    /// "profile switch under load loses no keystrokes" guarantee (PRD §8).
+    pub fn set_profile(&mut self, profile: Profile) {
+        match profile {
+            Profile::Cua => self.set_non_modal(cua()),
+            Profile::Emacs => self.set_non_modal(emacs()),
+            Profile::Vim => self.enable_vim(),
+        }
+    }
+
+    /// Installs a single-layer, non-modal keymap (CUA, Emacs): always [`EditMode::Insert`], no Vim
+    /// state. The new keymap shares structure with the old via `Arc`, so this is cheap.
+    fn set_non_modal(&mut self, keymap: Keymap) {
+        self.vim = None;
+        self.mode = EditMode::Insert;
+        self.dispatcher = Dispatcher::new(vec![keymap]);
+    }
+
+    /// Switches this editor to the Vim profile, starting in Normal mode; installs the three modal
+    /// keymaps. Prefer [`Editor::set_profile`] at call sites that select by [`Profile`].
     pub fn enable_vim(&mut self) {
         self.vim = Some(VimKeymaps {
             normal: vim_normal(),
@@ -277,6 +294,9 @@ impl Editor {
             "enter-insert-mode" => self.set_mode(EditMode::Insert),
             "enter-normal-mode" => self.set_mode(EditMode::Normal),
             "enter-visual-mode" => self.set_mode(EditMode::Visual),
+            "profile-cua" => self.set_profile(Profile::Cua),
+            "profile-emacs" => self.set_profile(Profile::Emacs),
+            "profile-vim" => self.set_profile(Profile::Vim),
             "save" => self.save(),
             "find" => "find: not yet implemented (M1)".clone_into(&mut self.status),
             "quit" | "close-buffer" => self.quit = true,
@@ -767,5 +787,33 @@ mod tests {
         editor.handle_key(KeyPress::char('y')); // copy the selection
         assert_eq!(editor.clipboard(), "ab");
         assert_eq!(editor.buffer().text(), "abc");
+    }
+
+    #[test]
+    fn set_profile_round_trips_modality() {
+        use super::EditMode;
+        use keymaker::Profile;
+        let mut editor = Editor::with_buffer(Buffer::from_text(""));
+        editor.set_profile(Profile::Vim);
+        assert_eq!(editor.mode(), EditMode::Normal);
+        editor.handle_key(KeyPress::char('z')); // Normal mode: swallowed
+        assert_eq!(editor.buffer().text(), "");
+        editor.set_profile(Profile::Cua); // back to a non-modal profile
+        assert_eq!(editor.mode(), EditMode::Insert);
+        editor.handle_key(KeyPress::char('z')); // Insert mode: inserts
+        assert_eq!(editor.buffer().text(), "z");
+    }
+
+    #[test]
+    fn profile_switch_under_load_loses_no_keystrokes() {
+        // The §8 exit criterion: a live profile switch mid-stream drops nothing. Dispatch is
+        // synchronous, so every text-producing key before and after the switch takes effect.
+        let mut editor = Editor::with_buffer(Buffer::from_text(""));
+        editor.handle_key(KeyPress::char('a')); // CUA (insert)
+        editor.handle_key(KeyPress::char('b'));
+        editor.execute("profile-emacs"); // live switch between keystrokes
+        editor.handle_key(KeyPress::char('c')); // Emacs is also insert-mode
+        editor.handle_key(KeyPress::char('d'));
+        assert_eq!(editor.buffer().text(), "abcd");
     }
 }

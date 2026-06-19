@@ -16,7 +16,7 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 
-use keymaker::{KeyCode, KeyPress, Keymap, Lookup, Mods};
+use keymaker::{KeyCode, KeyPress, Keymap, Lookup, Mods, Profile};
 
 /// A documented editor command — one entry of the live command registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +144,18 @@ pub const COMMANDS: &[CommandDoc] = &[
         summary: "Enter Vim visual mode (motion extends the selection).",
     },
     CommandDoc {
+        name: "profile-cua",
+        summary: "Switch to the CUA keybinding profile.",
+    },
+    CommandDoc {
+        name: "profile-emacs",
+        summary: "Switch to the Emacs keybinding profile.",
+    },
+    CommandDoc {
+        name: "profile-vim",
+        summary: "Switch to the Vim keybinding profile.",
+    },
+    CommandDoc {
         name: "save",
         summary: "Save the active buffer to its file.",
     },
@@ -252,12 +264,24 @@ pub fn describe_variable(name: &str) -> String {
     )
 }
 
-/// `describe-mode`: the active keybinding profile. M1 ships only CUA.
+/// `describe-mode`: a short description of the active keybinding `profile`.
 #[must_use]
-pub fn describe_mode() -> String {
-    "CUA — Common User Access keybindings (Ctrl+C copy, Ctrl+X cut, Ctrl+V paste, \
-     Ctrl+Z/Ctrl+Y undo/redo, Ctrl+S save). The only profile in M1; Vim/Emacs/Acme land at M2."
-        .to_owned()
+pub fn describe_mode(profile: Profile) -> String {
+    match profile {
+        Profile::Cua => {
+            "CUA — Common User Access: Ctrl+C/X/V copy/cut/paste, Ctrl+Z/Y undo/redo, Ctrl+S \
+             save, arrows move. The non-modal default."
+        }
+        Profile::Emacs => {
+            "Emacs — C-/M- chords and the C-x prefix map: C-f/b/n/p motion, C-k kill-line, \
+             C-w/M-w/C-y kill/save/yank, C-x C-s save, C-x C-c quit. Non-modal."
+        }
+        Profile::Vim => {
+            "Vim — modal: Normal (hjkl motion, i/v switch), Insert (Esc returns to Normal), \
+             Visual (hjkl extends the selection, y/x copy/cut)."
+        }
+    }
+    .to_owned()
 }
 
 /// `apropos`: commands whose name or docstring contains `query` (case-insensitive).
