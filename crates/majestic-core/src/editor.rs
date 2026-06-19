@@ -68,6 +68,16 @@ impl Editor {
         }
     }
 
+    /// A second view of this editor's buffer: a new editor sharing the document (and thus text +
+    /// undo) with an independent cursor, viewport, and highlighter. Used to show one buffer in
+    /// two panes.
+    #[must_use]
+    pub fn view(&self) -> Self {
+        let mut editor = Self::with_buffer(self.buffer.view());
+        editor.set_tab_width(self.tab_width);
+        editor
+    }
+
     /// Sets the indent width (columns), clamped to a sane `1..=16` range. Applied from config.
     pub fn set_tab_width(&mut self, width: usize) {
         self.tab_width = width.clamp(1, 16);

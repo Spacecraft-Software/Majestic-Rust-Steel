@@ -220,24 +220,26 @@ impl Buffer {
         self.doc.borrow().history.current_rope().to_string()
     }
 
-    /// The cursor's byte offset.
+    /// The cursor's byte offset (clamped to the current shared document — see [`Buffer::clamped`]).
     #[must_use]
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.clamped(self.cursor)
     }
 
     /// The cursor's `(row, byte-column)` position.
     #[must_use]
     pub fn cursor_point(&self) -> Point {
-        self.rope().byte_to_point(self.cursor)
+        let rope = self.rope();
+        rope.byte_to_point(snap_to_boundary(&rope, self.cursor))
     }
 
     /// The cursor's column counted in `char`s from the start of its line (the display column).
     #[must_use]
     pub fn cursor_column(&self) -> usize {
         let rope = self.rope();
-        let line_start = self.line_start(rope.byte_to_point(self.cursor).row);
-        rope.byte_to_char(self.cursor) - rope.byte_to_char(line_start)
+        let cursor = snap_to_boundary(&rope, self.cursor);
+        let line_start = self.line_start(rope.byte_to_point(cursor).row);
+        rope.byte_to_char(cursor) - rope.byte_to_char(line_start)
     }
 
     /// Whether the document has unsaved changes.
@@ -278,7 +280,10 @@ impl Buffer {
     #[must_use]
     pub fn selection(&self) -> Option<Range<usize>> {
         let anchor = self.selection_anchor?;
-        let (lo, hi) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        let rope = self.rope();
+        let cursor = snap_to_boundary(&rope, self.cursor);
+        let anchor = snap_to_boundary(&rope, anchor);
+        let (lo, hi) = (anchor.min(cursor), anchor.max(cursor));
         (lo != hi).then_some(lo..hi)
     }
 
@@ -292,6 +297,7 @@ impl Buffer {
 
     /// Inserts `text` at the cursor, replacing the selection if one is active.
     pub fn insert(&mut self, text: &str) {
+        self.clamp();
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         self.apply_edit(range, text);
     }
@@ -304,6 +310,7 @@ impl Buffer {
 
     /// Deletes the selection, or the character before the cursor (Backspace).
     pub fn backspace(&mut self) {
+        self.clamp();
         if let Some(range) = self.selection() {
             self.apply_edit(range, "");
         } else {
@@ -316,6 +323,7 @@ impl Buffer {
 
     /// Deletes the selection, or the character at the cursor (Delete).
     pub fn delete_forward(&mut self) {
+        self.clamp();
         if let Some(range) = self.selection() {
             self.apply_edit(range, "");
         } else {
@@ -456,6 +464,7 @@ impl Buffer {
     }
 
     fn start_motion(&mut self, extend: bool) {
+        self.clamp(); // a sibling view may have shrunk the shared document
         if extend {
             if self.selection_anchor.is_none() {
                 self.selection_anchor = Some(self.cursor);
@@ -463,6 +472,24 @@ impl Buffer {
         } else {
             self.selection_anchor = None;
         }
+    }
+
+    /// Snaps `offset` to the largest `char` boundary `<=` the current shared document's length.
+    ///
+    /// This is the design's Phase-1 clamp-on-access: a view's byte-offset cursor can fall out of
+    /// range when another view shrinks the shared document, so reads clamp rather than panic.
+    /// (Phase 2 promotes cursors to `stratum::Anchor`s, which track edits instead of clamping.)
+    fn clamped(&self, offset: usize) -> usize {
+        snap_to_boundary(&self.rope(), offset)
+    }
+
+    /// Clamps the cursor and selection anchor to the (possibly shrunk) shared document.
+    fn clamp(&mut self) {
+        let rope = self.rope();
+        self.cursor = snap_to_boundary(&rope, self.cursor);
+        self.selection_anchor = self
+            .selection_anchor
+            .map(|anchor| snap_to_boundary(&rope, anchor));
     }
 
     /// Moves to `row`, keeping (and updating) the goal column measured in `char`s.
@@ -593,6 +620,53 @@ mod tests {
         assert_eq!(buffer.cursor(), 3); // 'h' (1) + 'é' (2)
         buffer.backspace(); // deletes 'é'
         assert_eq!(buffer.text(), "hllo");
+    }
+
+    #[test]
+    fn views_share_text_and_undo() {
+        let a = Buffer::from_text("hello");
+        let mut b = a.view();
+        b.move_line_end(false);
+        b.insert("!"); // edit through the second view
+        assert_eq!(
+            a.text(),
+            "hello!",
+            "an edit in one view is visible in the other"
+        );
+        assert_eq!(b.text(), "hello!");
+
+        let mut a = a;
+        assert!(a.undo()); // undo through the first view affects the shared document
+        assert_eq!(b.text(), "hello", "undo is shared across views");
+    }
+
+    #[test]
+    fn views_have_independent_cursors() {
+        let a = Buffer::from_text("hello");
+        let mut b = a.view();
+        b.move_line_end(false);
+        assert_eq!(a.cursor(), 0, "the first view's cursor is untouched");
+        assert_eq!(b.cursor(), 5);
+        b.insert("X"); // edits the shared text; the other view's cursor stays put
+        assert_eq!(a.text(), "helloX");
+        assert_eq!(a.cursor(), 0);
+    }
+
+    #[test]
+    fn view_cursor_clamps_when_a_sibling_shrinks_the_document() {
+        let mut a = Buffer::from_text("hello");
+        a.move_line_end(false); // a's cursor at byte 5
+        let mut b = a.view();
+        b.select_all();
+        b.backspace(); // delete everything through b — the shared document is now empty
+        assert_eq!(a.text(), "");
+        assert_eq!(
+            a.cursor(),
+            0,
+            "a's now-out-of-range cursor clamps to the new length"
+        );
+        a.move_left(false); // must not panic on the shrunk document
+        assert_eq!(a.cursor(), 0);
     }
 
     /// A unique temp document path and its journal sidecar, both removed up front.

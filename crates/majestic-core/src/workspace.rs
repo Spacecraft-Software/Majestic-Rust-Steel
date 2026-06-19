@@ -374,13 +374,14 @@ impl Workspace {
         }
     }
 
-    /// Splits the focused pane along `dir`, showing a not-yet-visible buffer (or a fresh scratch)
-    /// in the new pane, which becomes focused.
+    /// Splits the focused pane along `dir`, opening a **second view of the same buffer** in the
+    /// new pane (Emacs `C-x 2`/`C-x 3`): shared text + undo, independent cursor and scroll. The
+    /// new pane becomes focused; `Alt+←/→` re-points it at another buffer if desired.
     fn split_focused(&mut self, dir: Split) {
-        let next = self.hidden_buffer().unwrap_or_else(|| {
-            self.editors.push(Editor::new());
-            self.editors.len() - 1
-        });
+        let mut view = self.active().view();
+        view.set_clipboard(&self.clipboard); // share the kill-ring with the new pane
+        self.editors.push(view);
+        let next = self.editors.len() - 1;
         split_leaf(&mut self.root, self.focused, dir, next);
         self.focused += 1; // the new leaf is the second child, just after the old one
     }
@@ -395,12 +396,6 @@ impl Workspace {
         let mut out = Vec::new();
         self.root.collect_editors(&mut out);
         out
-    }
-
-    /// The first open buffer not currently shown in any pane, if any.
-    fn hidden_buffer(&self) -> Option<usize> {
-        let shown = self.shown_editors();
-        (0..self.editors.len()).find(|index| !shown.contains(index))
     }
 
     /// Moves focus to the next pane (wrapping).
@@ -595,16 +590,21 @@ mod tests {
     }
 
     #[test]
-    fn split_with_one_buffer_opens_a_scratch_pane() {
-        let mut workspace = Workspace::new(Editor::new());
+    fn split_opens_a_second_view_of_the_current_buffer() {
+        let mut workspace = Workspace::new(Editor::with_buffer(Buffer::from_text("hi")));
         workspace.handle_key(KeyPress::ctrl('\\'));
         assert_eq!(workspace.pane_count(), 2);
-        assert_eq!(workspace.editors.len(), 2); // a fresh scratch was created
+        assert_eq!(workspace.editors.len(), 2); // a second *view*, not a new document
         assert_eq!(workspace.focused, 1); // focus moved to the new pane
+                                          // Both panes show the same buffer.
+        assert_eq!(workspace.editors[0].buffer().text(), "hi");
+        assert_eq!(workspace.editors[1].buffer().text(), "hi");
     }
 
     #[test]
-    fn split_reuses_a_hidden_buffer() {
+    fn split_shows_the_current_buffer_not_a_background_tab() {
+        // `one` is in the pane; `two` is a background tab. Splitting views `one` again, leaving
+        // `two` reachable via Alt+←/→ — it is not pulled into the new pane.
         let editors = vec![
             Editor::with_buffer(Buffer::from_text("one")),
             Editor::with_buffer(Buffer::from_text("two")),
@@ -612,8 +612,20 @@ mod tests {
         let mut workspace = Workspace::from_editors(editors);
         workspace.handle_key(KeyPress::ctrl('\\'));
         assert_eq!(workspace.pane_count(), 2);
-        assert_eq!(workspace.editors.len(), 2); // no new scratch needed
-        assert_eq!(workspace.active().buffer().text(), "two");
+        assert_eq!(workspace.editors.len(), 3); // `one`, `two`, and a new view of `one`
+        assert_eq!(workspace.active().buffer().text(), "one");
+    }
+
+    #[test]
+    fn split_views_share_edits() {
+        let mut workspace = Workspace::new(Editor::with_buffer(Buffer::from_text("hi")));
+        workspace.handle_key(KeyPress::ctrl('\\')); // focus the new view of the same buffer
+        let editor = workspace.active_mut();
+        editor.buffer_mut().move_line_end(false);
+        editor.self_insert('!');
+        // The edit is visible in the first view — they share one document.
+        assert_eq!(workspace.editors[0].buffer().text(), "hi!");
+        assert_eq!(workspace.editors[1].buffer().text(), "hi!");
     }
 
     #[test]
@@ -704,9 +716,10 @@ mod tests {
             Editor::with_buffer(Buffer::from_text("")),
         ];
         let mut workspace = Workspace::from_editors(editors);
-        workspace.handle_key(KeyPress::ctrl('a')); // select-all in buffer "one"
+        workspace.handle_key(KeyPress::ctrl('a')); // select-all in buffer "hello"
         workspace.handle_key(KeyPress::ctrl('c')); // copy -> shared clipboard
-        workspace.handle_key(KeyPress::ctrl('\\')); // split: focus the empty second buffer
+        workspace.handle_key(KeyPress::ctrl('\\')); // split -> a second view of "hello"
+        workspace.handle_key(alt(KeyCode::Right)); // re-point the new pane at the empty buffer
         assert_eq!(workspace.active().buffer().text(), "");
         workspace.handle_key(KeyPress::ctrl('v')); // paste the other pane's copy
         assert_eq!(workspace.active().buffer().text(), "hello");
