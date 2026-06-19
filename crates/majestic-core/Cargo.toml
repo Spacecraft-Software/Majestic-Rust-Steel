@@ -90,5 +90,10 @@ lang-erlang = ["dep:tree-sitter-erlang"]
 lang-powershell = ["dep:tree-sitter-powershell"]
 lang-typescript = ["dep:tree-sitter-typescript"]
 
+[dev-dependencies]
+# Cross-checks the command catalog (oracle::COMMANDS) against `Editor::execute`: every documented
+# command must be executable. No cycle — `oracle` depends only on `keymaker`, not `majestic-core`.
+oracle = { version = "0.0.0", path = "../oracle" }
+
 [lints]
 workspace = true

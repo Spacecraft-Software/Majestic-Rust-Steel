@@ -116,6 +116,12 @@ impl KeyPress {
         Self::new(Mods::CTRL, KeyCode::Char(c))
     }
 
+    /// An `Alt`/`Meta`-modified character key (Emacs `M-` chords).
+    #[must_use]
+    pub const fn alt(c: char) -> Self {
+        Self::new(Mods::ALT, KeyCode::Char(c))
+    }
+
     /// An unmodified named key.
     #[must_use]
     pub const fn key(code: KeyCode) -> Self {

@@ -25,8 +25,10 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
-use keymaker::{KeyCode, KeyPress, Mods};
-use majestic_core::{Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, Workspace};
+use keymaker::{KeyCode, KeyPress, Mods, Profile};
+use majestic_core::{
+    Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector, Workspace,
+};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -100,6 +102,8 @@ struct App {
     finder: Option<Finder>,
     help: Option<HelpOverlay>,
     info: Option<InfoReader>,
+    /// The first-run profile picker; `Some` until the user chooses (modal while open).
+    selector: Option<ProfileSelector>,
     focus: Focus,
 }
 
@@ -113,6 +117,7 @@ impl App {
             finder: None,
             help: None,
             info: None,
+            selector: None,
             focus: Focus::Editor,
         }
     }
@@ -178,6 +183,19 @@ impl App {
 
         self.draw_status_bar(surface, status.y, theme);
 
+        // which-key hint: while a prefix is in progress in the editor (Spacemacs SPC, Emacs C-x)
+        // and no modal is open, list the keys that may come next over the editor area.
+        if self.focus == Focus::Editor
+            && self.finder.is_none()
+            && self.help.is_none()
+            && self.info.is_none()
+            && self.selector.is_none()
+        {
+            if let Some(which_key) = self.workspace.which_key() {
+                which_key.render(surface, main, theme);
+            }
+        }
+
         // Modal overlays are drawn last, over everything else.
         let area = surface.area();
         if let Some(finder) = self.finder.as_ref() {
@@ -185,6 +203,9 @@ impl App {
         }
         if let Some(help) = self.help.as_ref() {
             help.render(surface, area, theme);
+        }
+        if let Some(selector) = self.selector.as_ref() {
+            selector.render(surface, area, theme);
         }
     }
 
@@ -237,6 +258,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
+        // The first-run selector is modal and outranks everything: it captures every key until
+        // the user has chosen a keybinding profile.
+        if self.selector.is_some() {
+            self.selector_key(key);
+            return Ok(());
+        }
         // The help overlay and the fuzzy finder are modal: while open they capture every key.
         if self.help.is_some() {
             self.help_key(key);
@@ -436,6 +463,36 @@ impl App {
         }
     }
 
+    /// Routes a key to the first-run selector: a mnemonic letter chooses that profile, `Esc`
+    /// accepts the CUA default. The choice is applied live and persisted so the prompt does not
+    /// reappear; a persistence failure is non-fatal (it just re-prompts next launch).
+    fn selector_key(&mut self, key: KeyPress) {
+        let Some(selector) = self.selector.as_ref() else {
+            return;
+        };
+        let chosen = match key.code {
+            KeyCode::Escape => Some(Profile::Cua),
+            KeyCode::Char(ch) => selector.choose(ch),
+            _ => None,
+        };
+        let Some(profile) = chosen else {
+            return; // an unrecognized key keeps the modal open
+        };
+        self.selector = None;
+        self.workspace.set_profile(profile);
+        match majestic_config::write_keymap(profile.name()) {
+            Ok(path) => self.workspace.set_status(format!(
+                "keybindings: {} — saved to {}",
+                profile.name(),
+                path.display()
+            )),
+            Err(error) => self.workspace.set_status(format!(
+                "keybindings: {} (not saved: {error})",
+                profile.name()
+            )),
+        }
+    }
+
     /// Routes a key to the open help overlay: arrows/Page scroll, Esc or F1 close.
     fn help_key(&mut self, key: KeyPress) {
         if key.code == KeyCode::Escape || key == HELP_KEY {
@@ -512,6 +569,7 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
 pub(crate) fn run(
     workspace: Workspace,
     initial_info: Option<PathBuf>,
+    first_run: bool,
     persist_session: bool,
 ) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
@@ -520,6 +578,10 @@ pub(crate) fn run(
     let mut screen = Screen::new(columns, lines, theme.base_style());
     let mut out = io::stdout();
     let mut app = App::new(workspace);
+    if first_run {
+        // No manifest yet: ask the user to pick a keybinding profile before editing.
+        app.selector = Some(ProfileSelector::new());
+    }
     if let Some(path) = initial_info {
         // A launch-time Info path (an `.info` argument, or `mj info`) opens the reader directly —
         // including the extension-less `dir` directory file.

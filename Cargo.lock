@@ -1624,6 +1624,7 @@ name = "majestic-core"
 version = "0.0.0"
 dependencies = [
  "keymaker",
+ "oracle",
  "penumbra",
  "serde",
  "serde_json",
