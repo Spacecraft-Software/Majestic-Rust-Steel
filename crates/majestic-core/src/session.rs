@@ -101,6 +101,37 @@ impl Session {
         let json = std::fs::read_to_string(path)?;
         Self::from_json(&json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
+
+    /// The canonical session file: `$XDG_STATE_HOME/majestic/session.json`, else
+    /// `$HOME/.local/state/majestic/session.json`. `None` when neither variable is set.
+    #[must_use]
+    pub fn default_path() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local").join("state"))
+            })?;
+        Some(base.join("majestic").join("session.json"))
+    }
+
+    /// Saves this session to [`Session::default_path`], returning the path written.
+    ///
+    /// # Errors
+    /// Returns an I/O error when there is no state home, or when the write fails.
+    pub fn save(&self) -> io::Result<PathBuf> {
+        let path = Self::default_path()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no state home to write to"))?;
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    /// Loads the saved session from [`Session::default_path`], or `None` when there is none (or it
+    /// is unreadable / does not parse — a corrupt session never blocks startup).
+    #[must_use]
+    pub fn load() -> Option<Self> {
+        Self::load_from(&Self::default_path()?).ok()
+    }
 }
 
 #[cfg(test)]

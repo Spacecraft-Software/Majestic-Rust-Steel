@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use keymaker::Profile;
 use majestic_config::Config;
-use majestic_core::{Buffer, Editor, Workspace};
+use majestic_core::{Buffer, Editor, Session, Workspace};
 use majestic_steel::Runtime as SteelRuntime;
 
 mod tui;
@@ -42,6 +42,8 @@ enum Action {
     Apropos(Option<String>),
     /// Open the built-in Info reader: a topic's manual, or the `dir` directory with no argument.
     Info(Option<String>),
+    /// `session [list|clear]`: manage the saved session (WS2).
+    Session(Option<String>),
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -64,8 +66,9 @@ fn classify(args: &[String]) -> Action {
         "describe" => Action::Describe(args.get(1).cloned()),
         "apropos" => Action::Apropos(args.get(1).cloned()),
         "info" => Action::Info(args.get(1).cloned()),
+        "session" => Action::Session(args.get(1).cloned()),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
-        "config" | "session" | "ed" => Action::Pending(first.clone()),
+        "config" | "ed" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
         "--" => Action::Open(args[1..].to_vec()),
         other if other.starts_with('-') => Action::Unknown(other.to_owned()),
@@ -101,7 +104,7 @@ COMMANDS:
     apropos <WORD>     Search commands by keyword (Oracle)
     info [TOPIC]       Open the built-in Info/Texinfo reader (the `dir` index if no topic)
     config             Validate/inspect configuration (M1)
-    session            Manage daemon sessions (M2)
+    session [list|clear]  Show or clear the saved session (`mj` reopens it)
     ed                 Line-editor mode (M4)
 
 OPTIONS:
@@ -134,6 +137,7 @@ fn main() -> ExitCode {
         Action::Describe(query) => run_describe(query.as_deref()),
         Action::Apropos(query) => run_apropos(query.as_deref()),
         Action::Info(topic) => run_info(topic.as_deref(), safe_mode),
+        Action::Session(sub) => run_session(sub.as_deref()),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -171,19 +175,78 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
             }
         }
     }
-    if editors.is_empty() {
-        editors.push(Editor::new());
-    }
-    let mut workspace = Workspace::from_editors(editors);
+    // Plain `mj` (no file arguments) reopens the last saved session, if any; otherwise a scratch
+    // buffer. Launching with files opens those instead and does not restore.
+    let mut workspace = if paths.is_empty() {
+        Session::load().map_or_else(
+            || Workspace::from_editors(vec![Editor::new()]),
+            |session| Workspace::from_session(&session),
+        )
+    } else {
+        if editors.is_empty() {
+            editors.push(Editor::new());
+        }
+        Workspace::from_editors(editors)
+    };
     // First run = no manifest yet (and not in safe mode): prompt for a keybinding profile.
     let first_run = !safe_mode && Config::discover().is_none();
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    match tui::run(workspace, initial_info, first_run) {
+    // The editor path persists its layout on exit so the next plain `mj` resumes here.
+    match tui::run(workspace, initial_info, first_run, true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Manages the saved session: `session` / `session list` prints it, `session clear` deletes it.
+fn run_session(sub: Option<&str>) -> ExitCode {
+    match sub {
+        None | Some("list") => {
+            let Some(session) = Session::load() else {
+                println!("No saved session.");
+                return ExitCode::SUCCESS;
+            };
+            println!(
+                "Saved session — {} pane(s), focused #{}:",
+                session.panes.len(),
+                session.focused
+            );
+            for (index, pane) in session.panes.iter().enumerate() {
+                let location = pane
+                    .path
+                    .as_deref()
+                    .map_or_else(|| "[scratch]".to_owned(), |path| path.display().to_string());
+                println!("  {index}: {location}");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("clear") => {
+            let Some(path) = Session::default_path() else {
+                eprintln!("{PROGRAM}: no state directory to clear");
+                return ExitCode::FAILURE;
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("Cleared session {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("No saved session.");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{PROGRAM}: cannot clear session: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("{PROGRAM}: unknown `session` subcommand `{other}` (try: list, clear)");
             ExitCode::FAILURE
         }
     }
@@ -203,8 +266,9 @@ fn run_info(topic: Option<&str>, safe_mode: bool) -> ExitCode {
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    // `mj info` just views a manual — never prompt for first-run profile selection here.
-    match tui::run(workspace, Some(path), false) {
+    // `mj info` is a transient manual view: no first-run prompt, and it must not overwrite the
+    // saved editing session.
+    match tui::run(workspace, Some(path), false, false) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
@@ -380,6 +444,11 @@ mod tests {
         assert_eq!(
             classify(&owned(&["config", "check"])),
             Action::Pending("config".to_owned())
+        );
+        assert_eq!(classify(&owned(&["session"])), Action::Session(None));
+        assert_eq!(
+            classify(&owned(&["session", "clear"])),
+            Action::Session(Some("clear".to_owned()))
         );
         assert_eq!(
             classify(&owned(&["--", "-weird.txt"])),
