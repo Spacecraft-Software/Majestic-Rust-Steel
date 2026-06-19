@@ -29,7 +29,9 @@ grammars-extra = ["majestic-core/grammars-extra"]
 grammars-all = ["majestic-core/grammars-all"]
 
 [dependencies]
-crossterm = "0.28"
+# `serde` derives Serialize/Deserialize on the event types, so the attach client can forward
+# key/resize events to the daemon over the wire.
+crossterm = { version = "0.28", features = ["serde"] }
 keymaker = { version = "0.0.0", path = "../crates/keymaker" }
 majestic-config = { version = "0.0.0", path = "../crates/majestic-config" }
 majestic-core = { version = "0.0.0", path = "../crates/majestic-core" }
@@ -38,3 +40,5 @@ majestic-steel = { version = "0.0.0", path = "../crates/majestic-steel" }
 majestic-term = { version = "0.0.0", path = "../crates/majestic-term" }
 oracle = { version = "0.0.0", path = "../crates/oracle" }
 penumbra = { version = "0.0.0", path = "../crates/penumbra" }
+# The attach wire messages (AttachInput / ServerFrame) derive serde.
+serde = { version = "1.0.228", features = ["derive"] }

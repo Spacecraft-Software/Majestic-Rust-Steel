@@ -82,6 +82,9 @@ impl Daemon {
                 self.shutdown = true;
                 Response::Ok
             }
+            // `Attach` is an interactive stream the session host intercepts before dispatching
+            // here; reaching this arm means a control path mishandled it.
+            Request::Attach { .. } => Response::Error("attach is not a control request".to_owned()),
         }
     }
 

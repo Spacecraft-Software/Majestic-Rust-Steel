@@ -27,7 +27,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
-    Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector, Workspace,
+    Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector, Session, Workspace,
 };
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
@@ -48,10 +48,10 @@ const SIDEBAR_COLS: u16 = 28;
 const MIN_MAIN_COLS: u16 = 24;
 
 /// Restores the terminal (cooked mode, main screen, visible cursor) when dropped.
-struct TerminalGuard;
+pub(crate) struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    pub(crate) fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         execute!(
             io::stdout(),
@@ -141,6 +141,11 @@ impl App {
 
     fn should_quit(&self) -> bool {
         self.workspace.should_quit()
+    }
+
+    /// The editing workspace (so the daemon can snapshot it into a session on detach).
+    pub(crate) fn workspace(&self) -> &Workspace {
+        &self.workspace
     }
 
     /// Draws the sidebar, the editor area, the bottom terminal panel (when present), and the
@@ -559,6 +564,71 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
     surface.set_str(area.x.saturating_add(1), area.y, " TERMINAL ", label_style);
 }
 
+/// A headless editor session the daemon drives over a socket.
+///
+/// It owns the full [`App`] and an off-screen [`Screen`], so [`SessionHost::render`] produces the
+/// exact terminal byte stream `run` would have written locally — an attached client just paints
+/// those bytes. The whole editor UI (sidebar, panels, overlays) is reused without touching a real
+/// terminal; only input and output are redirected to the wire.
+pub(crate) struct SessionHost {
+    app: App,
+    screen: Screen,
+    theme: Theme,
+    cols: u16,
+    rows: u16,
+}
+
+impl SessionHost {
+    /// Creates a host over `workspace` at the given client terminal size.
+    pub(crate) fn new(workspace: Workspace, cols: u16, rows: u16) -> Self {
+        let theme = Theme::steelbore();
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        let screen = Screen::new(cols, rows, theme.base_style());
+        Self {
+            app: App::new(workspace),
+            screen,
+            theme,
+            cols,
+            rows,
+        }
+    }
+
+    /// Resizes the off-screen surface to a (new) client terminal size; the next render repaints.
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        self.cols = cols;
+        self.rows = rows;
+        self.screen.resize(cols, rows, self.theme.base_style());
+    }
+
+    /// Feeds one key; returns whether the editor asked to quit.
+    ///
+    /// # Errors
+    /// Propagates an I/O error from the integrated terminal panel.
+    pub(crate) fn input(&mut self, key: KeyPress) -> io::Result<bool> {
+        self.app.handle_key(key, self.cols, self.rows)?;
+        Ok(self.app.should_quit())
+    }
+
+    /// Renders the current state, returning the terminal bytes to send to clients (the diff since
+    /// the previous render — a full repaint on the first call or after a resize).
+    ///
+    /// # Errors
+    /// Propagates a write error from the framebuffer presenter.
+    pub(crate) fn render(&mut self) -> io::Result<Vec<u8>> {
+        self.app.reap_dead_terminal();
+        self.app.render(self.screen.back_mut(), &self.theme);
+        let mut bytes = Vec::new();
+        self.screen.present(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Snapshots the current layout/open-files/cursors into a [`Session`] (persisted on detach).
+    pub(crate) fn to_session(&self) -> Session {
+        self.app.workspace().to_session()
+    }
+}
+
 /// Runs the editor + terminal interactive loop until a quit command is issued.
 ///
 /// When `persist_session` is set, the workspace layout is saved to the session file on exit so a
@@ -642,7 +712,7 @@ fn is_command_palette(key: KeyPress) -> bool {
 }
 
 /// Translates a crossterm key event into a Keymaker [`KeyPress`], if it maps to one.
-fn translate(key: KeyEvent) -> Option<KeyPress> {
+pub(crate) fn translate(key: KeyEvent) -> Option<KeyPress> {
     if key.kind == KeyEventKind::Release {
         return None; // ignore key-release events (Kitty protocol)
     }
