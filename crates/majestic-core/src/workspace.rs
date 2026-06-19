@@ -14,10 +14,12 @@
 use keymaker::{KeyCode, KeyPress, Mods};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
+use crate::buffer::Buffer;
 use crate::editor::Editor;
+use crate::session::{LayoutNode, PaneState, Session};
 
 /// The axis a split divides its two children along.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Split {
     /// Children side by side, separated by a vertical rule (`│`).
     Columns,
@@ -259,6 +261,110 @@ impl Workspace {
         self.tab_width = width;
         for editor in &mut self.editors {
             editor.set_tab_width(width);
+        }
+    }
+
+    /// Captures the layout, open files, and cursor/viewport of every pane into a [`Session`] for
+    /// persistence. Unsaved scratch buffers are recorded with no path (they restore empty).
+    #[must_use]
+    pub fn to_session(&self) -> Session {
+        let mut panes = Vec::new();
+        let layout = self.node_to_layout(&self.root, &mut panes);
+        Session {
+            panes,
+            layout,
+            focused: self.focused,
+        }
+    }
+
+    /// Rebuilds a workspace from a saved [`Session`]: reopens each pane's file (a scratch pane, or
+    /// a file that no longer opens, becomes an empty buffer) and restores the layout, focus, and
+    /// cursor/viewport. The host applies config (indent width, …) afterward.
+    #[must_use]
+    pub fn from_session(session: &Session) -> Self {
+        let mut editors: Vec<Editor> = session
+            .panes
+            .iter()
+            .map(|pane| {
+                let mut editor = match &pane.path {
+                    Some(path) => Buffer::open(path.clone())
+                        .map_or_else(|_| Editor::new(), Editor::with_buffer),
+                    None => Editor::new(),
+                };
+                editor.restore_position(pane.cursor, pane.viewport_top, pane.viewport_left);
+                editor
+            })
+            .collect();
+        if editors.is_empty() {
+            editors.push(Editor::new());
+        }
+
+        // Trust the layout only if every leaf indexes a real pane; otherwise fall back to a single
+        // pane so a corrupt session file degrades gracefully rather than panicking (Stability P1).
+        let root = Self::layout_to_node(&session.layout);
+        let mut leaves = Vec::new();
+        root.collect_editors(&mut leaves);
+        let (root, focused) = if !leaves.is_empty() && leaves.iter().all(|&i| i < editors.len()) {
+            (root, session.focused.min(leaves.len() - 1))
+        } else {
+            (Node::Leaf(0), 0)
+        };
+
+        Self {
+            editors,
+            root,
+            focused,
+            clipboard: String::new(),
+            tab_width: 4,
+            quit: false,
+        }
+    }
+
+    /// Walks the window tree into a serializable [`LayoutNode`], collecting each pane's state into
+    /// `panes` and referencing it by its in-order ordinal.
+    fn node_to_layout(&self, node: &Node, panes: &mut Vec<PaneState>) -> LayoutNode {
+        match node {
+            Node::Leaf(index) => {
+                let editor = &self.editors[*index];
+                let (viewport_top, viewport_left) = editor.viewport();
+                panes.push(PaneState {
+                    path: editor.buffer().path(),
+                    cursor: editor.buffer().cursor(),
+                    viewport_top,
+                    viewport_left,
+                });
+                LayoutNode::Leaf(panes.len() - 1)
+            }
+            Node::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => LayoutNode::Split {
+                dir: *dir,
+                ratio: *ratio,
+                first: Box::new(self.node_to_layout(first, panes)),
+                second: Box::new(self.node_to_layout(second, panes)),
+            },
+        }
+    }
+
+    /// Rebuilds the window tree from a serialized [`LayoutNode`] (leaves index `editors` directly,
+    /// since `from_session` builds them in ordinal order).
+    fn layout_to_node(layout: &LayoutNode) -> Node {
+        match layout {
+            LayoutNode::Leaf(ordinal) => Node::Leaf(*ordinal),
+            LayoutNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => Node::Split {
+                dir: *dir,
+                ratio: *ratio,
+                first: Box::new(Self::layout_to_node(first)),
+                second: Box::new(Self::layout_to_node(second)),
+            },
         }
     }
 
@@ -814,5 +920,45 @@ mod tests {
             has_divider,
             "expected a vertical divider between the two panes"
         );
+    }
+
+    #[test]
+    fn single_scratch_session_round_trips_to_one_pane() {
+        let workspace = Workspace::new(Editor::new());
+        let session = workspace.to_session();
+        assert_eq!(session.panes.len(), 1);
+        assert!(session.panes[0].path.is_none());
+        assert_eq!(Workspace::from_session(&session).pane_count(), 1);
+    }
+
+    #[test]
+    fn session_captures_and_restores_split_layout_and_cursor() {
+        // Open a real file (so it reopens on restore), split it, move the cursor, round-trip.
+        let mut path = std::env::temp_dir();
+        path.push(format!("majestic-ws-session-{}.txt", std::process::id()));
+        let mut journal = path.clone().into_os_string();
+        journal.push(".mjjournal");
+        std::fs::write(&path, "hello world\nsecond line\n").unwrap();
+
+        let mut workspace =
+            Workspace::new(Editor::with_buffer(Buffer::open(path.clone()).unwrap()));
+        workspace.handle_key(KeyPress::ctrl('\\')); // split into two panes
+        workspace.active_mut().execute("move-right");
+        workspace.active_mut().execute("move-right");
+        let cursor = workspace.active().buffer().cursor();
+
+        let session = workspace.to_session();
+        assert_eq!(session.panes.len(), 2);
+
+        let restored = Workspace::from_session(&session);
+        assert_eq!(restored.pane_count(), 2);
+        assert_eq!(restored.active().buffer().cursor(), cursor);
+        assert_eq!(
+            restored.active().buffer().text(),
+            "hello world\nsecond line\n"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
     }
 }

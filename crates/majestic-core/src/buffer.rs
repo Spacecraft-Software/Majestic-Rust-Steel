@@ -255,6 +255,14 @@ impl Buffer {
         self.clamped(self.cursor)
     }
 
+    /// Moves the cursor to `offset` (snapped to the nearest `char` boundary `<=` length), dropping
+    /// any selection. Used to restore a saved session's cursor position.
+    pub fn set_cursor(&mut self, offset: usize) {
+        self.cursor = self.clamped(offset);
+        self.selection_anchor = None;
+        self.goal_column = None;
+    }
+
     /// The cursor's `(row, byte-column)` position.
     #[must_use]
     pub fn cursor_point(&self) -> Point {

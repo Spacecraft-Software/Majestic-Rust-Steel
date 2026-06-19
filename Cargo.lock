@@ -1624,6 +1624,8 @@ version = "0.0.0"
 dependencies = [
  "keymaker",
  "penumbra",
+ "serde",
+ "serde_json",
  "stratum",
  "syntect",
  "tree-sitter",
