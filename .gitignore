@@ -13,3 +13,4 @@
 
 # Local-only runtime/state (sessions, journals) must never be committed
 /.majestic/
+*.mjjournal

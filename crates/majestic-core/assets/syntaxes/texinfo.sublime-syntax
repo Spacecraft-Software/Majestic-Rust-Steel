@@ -1,0 +1,47 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# A focused Texinfo (.texi) syntax for Majestic's syntect tier — complements the built-in Info
+# reader (PRD §5.7). Scopes use TextMate roots that map to Majestic's HighlightKind: comment,
+# keyword (@-commands), entity.name.section (node/sectioning titles), punctuation (braces).
+---
+name: Texinfo
+file_extensions:
+  - texi
+  - texinfo
+  - txi
+scope: text.texinfo
+
+contexts:
+  main:
+    # Line comments: `@c ...` / `@comment ...` run to end of line.
+    - match: '@(?:comment|c)\b.*$'
+      scope: comment.line.texinfo
+
+    # `@ignore` ... `@end ignore` is a comment block.
+    - match: '^@ignore\b'
+      push:
+        - meta_scope: comment.block.texinfo
+        - match: '^@end\s+ignore\b'
+          pop: true
+
+    # A node line: `@node Name` — highlight the title.
+    - match: '^(@node)\b\s*(.*)$'
+      captures:
+        1: keyword.other.texinfo
+        2: entity.name.section.texinfo
+
+    # Sectioning commands: highlight the command and its title.
+    - match: '^(@(?:chapter|(?:sub){0,2}section|unnumbered\w*|appendix\w*|top|chapheading|(?:major|sub)?heading))\b\s*(.*)$'
+      captures:
+        1: keyword.other.texinfo
+        2: entity.name.section.texinfo
+
+    # Any other @-command (markup directive, environment, accent, …).
+    - match: '@[a-zA-Z]+'
+      scope: keyword.other.texinfo
+
+    # Braces delimiting command arguments.
+    - match: '[{}]'
+      scope: punctuation.definition.texinfo

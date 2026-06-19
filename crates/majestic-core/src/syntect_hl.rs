@@ -15,14 +15,31 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use stratum::{Span, SpanLayer};
-use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::parsing::{
+    ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet,
+};
 use syntect::util::LinesWithEndings;
 
 use crate::syntax::HighlightKind;
 
+/// Extra `.sublime-syntax` definitions bundled for languages absent from bat's set (each carries
+/// its own SPDX header). Folded into [`SYNTAXES`] at build time.
+const EXTRA_SYNTAXES: &[&str] = &[include_str!("../assets/syntaxes/texinfo.sublime-syntax")];
+
 /// The shared syntax set: bat's extended `.sublime-syntax` collection (~150 languages) via
-/// `two-face`. Built once, lazily, on first use — off the UI thread.
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
+/// `two-face`, plus [`EXTRA_SYNTAXES`]. Built once, lazily, on first use — off the UI thread.
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(build_syntax_set);
+
+fn build_syntax_set() -> SyntaxSet {
+    let mut builder = two_face::syntax::extra_newlines().into_builder();
+    for source in EXTRA_SYNTAXES {
+        // `lines_include_newline = true` matches the newline-inclusive bat set we extend.
+        if let Ok(definition) = SyntaxDefinition::load_from_str(source, true, None) {
+            builder.add(definition);
+        }
+    }
+    builder.build()
+}
 
 /// A syntect-backed highlighter bound to one language.
 pub(crate) struct SyntectHighlighter {
@@ -191,11 +208,29 @@ mod tests {
     }
 
     #[test]
+    fn highlights_bundled_texinfo() {
+        // The hand-authored Texinfo syntax complements the Info reader.
+        let mut highlighter =
+            SyntectHighlighter::for_path(Path::new("manual.texi")).expect("texinfo bundled");
+        let layer = highlighter
+            .highlight(b"@c a comment\n@chapter Introduction\nUse @code{foo} for code.\n");
+        let kinds: Vec<HighlightKind> = layer.iter().map(|span| span.value).collect();
+        assert!(
+            kinds.contains(&HighlightKind::Comment),
+            "@c line is a comment"
+        );
+        assert!(
+            kinds.contains(&HighlightKind::Keyword),
+            "@chapter / @code are keywords"
+        );
+    }
+
+    #[test]
     fn covers_languages_beyond_the_tree_sitter_core() {
         // A sampling from bat's extended set that the tree-sitter tier does not wire — including
-        // Lua and Emacs Lisp (`.el`, via the bundled "Lisp" syntax).
+        // Lua and Emacs Lisp (`.el`, via the bundled "Lisp" syntax) and our bundled Texinfo.
         for ext in [
-            "nix", "swift", "kt", "dart", "toml", "zig", "asm", "adb", "lua", "el",
+            "nix", "swift", "kt", "dart", "toml", "zig", "asm", "adb", "lua", "el", "texi",
         ] {
             assert!(
                 SyntectHighlighter::supports(Path::new(&format!("x.{ext}"))),

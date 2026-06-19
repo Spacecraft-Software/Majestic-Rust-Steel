@@ -44,6 +44,7 @@ tree-sitter-typescript = { version = "0.23.2", optional = true }
 syntect = { version = "5.3", default-features = false, optional = true, features = [
     "parsing",
     "regex-fancy",
+    "yaml-load",
 ] }
 # two-face bundles bat's extended `.sublime-syntax` set (~150 languages) for syntect — the data
 # that gives the broad tier its reach without one compiled grammar each. `syntect-fancy` keeps the
