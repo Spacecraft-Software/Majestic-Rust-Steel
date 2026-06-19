@@ -8,14 +8,15 @@
 //! character). Each node opens with a header line — `File: f,  Node: N,  Next: X,  Prev: Y,
 //! Up: Z` — followed by the node body, which may contain a `* Menu:` of `* Item::` entries.
 //! [`InfoDocument`] parses that structure; [`InfoReader`] drives navigation (next/prev/up,
-//! menu entries, history) and renders the current node in the Steelbore palette (§9).
+//! `* Menu:` entries, inline `*note` cross-references, and history) and renders the current node
+//! in the Steelbore palette (§9).
 //!
-//! This v1 reads single-file, in-file navigation; cross-file references (`(dir)`, `(other)node`)
-//! are shown but not followed. Inline `*note …::` cross-references render as text — following
-//! them is a later refinement.
+//! Cross-file references (`(dir)`, `(other)Node`) are resolved against the opened file's
+//! directory and loaded lazily, so navigation spans a whole Info tree. Gzipped `.info.gz`
+//! files are not yet decompressed.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
@@ -48,7 +49,7 @@ impl Reference {
     /// Parses the text after a leading `* ` (a menu entry) into a reference, or `None`.
     ///
     /// Forms: `Node::  desc` (label == node) or `Label: Node.  desc`. Cross-file targets
-    /// (`(file)node`) are rejected — this v1 navigates within one file.
+    /// (`(file)node`) are kept and resolved by [`InfoReader::goto`].
     fn menu(rest: &str, line: usize) -> Option<Self> {
         let (label, target) = if let Some((node, _description)) = rest.split_once("::") {
             let node = node.trim();
@@ -58,7 +59,7 @@ impl Reference {
             let target = after.split('.').next().unwrap_or_default().trim();
             (label.trim().to_owned(), target.to_owned())
         };
-        if target.is_empty() || target.starts_with('(') {
+        if target.is_empty() {
             return None;
         }
         Some(Self {
@@ -89,34 +90,50 @@ fn find_note(slice: &str) -> Option<usize> {
     None
 }
 
-/// Appends inline `*note Target::` cross-references found on `line` to `out`.
+/// Parses the text after `*note␠` into `(label, target, consumed_bytes)`.
 ///
-/// Only the `Target::` form is parsed (what `makeinfo` emits for `@xref`/`@ref`/`@pxref`); the
-/// labelled `Label: Target.` form and cross-file targets are left for a later refinement.
+/// Two forms: `Target::` (label == target) and `Label: Target.`. Cross-file targets
+/// (`(file)Node`) are kept verbatim for [`InfoReader::goto`] to resolve.
+fn parse_note_body(rest: &str) -> Option<(String, String, usize)> {
+    // `Target::` — only when the target itself holds no `:` (which would signal the labelled form).
+    if let Some(end) = rest.find("::") {
+        let target = rest[..end].trim();
+        if !target.is_empty() && !rest[..end].contains(": ") {
+            return Some((target.to_owned(), target.to_owned(), end + 2));
+        }
+    }
+    // `Label: Target.`
+    let colon = rest.find(": ")?;
+    let after = &rest[colon + 2..];
+    let dot = after.find('.')?;
+    let (label, target) = (rest[..colon].trim(), after[..dot].trim());
+    if label.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some((label.to_owned(), target.to_owned(), colon + 2 + dot + 1))
+}
+
+/// Appends inline `*note …` cross-references found on `line` to `out`.
 fn parse_xrefs(line: &str, line_index: usize, out: &mut Vec<Reference>) {
     let mut search = 0;
     while let Some(found) = find_note(&line[search..]) {
         let start = search + found; // byte offset of the `*`
         let after = &line[start + NOTE.len()..];
         let whitespace = after.len() - after.trim_start().len();
-        let rest = &after[whitespace..];
-        match (whitespace > 0).then(|| rest.find("::")).flatten() {
-            Some(end) => {
-                let target = rest[..end].trim();
-                if !target.is_empty() && !target.starts_with('(') {
-                    let span_bytes = NOTE.len() + whitespace + end + 2; // `*note` + ws + target + `::`
-                    out.push(Reference {
-                        label: target.to_owned(),
-                        target: target.to_owned(),
-                        line: line_index,
-                        column: line[..start].chars().count(),
-                        length: line[start..start + span_bytes].chars().count(),
-                        menu: false,
-                    });
-                }
-                search = start + NOTE.len() + whitespace + end + 2;
-            }
-            None => search = start + NOTE.len(),
+        let parsed = (whitespace > 0).then(|| parse_note_body(&after[whitespace..]));
+        if let Some((label, target, consumed)) = parsed.flatten() {
+            let span_bytes = NOTE.len() + whitespace + consumed;
+            out.push(Reference {
+                label,
+                target,
+                line: line_index,
+                column: line[..start].chars().count(),
+                length: line[start..start + span_bytes].chars().count(),
+                menu: false,
+            });
+            search = start + span_bytes;
+        } else {
+            search = start + NOTE.len();
         }
     }
 }
@@ -144,9 +161,9 @@ impl InfoNode {
                 let value = value.trim();
                 match key {
                     "Node" => value.clone_into(&mut name),
-                    "Next" => next = in_file(value),
-                    "Prev" => prev = in_file(value),
-                    "Up" => up = in_file(value),
+                    "Next" => next = link(value),
+                    "Prev" => prev = link(value),
+                    "Up" => up = link(value),
                     _ => {}
                 }
             }
@@ -167,10 +184,10 @@ impl InfoNode {
     }
 }
 
-/// A cross-file ref (`(dir)`, `(other)node`) or empty value yields `None`; an in-file node name
-/// yields `Some`.
-fn in_file(value: &str) -> Option<String> {
-    (!value.is_empty() && !value.starts_with('(')).then(|| value.to_owned())
+/// A navigation link: `None` only for an empty value. Cross-file forms (`(dir)`, `(other)node`)
+/// are kept verbatim and resolved by [`InfoReader::goto`].
+fn link(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Scans a node body for its `* Menu:` entries (as whole-line references).
@@ -242,14 +259,25 @@ impl InfoDocument {
     }
 }
 
-/// An interactive Info reader: a parsed document plus the current node, scroll, menu selection,
-/// and navigation history.
+/// The Info-file key for `path`: its base name without a trailing `.info` extension.
+fn info_key(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("info");
+    name.strip_suffix(".info").unwrap_or(name).to_owned()
+}
+
+/// An interactive Info reader: one or more parsed documents (loaded lazily for cross-file
+/// navigation), the current node, scroll, reference selection, and a cross-document history.
 #[derive(Clone, Debug)]
 pub struct InfoReader {
-    doc: InfoDocument,
-    title: String,
+    /// Parsed documents, keyed by Info file name (base name without `.info`).
+    docs: HashMap<String, InfoDocument>,
+    /// The active document's key.
+    file: String,
+    /// Directory used to resolve sibling `.info` files for cross-file links (`None` for in-memory
+    /// readers, which stay single-file).
+    dir: Option<PathBuf>,
     current: usize,
-    history: Vec<usize>,
+    history: Vec<(String, usize)>,
     scroll: usize,
     ref_selected: usize,
     /// Visible body rows, recorded by [`InfoReader::render`] so selection can scroll into view.
@@ -257,7 +285,8 @@ pub struct InfoReader {
 }
 
 impl InfoReader {
-    /// Opens and parses an Info file, starting at its `Top` node (or the first node).
+    /// Opens and parses an Info file, starting at its `Top` node (or the first node). Sibling
+    /// `.info` files in the same directory become reachable through cross-file references.
     ///
     /// # Errors
     /// Returns the underlying I/O error if `path` cannot be read.
@@ -265,22 +294,23 @@ impl InfoReader {
         // Info files are usually UTF-8 but historically Latin-1; read leniently rather than fail.
         let bytes = fs::read(path)?;
         let text = String::from_utf8_lossy(&bytes);
-        let title = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("info")
-            .to_owned();
-        Ok(Self::from_text(&text, title))
+        let mut reader = Self::from_text(&text, info_key(path));
+        reader.dir = path.parent().map(Path::to_path_buf);
+        Ok(reader)
     }
 
-    /// Builds a reader over already-loaded Info `text` titled `title`.
+    /// Builds a single-file reader over already-loaded Info `text`, keyed by `file`.
     #[must_use]
-    pub fn from_text(text: &str, title: impl Into<String>) -> Self {
+    pub fn from_text(text: &str, file: impl Into<String>) -> Self {
+        let file = file.into();
         let doc = InfoDocument::parse(text);
         let current = doc.position("Top").unwrap_or(0);
+        let mut docs = HashMap::new();
+        docs.insert(file.clone(), doc);
         Self {
-            doc,
-            title: title.into(),
+            docs,
+            file,
+            dir: None,
             current,
             history: Vec::new(),
             scroll: 0,
@@ -289,30 +319,95 @@ impl InfoReader {
         }
     }
 
-    /// The current node, if the document is non-empty.
+    fn doc(&self) -> Option<&InfoDocument> {
+        self.docs.get(&self.file)
+    }
+
+    /// The current node, if the active document is non-empty.
     #[must_use]
     pub fn node(&self) -> Option<&InfoNode> {
-        self.doc.nodes.get(self.current)
+        self.doc().and_then(|doc| doc.nodes.get(self.current))
     }
 
-    fn go(&mut self, target: usize) {
-        if target < self.doc.nodes.len() && target != self.current {
-            self.history.push(self.current);
-            self.current = target;
-            self.scroll = 0;
-            self.ref_selected = 0;
+    /// The active Info file name.
+    #[must_use]
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+
+    /// Switches to `(file, index)`, recording history; a no-op when already there.
+    fn go_to(&mut self, file: String, index: usize) {
+        if file == self.file && index == self.current {
+            return;
         }
+        self.history.push((self.file.clone(), self.current));
+        self.file = file;
+        self.current = index;
+        self.scroll = 0;
+        self.ref_selected = 0;
     }
 
-    /// Jumps to the in-file node named `name`, returning whether it exists.
-    pub fn goto(&mut self, name: &str) -> bool {
-        match self.doc.position(name) {
-            Some(target) => {
-                self.go(target);
+    /// Follows a reference `target`, resolving cross-file forms (`(file)Node`, `(file)`, `(dir)`)
+    /// against the opened file's directory. Returns whether the target was reached.
+    pub fn goto(&mut self, target: &str) -> bool {
+        if let Some(rest) = target.strip_prefix('(') {
+            let (file, node) = match rest.split_once(')') {
+                Some((file, node)) => (file, node.trim()),
+                None => (rest, ""),
+            };
+            return self.goto_file(file, node);
+        }
+        match self.doc().and_then(|doc| doc.position(target)) {
+            Some(index) => {
+                let file = self.file.clone();
+                self.go_to(file, index);
                 true
             }
             None => false,
         }
+    }
+
+    /// Resolves a cross-file jump: load `file` (if needed) and go to `node` (or its `Top`).
+    fn goto_file(&mut self, file: &str, node: &str) -> bool {
+        let file = if file.is_empty() {
+            self.file.clone()
+        } else {
+            file.to_owned()
+        };
+        if !self.load(&file) {
+            return false;
+        }
+        let index = if node.is_empty() {
+            self.docs.get(&file).and_then(|doc| doc.position("Top"))
+        } else {
+            self.docs.get(&file).and_then(|doc| doc.position(node))
+        };
+        match index {
+            Some(index) => {
+                self.go_to(file, index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Loads (and caches) the document for Info file `file` from the opened file's directory.
+    fn load(&mut self, file: &str) -> bool {
+        if self.docs.contains_key(file) {
+            return true;
+        }
+        let Some(dir) = self.dir.clone() else {
+            return false;
+        };
+        for name in [format!("{file}.info"), file.to_owned()] {
+            if let Ok(bytes) = fs::read(dir.join(name)) {
+                let text = String::from_utf8_lossy(&bytes);
+                self.docs
+                    .insert(file.to_owned(), InfoDocument::parse(&text));
+                return true;
+            }
+        }
+        false
     }
 
     /// Follows the node's `Next` link, if any.
@@ -336,10 +431,11 @@ impl InfoReader {
         }
     }
 
-    /// Returns to the previously visited node (history back).
+    /// Returns to the previously visited node (cross-document history back).
     pub fn back(&mut self) {
-        if let Some(previous) = self.history.pop() {
-            self.current = previous;
+        if let Some((file, index)) = self.history.pop() {
+            self.file = file;
+            self.current = index;
             self.scroll = 0;
             self.ref_selected = 0;
         }
@@ -413,18 +509,18 @@ impl InfoReader {
         for x in header.x..header.right() {
             surface.set_char(x, header.y, ' ', bar);
         }
-        let name = self
-            .doc
-            .nodes
-            .get(self.current)
-            .map_or("(no nodes)", |node| node.name.as_str());
+        let node = self
+            .docs
+            .get(&self.file)
+            .and_then(|doc| doc.nodes.get(self.current));
+        let name = node.map_or("(no nodes)", |node| node.name.as_str());
         let title = format!(
             " Info: {} — {}    n/p/u nav · ↑↓ select · Enter follow · l back · q quit",
-            self.title, name
+            self.file, name
         );
         surface.set_str(header.x, header.y, &clip(&title, header.width), bar);
 
-        let Some(node) = self.doc.nodes.get(self.current) else {
+        let Some(node) = node else {
             return;
         };
         let foreground = Style::new(theme.foreground, theme.background);
@@ -525,8 +621,8 @@ Node: Top\u{007f}123\n";
         assert_eq!(top.next.as_deref(), Some("First"));
         assert_eq!(
             top.prev.as_deref(),
-            None,
-            "(dir) is cross-file, not followed"
+            Some("(dir)"),
+            "cross-file links are kept verbatim for goto to resolve"
         );
         assert_eq!(top.refs.len(), 2);
         assert_eq!(top.refs[0].target, "First");
@@ -553,6 +649,56 @@ The other node.\n";
         // Enter follows the first reference (`*note Other::`).
         reader.enter();
         assert_eq!(reader.node().unwrap().name, "Other");
+    }
+
+    #[test]
+    fn parses_labelled_cross_references() {
+        let text = "\u{001f}\n\
+File: x.info,  Node: Top,  Up: (dir)\n\
+\n\
+See *note the manual: Other. for the rest.\n\
+\u{001f}\n\
+File: x.info,  Node: Other,  Up: Top\n\
+\n\
+Body.\n";
+        let mut reader = InfoReader::from_text(text, "x");
+        let references = &reader.node().unwrap().refs;
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].label, "the manual");
+        assert_eq!(references[0].target, "Other");
+
+        reader.enter();
+        assert_eq!(reader.node().unwrap().name, "Other");
+    }
+
+    #[test]
+    fn follows_cross_file_references() {
+        let dir = std::env::temp_dir().join(format!("mj-info-xfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.info"),
+            "\u{001f}\nFile: main.info,  Node: Top,  Up: (dir)\n\nSee *note (other)Top:: for more.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("other.info"),
+            "\u{001f}\nFile: other.info,  Node: Top,  Up: (dir)\n\nThe other manual.\n",
+        )
+        .unwrap();
+
+        let mut reader = InfoReader::open(&dir.join("main.info")).unwrap();
+        assert_eq!(reader.file(), "main");
+
+        // The inline `*note (other)Top::` loads the sibling file and jumps into it.
+        reader.enter();
+        assert_eq!(reader.file(), "other");
+        assert_eq!(reader.node().unwrap().name, "Top");
+
+        // History back returns across the file boundary.
+        reader.back();
+        assert_eq!(reader.file(), "main");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
