@@ -14,7 +14,10 @@
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
+use std::path::Path;
+
 use crate::buffer::Buffer;
+use crate::diagnostic::Diagnostic;
 use crate::editor::Editor;
 use crate::session::{LayoutNode, PaneState, Session};
 use crate::whichkey::WhichKey;
@@ -265,6 +268,16 @@ impl Workspace {
         self.tab_width = width;
         for editor in &mut self.editors {
             editor.set_tab_width(width);
+        }
+    }
+
+    /// Applies `diagnostics` to every pane showing the file at `path` (so both views of one file
+    /// update together). Called from the host with the language server's published diagnostics.
+    pub fn apply_diagnostics(&mut self, path: &Path, diagnostics: &[Diagnostic]) {
+        for editor in &mut self.editors {
+            if editor.buffer().path().as_deref() == Some(path) {
+                editor.set_diagnostics(diagnostics.to_vec());
+            }
         }
     }
 

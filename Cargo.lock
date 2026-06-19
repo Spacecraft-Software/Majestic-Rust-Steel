@@ -1621,6 +1621,7 @@ dependencies = [
  "majestic-config",
  "majestic-core",
  "majestic-daemon",
+ "majestic-lsp",
  "majestic-steel",
  "majestic-term",
  "oracle",
