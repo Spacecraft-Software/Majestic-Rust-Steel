@@ -19,6 +19,8 @@ use majestic_config::Config;
 use majestic_core::{Buffer, Editor, Session, Workspace};
 use majestic_steel::Runtime as SteelRuntime;
 
+#[cfg(unix)]
+mod daemon_host;
 mod tui;
 
 /// Canonical program name (GNU `--version` discipline: a constant, never `argv[0]`).
@@ -46,6 +48,8 @@ enum Action {
     Session(Option<String>),
     /// `daemon [start|status|stop]`: run or control the session daemon (WS3).
     Daemon(Option<String>),
+    /// `attach`: attach this terminal to the running session daemon (WS3).
+    Attach,
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -70,6 +74,7 @@ fn classify(args: &[String]) -> Action {
         "info" => Action::Info(args.get(1).cloned()),
         "session" => Action::Session(args.get(1).cloned()),
         "daemon" => Action::Daemon(args.get(1).cloned()),
+        "attach" => Action::Attach,
         // `mj --daemon` is an alias for `mj daemon start` (the spelling in PRD §6.8).
         "--daemon" => Action::Daemon(Some("start".to_owned())),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
@@ -111,6 +116,7 @@ COMMANDS:
     config             Validate/inspect configuration (M1)
     session [list|clear]  Show or clear the saved session (`mj` reopens it)
     daemon [start|status|stop]  Run or control the headless session daemon
+    attach             Attach this terminal to the running session daemon
     ed                 Line-editor mode (M4)
 
 OPTIONS:
@@ -145,6 +151,7 @@ fn main() -> ExitCode {
         Action::Info(topic) => run_info(topic.as_deref(), safe_mode),
         Action::Session(sub) => run_session(sub.as_deref()),
         Action::Daemon(sub) => run_daemon(sub.as_deref()),
+        Action::Attach => run_attach(),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -265,10 +272,11 @@ fn run_daemon(sub: Option<&str>) -> ExitCode {
     match sub {
         None | Some("start") => {
             println!(
-                "{PROGRAM}: daemon listening on {} (Ctrl+C or `{PROGRAM} daemon stop` to quit)",
+                "{PROGRAM}: daemon listening on {} (`{PROGRAM} attach` to edit, \
+                 `{PROGRAM} daemon stop` to quit)",
                 majestic_daemon::socket_path().display()
             );
-            match majestic_daemon::run() {
+            match start_daemon() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("{PROGRAM}: daemon error: {error}");
@@ -313,6 +321,42 @@ fn run_daemon(sub: Option<&str>) -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Runs the daemon serve loop: the interactive session host on Unix (where attach is supported),
+/// the control-only server elsewhere.
+fn start_daemon() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        daemon_host::serve()
+    }
+    #[cfg(not(unix))]
+    {
+        majestic_daemon::run()
+    }
+}
+
+/// Attaches this terminal to the running session daemon (`Ctrl-]` detaches).
+fn run_attach() -> ExitCode {
+    #[cfg(unix)]
+    {
+        match daemon_host::attach() {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => {
+                println!("no daemon running — start it with `{PROGRAM} daemon start`");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PROGRAM}: attach error: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!("{PROGRAM}: attach requires a Unix platform");
+        ExitCode::FAILURE
     }
 }
 
@@ -518,6 +562,7 @@ mod tests {
             classify(&owned(&["daemon", "status"])),
             Action::Daemon(Some("status".to_owned()))
         );
+        assert_eq!(classify(&owned(&["attach"])), Action::Attach);
         // `--daemon` is an alias for `daemon start`.
         assert_eq!(
             classify(&owned(&["--daemon"])),

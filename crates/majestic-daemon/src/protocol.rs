@@ -12,7 +12,8 @@ use std::io::{self, Read, Write};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// A request from a client to the daemon.
+/// A request from a client to the daemon. The first frame on a connection; `Attach` turns it into
+/// a bidirectional interactive stream, the rest are one-shot control requests.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     /// Report the daemon's owned-session summary and uptime.
@@ -21,6 +22,15 @@ pub enum Request {
     Save,
     /// Shut the daemon down (after responding).
     Shutdown,
+    /// Attach an interactive client of the given terminal size; the daemon then streams rendered
+    /// frames and consumes input until the client detaches. Handled by the session host, not by
+    /// [`Daemon::handle`].
+    Attach {
+        /// The client terminal width in columns.
+        cols: u16,
+        /// The client terminal height in rows.
+        rows: u16,
+    },
 }
 
 /// A response from the daemon to a client.
