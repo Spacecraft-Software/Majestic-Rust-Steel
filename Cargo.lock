@@ -1657,6 +1657,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "majestic-lsp"
+version = "0.0.0"
+dependencies = [
+ "morpheus",
+ "serde_json",
+]
+
+[[package]]
 name = "majestic-steel"
 version = "0.0.0"
 dependencies = [
