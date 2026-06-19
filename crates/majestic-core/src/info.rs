@@ -23,41 +23,101 @@ use penumbra::{Buffer as Surface, Rect, Style, Theme};
 /// The Info file-separator control character that delimits nodes.
 const NODE_SEPARATOR: char = '\u{001f}';
 
-/// One entry of a node's `* Menu:` — a label and the node it jumps to.
+/// `*note` (the inline cross-reference marker), as a length constant for offset arithmetic.
+const NOTE: &str = "*note";
+
+/// A navigable reference within a node: a `* Menu:` entry or an inline `*note …::`
+/// cross-reference. Both are selectable and followed with the same key.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MenuEntry {
-    /// Display text.
+pub struct Reference {
+    /// Display text (the menu label, or the cross-referenced node name).
     pub label: String,
-    /// The in-file node name this entry targets.
+    /// The in-file node name this reference targets.
     pub target: String,
-    /// The entry's line index within the node body (for highlight + scroll-into-view).
-    pub line: usize,
+    /// The body line the reference sits on.
+    line: usize,
+    /// Character column where the reference starts (0 for whole-line menu entries).
+    column: usize,
+    /// Character length of the reference span (0 = the whole line, for menu entries).
+    length: usize,
+    /// `true` for a `* Menu:` entry (highlighted as a whole line); `false` for an inline xref.
+    menu: bool,
 }
 
-impl MenuEntry {
-    /// Parses the text after a leading `* ` into a menu entry, or `None` if it is not one.
+impl Reference {
+    /// Parses the text after a leading `* ` (a menu entry) into a reference, or `None`.
     ///
     /// Forms: `Node::  desc` (label == node) or `Label: Node.  desc`. Cross-file targets
     /// (`(file)node`) are rejected — this v1 navigates within one file.
-    fn parse(rest: &str, line: usize) -> Option<Self> {
-        if let Some((node, _description)) = rest.split_once("::") {
+    fn menu(rest: &str, line: usize) -> Option<Self> {
+        let (label, target) = if let Some((node, _description)) = rest.split_once("::") {
             let node = node.trim();
-            return (!node.is_empty()).then(|| Self {
-                label: node.to_owned(),
-                target: node.to_owned(),
-                line,
-            });
-        }
-        let (label, after) = rest.split_once(": ")?;
-        let target = after.split('.').next().unwrap_or_default().trim();
+            (node.to_owned(), node.to_owned())
+        } else {
+            let (label, after) = rest.split_once(": ")?;
+            let target = after.split('.').next().unwrap_or_default().trim();
+            (label.trim().to_owned(), target.to_owned())
+        };
         if target.is_empty() || target.starts_with('(') {
             return None;
         }
         Some(Self {
-            label: label.trim().to_owned(),
-            target: target.to_owned(),
+            label,
+            target,
             line,
+            column: 0,
+            length: 0,
+            menu: true,
         })
+    }
+}
+
+/// Finds the next `*note` / `*Note` marker in `slice`, returning its byte offset.
+fn find_note(slice: &str) -> Option<usize> {
+    let bytes = slice.as_bytes();
+    let mut i = 0;
+    while i + NOTE.len() <= slice.len() {
+        // `*` is ASCII, so it only ever sits on a char boundary — slicing at `i+1` is safe.
+        if bytes[i] == b'*' {
+            let tail = &slice[i + 1..];
+            if tail.starts_with("note") || tail.starts_with("Note") {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Appends inline `*note Target::` cross-references found on `line` to `out`.
+///
+/// Only the `Target::` form is parsed (what `makeinfo` emits for `@xref`/`@ref`/`@pxref`); the
+/// labelled `Label: Target.` form and cross-file targets are left for a later refinement.
+fn parse_xrefs(line: &str, line_index: usize, out: &mut Vec<Reference>) {
+    let mut search = 0;
+    while let Some(found) = find_note(&line[search..]) {
+        let start = search + found; // byte offset of the `*`
+        let after = &line[start + NOTE.len()..];
+        let whitespace = after.len() - after.trim_start().len();
+        let rest = &after[whitespace..];
+        match (whitespace > 0).then(|| rest.find("::")).flatten() {
+            Some(end) => {
+                let target = rest[..end].trim();
+                if !target.is_empty() && !target.starts_with('(') {
+                    let span_bytes = NOTE.len() + whitespace + end + 2; // `*note` + ws + target + `::`
+                    out.push(Reference {
+                        label: target.to_owned(),
+                        target: target.to_owned(),
+                        line: line_index,
+                        column: line[..start].chars().count(),
+                        length: line[start..start + span_bytes].chars().count(),
+                        menu: false,
+                    });
+                }
+                search = start + NOTE.len() + whitespace + end + 2;
+            }
+            None => search = start + NOTE.len(),
+        }
     }
 }
 
@@ -71,8 +131,8 @@ pub struct InfoNode {
     up: Option<String>,
     /// The node body (everything after the header line).
     pub body: String,
-    /// Parsed `* Menu:` entries.
-    pub menu: Vec<MenuEntry>,
+    /// Navigable references — `* Menu:` entries and inline `*note` xrefs — in reading order.
+    refs: Vec<Reference>,
 }
 
 impl InfoNode {
@@ -91,14 +151,18 @@ impl InfoNode {
                 }
             }
         }
-        let menu = parse_menu(&body);
+        let mut refs = parse_menu(&body);
+        for (line_index, line) in body.lines().enumerate() {
+            parse_xrefs(line, line_index, &mut refs);
+        }
+        refs.sort_by_key(|reference| (reference.line, reference.column));
         Self {
             name,
             next,
             prev,
             up,
             body,
-            menu,
+            refs,
         }
     }
 }
@@ -109,8 +173,8 @@ fn in_file(value: &str) -> Option<String> {
     (!value.is_empty() && !value.starts_with('(')).then(|| value.to_owned())
 }
 
-/// Scans a node body for its `* Menu:` entries.
-fn parse_menu(body: &str) -> Vec<MenuEntry> {
+/// Scans a node body for its `* Menu:` entries (as whole-line references).
+fn parse_menu(body: &str) -> Vec<Reference> {
     let mut entries = Vec::new();
     let mut in_menu = false;
     for (line_index, line) in body.lines().enumerate() {
@@ -122,7 +186,7 @@ fn parse_menu(body: &str) -> Vec<MenuEntry> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("* ") {
-            if let Some(entry) = MenuEntry::parse(rest, line_index) {
+            if let Some(entry) = Reference::menu(rest, line_index) {
                 entries.push(entry);
             }
         }
@@ -187,7 +251,9 @@ pub struct InfoReader {
     current: usize,
     history: Vec<usize>,
     scroll: usize,
-    menu_selected: usize,
+    ref_selected: usize,
+    /// Visible body rows, recorded by [`InfoReader::render`] so selection can scroll into view.
+    viewport_rows: usize,
 }
 
 impl InfoReader {
@@ -218,7 +284,8 @@ impl InfoReader {
             current,
             history: Vec::new(),
             scroll: 0,
-            menu_selected: 0,
+            ref_selected: 0,
+            viewport_rows: 0,
         }
     }
 
@@ -233,7 +300,7 @@ impl InfoReader {
             self.history.push(self.current);
             self.current = target;
             self.scroll = 0;
-            self.menu_selected = 0;
+            self.ref_selected = 0;
         }
     }
 
@@ -274,31 +341,49 @@ impl InfoReader {
         if let Some(previous) = self.history.pop() {
             self.current = previous;
             self.scroll = 0;
-            self.menu_selected = 0;
+            self.ref_selected = 0;
         }
     }
 
-    /// Follows the currently selected menu entry.
+    /// Follows the currently selected reference (menu entry or inline cross-reference).
     pub fn enter(&mut self) {
         if let Some(target) = self
             .node()
-            .and_then(|node| node.menu.get(self.menu_selected))
-            .map(|entry| entry.target.clone())
+            .and_then(|node| node.refs.get(self.ref_selected))
+            .map(|reference| reference.target.clone())
         {
             self.goto(&target);
         }
     }
 
-    /// Moves the menu selection up one entry.
+    /// Selects the previous reference (and scrolls it into view).
     pub fn select_up(&mut self) {
-        self.menu_selected = self.menu_selected.saturating_sub(1);
+        self.ref_selected = self.ref_selected.saturating_sub(1);
+        self.scroll_to_selected();
     }
 
-    /// Moves the menu selection down one entry.
+    /// Selects the next reference (and scrolls it into view).
     pub fn select_down(&mut self) {
-        let count = self.node().map_or(0, |node| node.menu.len());
-        if self.menu_selected + 1 < count {
-            self.menu_selected += 1;
+        let count = self.node().map_or(0, |node| node.refs.len());
+        if self.ref_selected + 1 < count {
+            self.ref_selected += 1;
+            self.scroll_to_selected();
+        }
+    }
+
+    /// Scrolls so the selected reference's line is within the (last-rendered) viewport.
+    fn scroll_to_selected(&mut self) {
+        let Some(line) = self
+            .node()
+            .and_then(|node| node.refs.get(self.ref_selected))
+            .map(|reference| reference.line)
+        else {
+            return;
+        };
+        if line < self.scroll {
+            self.scroll = line;
+        } else if self.viewport_rows > 0 && line >= self.scroll + self.viewport_rows {
+            self.scroll = line + 1 - self.viewport_rows;
         }
     }
 
@@ -313,66 +398,87 @@ impl InfoReader {
         self.scroll = self.scroll.saturating_sub(rows);
     }
 
-    /// Draws the reader into `area`: a header bar over the scrolling node body, with menu entries
-    /// highlighted and the selected one inverted (Steelbore palette).
-    pub fn render(&self, surface: &mut Surface, area: Rect, theme: &Theme) {
+    /// Draws the reader into `area`: a header bar over the scrolling node body. `* Menu:` entries
+    /// are highlighted as whole lines and inline `*note` cross-references in place; the selected
+    /// reference is inverted (Steelbore palette). Records the body height so selection can scroll.
+    pub fn render(&mut self, surface: &mut Surface, area: Rect, theme: &Theme) {
         if area.is_empty() {
             return;
         }
         let (header, body_area) = area.split_top(1);
+        self.viewport_rows = usize::from(body_area.height);
+        let (ref_selected, scroll) = (self.ref_selected, self.scroll);
+
         let bar = Style::new(theme.background, theme.accent);
         for x in header.x..header.right() {
             surface.set_char(x, header.y, ' ', bar);
         }
-        let name = self.node().map_or("(no nodes)", |node| node.name.as_str());
+        let name = self
+            .doc
+            .nodes
+            .get(self.current)
+            .map_or("(no nodes)", |node| node.name.as_str());
         let title = format!(
-            " Info: {} — {}    n/p/u nav · Enter menu · l back · q quit",
+            " Info: {} — {}    n/p/u nav · ↑↓ select · Enter follow · l back · q quit",
             self.title, name
         );
         surface.set_str(header.x, header.y, &clip(&title, header.width), bar);
 
-        let Some(node) = self.node() else {
+        let Some(node) = self.doc.nodes.get(self.current) else {
             return;
         };
         let foreground = Style::new(theme.foreground, theme.background);
-        let menu = Style::new(theme.accent, theme.background);
+        let reference = Style::new(theme.accent, theme.background);
         let selected = Style::new(theme.background, theme.accent);
 
-        let mut in_menu = false;
-        let mut menu_index = 0usize;
         for (line_index, line) in node.body.lines().enumerate() {
-            let is_menu_start = line.trim() == "* Menu:";
-            let is_entry = in_menu && !is_menu_start && line.starts_with("* ");
-            let style = if is_entry {
-                let style = if menu_index == self.menu_selected {
-                    selected
-                } else {
-                    menu
-                };
-                menu_index += 1;
-                style
-            } else {
-                foreground
+            // A whole-line menu entry sets the base style for its line.
+            let menu_on_line = node
+                .refs
+                .iter()
+                .position(|item| item.menu && item.line == line_index);
+            let line_style = match menu_on_line {
+                Some(index) if index == ref_selected => selected,
+                Some(_) => reference,
+                None => foreground,
             };
-            if is_menu_start {
-                in_menu = true;
-            }
 
-            if line_index < self.scroll {
+            if line_index < scroll {
                 continue;
             }
-            let Ok(row) = u16::try_from(line_index - self.scroll) else {
+            let Ok(row) = u16::try_from(line_index - scroll) else {
                 break;
             };
             if row >= body_area.height {
                 break;
             }
-            surface.set_str(
-                body_area.x,
-                body_area.y + row,
-                &clip(line, body_area.width),
-                style,
-            );
+            let y = body_area.y + row;
+            surface.set_str(body_area.x, y, &clip(line, body_area.width), line_style);
+
+            // Overlay inline `*note` cross-references on this line.
+            for (index, item) in node.refs.iter().enumerate() {
+                if item.menu || item.line != line_index {
+                    continue;
+                }
+                let Ok(column) = u16::try_from(item.column) else {
+                    continue;
+                };
+                if column >= body_area.width {
+                    continue;
+                }
+                let style = if index == ref_selected {
+                    selected
+                } else {
+                    reference
+                };
+                let text: String = line.chars().skip(item.column).take(item.length).collect();
+                surface.set_str(
+                    body_area.x + column,
+                    y,
+                    &clip(&text, body_area.width - column),
+                    style,
+                );
+            }
         }
     }
 }
@@ -422,9 +528,31 @@ Node: Top\u{007f}123\n";
             None,
             "(dir) is cross-file, not followed"
         );
-        assert_eq!(top.menu.len(), 2);
-        assert_eq!(top.menu[0].target, "First");
-        assert_eq!(top.menu[1].label, "Second");
+        assert_eq!(top.refs.len(), 2);
+        assert_eq!(top.refs[0].target, "First");
+        assert_eq!(top.refs[1].label, "Second");
+    }
+
+    #[test]
+    fn follows_inline_cross_references() {
+        let text = "\u{001f}\n\
+File: x.info,  Node: Top,  Up: (dir)\n\
+\n\
+See *note Other:: for the details, and *note Top:: to return.\n\
+\u{001f}\n\
+File: x.info,  Node: Other,  Prev: Top,  Up: Top\n\
+\n\
+The other node.\n";
+        let mut reader = InfoReader::from_text(text, "x.info");
+        assert_eq!(reader.node().unwrap().name, "Top");
+
+        // Two inline xrefs were parsed (in reading order: Other, then Top).
+        assert_eq!(reader.node().unwrap().refs.len(), 2);
+        assert!(reader.node().unwrap().refs.iter().all(|r| !r.menu));
+
+        // Enter follows the first reference (`*note Other::`).
+        reader.enter();
+        assert_eq!(reader.node().unwrap().name, "Other");
     }
 
     #[test]

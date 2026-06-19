@@ -145,7 +145,7 @@ impl App {
         let (body, status) = surface.area().split_bottom(1);
         let main = self.render_sidebar(surface, body, theme);
 
-        if let Some(info) = self.info.as_ref() {
+        if let Some(info) = self.info.as_mut() {
             // The Info reader takes over the editor region (the sidebar + status bar remain).
             info.render(surface, main, theme);
         } else if self.terminal.is_some() && main.height > MIN_EDITOR_ROWS + 1 {
