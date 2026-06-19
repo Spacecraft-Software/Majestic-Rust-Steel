@@ -514,7 +514,11 @@ pub(crate) fn run(workspace: Workspace, initial_info: Option<PathBuf>) -> io::Re
     let mut out = io::stdout();
     let mut app = App::new(workspace);
     if let Some(path) = initial_info {
-        app.open_path(&path); // an `.info` launch argument opens the reader
+        // A launch-time Info path (an `.info` argument, or `mj info`) opens the reader directly —
+        // including the extension-less `dir` directory file.
+        if let Ok(reader) = InfoReader::open(&path) {
+            app.info = Some(reader);
+        }
     }
 
     loop {

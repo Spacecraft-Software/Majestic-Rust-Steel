@@ -39,6 +39,8 @@ enum Action {
     Describe(Option<String>),
     /// Oracle: search commands by keyword.
     Apropos(Option<String>),
+    /// Open the built-in Info reader: a topic's manual, or the `dir` directory with no argument.
+    Info(Option<String>),
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -60,6 +62,7 @@ fn classify(args: &[String]) -> Action {
         // Oracle introspection from the shell (PRD §5.2.2).
         "describe" => Action::Describe(args.get(1).cloned()),
         "apropos" => Action::Apropos(args.get(1).cloned()),
+        "info" => Action::Info(args.get(1).cloned()),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
         "config" | "session" | "ed" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
@@ -95,6 +98,7 @@ USAGE:
 COMMANDS:
     describe [NAME]    Help for a command/variable, or list keybindings (Oracle)
     apropos <WORD>     Search commands by keyword (Oracle)
+    info [TOPIC]       Open the built-in Info/Texinfo reader (the `dir` index if no topic)
     config             Validate/inspect configuration (M1)
     session            Manage daemon sessions (M2)
     ed                 Line-editor mode (M4)
@@ -128,6 +132,7 @@ fn main() -> ExitCode {
         Action::Open(paths) => run_editor(&paths, safe_mode),
         Action::Describe(query) => run_describe(query.as_deref()),
         Action::Apropos(query) => run_apropos(query.as_deref()),
+        Action::Info(topic) => run_info(topic.as_deref(), safe_mode),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -179,6 +184,66 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Opens the built-in Info reader on `topic`'s manual (`<topic>.info` from the Info search path),
+/// or the `dir` directory when no topic is given.
+fn run_info(topic: Option<&str>, safe_mode: bool) -> ExitCode {
+    let Some(path) = resolve_info(topic) else {
+        match topic {
+            Some(name) => eprintln!("{PROGRAM}: no Info manual found for `{name}`"),
+            None => eprintln!("{PROGRAM}: no Info directory (`dir`) on the Info search path"),
+        }
+        return ExitCode::FAILURE;
+    };
+    let mut workspace = Workspace::from_editors(vec![Editor::new()]);
+    if !safe_mode {
+        apply_config(&mut workspace);
+    }
+    match tui::run(workspace, Some(path)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{PROGRAM}: terminal error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolves `topic` to an Info file path (`<topic>.info`, then `<topic>`), or the `dir` file when
+/// `topic` is `None`, searching `$INFOPATH` then standard system directories.
+fn resolve_info(topic: Option<&str>) -> Option<std::path::PathBuf> {
+    let names: Vec<String> = match topic {
+        Some(name) => vec![format!("{name}.info"), name.to_owned()],
+        None => vec!["dir".to_owned()],
+    };
+    info_dirs().into_iter().find_map(|dir| {
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+/// The Info search path: `$INFOPATH` (colon-separated) then standard system directories.
+fn info_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs: Vec<PathBuf> = std::env::var("INFOPATH")
+        .into_iter()
+        .flat_map(|path| {
+            path.split(':')
+                .filter(|part| !part.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for standard in [
+        "/run/current-system/sw/share/info",
+        "/usr/share/info",
+        "/usr/local/share/info",
+    ] {
+        dirs.push(PathBuf::from(standard));
+    }
+    dirs
 }
 
 /// Loads the hybrid configuration and applies it to `workspace`.
@@ -319,6 +384,11 @@ mod tests {
             classify(&owned(&["apropos", "select"])),
             Action::Apropos(Some("select".to_owned()))
         );
+        assert_eq!(
+            classify(&owned(&["info", "emacs"])),
+            Action::Info(Some("emacs".to_owned()))
+        );
+        assert_eq!(classify(&owned(&["info"])), Action::Info(None));
     }
 
     #[test]
