@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Built-in keybinding profiles. M0 ships the [`cua`] profile (Standard §8); the Emacs, Vim,
-//! and Spacemacs profiles and the first-run selector land in M2.
+//! Built-in keybinding profiles. M0 shipped the [`cua`] profile (Standard §8); the [`emacs`]
+//! profile lands in M2, followed by Vim and Spacemacs plus the first-run selector. Every profile
+//! binds only command names documented in the Oracle catalog (`oracle::COMMANDS`); the
+//! `oracle::commands_missing_docs` guard enforces that contract in CI.
 
 use crate::key::{KeyCode, KeyPress, Mods};
 use crate::keymap::{Command, Keymap};
@@ -57,6 +59,61 @@ pub fn cua() -> Keymap {
     keymap
 }
 
+/// Builds the global Emacs keymap: the classic `C-`/`M-` motion and editing chords plus the
+/// `C-x` prefix map. Exercises the prefix tree's multi-key sequences (`C-x C-s`, `C-x C-c`).
+///
+/// As with [`cua`], printable keys are left unbound so the editor self-inserts them; only the
+/// control/meta chords and named keys appear here. Selection in Emacs is mark-based (`C-Space`),
+/// which lands with mark mode in a later M2 chunk — for now the shared motion commands move the
+/// point without extending.
+#[must_use]
+pub fn emacs() -> Keymap {
+    use KeyCode::{Backspace, Enter, Tab};
+
+    // Single-chord bindings: (chord, command).
+    let chords: &[(KeyPress, &str)] = &[
+        // Motion (C-f/b/n/p, C-a/e, C-v/M-v).
+        (KeyPress::ctrl('f'), "move-right"),
+        (KeyPress::ctrl('b'), "move-left"),
+        (KeyPress::ctrl('n'), "move-down"),
+        (KeyPress::ctrl('p'), "move-up"),
+        (KeyPress::ctrl('a'), "move-line-start"),
+        (KeyPress::ctrl('e'), "move-line-end"),
+        (KeyPress::ctrl('v'), "page-down"),
+        (KeyPress::alt('v'), "page-up"),
+        // Editing.
+        (KeyPress::key(Enter), "insert-newline"),
+        (KeyPress::key(Tab), "indent"),
+        (KeyPress::key(Backspace), "delete-backward"),
+        (KeyPress::ctrl('d'), "delete-forward"),
+        (KeyPress::ctrl('/'), "undo"),
+        // Kill / yank (C-k kill-line, C-w/M-w kill-region/save, C-y yank).
+        (KeyPress::ctrl('k'), "kill-line"),
+        (KeyPress::ctrl('w'), "cut"),
+        (KeyPress::alt('w'), "copy"),
+        (KeyPress::ctrl('y'), "paste"),
+        // Incremental search (isearch-forward).
+        (KeyPress::ctrl('s'), "find"),
+    ];
+
+    // `C-x`-prefixed bindings: (second chord, command). `C-x` is the canonical Emacs prefix.
+    let c_x: &[(KeyPress, &str)] = &[
+        (KeyPress::ctrl('s'), "save"),
+        (KeyPress::ctrl('c'), "quit"),
+        (KeyPress::char('k'), "close-buffer"),
+        (KeyPress::char('h'), "select-all"),
+    ];
+
+    let mut keymap = Keymap::new();
+    for &(key, command) in chords {
+        keymap = keymap.bind(&[key], Command::new(command));
+    }
+    for &(second, command) in c_x {
+        keymap = keymap.bind(&[KeyPress::ctrl('x'), second], Command::new(command));
+    }
+    keymap
+}
+
 #[cfg(test)]
 mod tests {
     use super::cua;
@@ -81,5 +138,44 @@ mod tests {
     #[test]
     fn cua_leaves_printable_keys_unbound_for_self_insert() {
         assert_eq!(cua().lookup(&[KeyPress::char('a')]), Lookup::Unbound);
+    }
+
+    #[test]
+    fn emacs_binds_motion_and_kill_chords() {
+        use super::emacs;
+        for (key, expected) in [
+            (KeyPress::ctrl('f'), "move-right"),
+            (KeyPress::ctrl('a'), "move-line-start"),
+            (KeyPress::ctrl('k'), "kill-line"),
+            (KeyPress::alt('w'), "copy"),
+            (KeyPress::ctrl('y'), "paste"),
+        ] {
+            assert_eq!(
+                emacs().lookup(&[key]),
+                Lookup::Bound(Command::new(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn emacs_c_x_is_a_prefix_resolving_to_commands() {
+        use super::emacs;
+        let keymap = emacs();
+        // `C-x` alone is an incomplete prefix; `C-x C-s` completes to `save`.
+        assert_eq!(keymap.lookup(&[KeyPress::ctrl('x')]), Lookup::Prefix);
+        assert_eq!(
+            keymap.lookup(&[KeyPress::ctrl('x'), KeyPress::ctrl('s')]),
+            Lookup::Bound(Command::new("save"))
+        );
+        assert_eq!(
+            keymap.lookup(&[KeyPress::ctrl('x'), KeyPress::char('k')]),
+            Lookup::Bound(Command::new("close-buffer"))
+        );
+    }
+
+    #[test]
+    fn emacs_leaves_printable_keys_unbound_for_self_insert() {
+        use super::emacs;
+        assert_eq!(emacs().lookup(&[KeyPress::char('a')]), Lookup::Unbound);
     }
 }
