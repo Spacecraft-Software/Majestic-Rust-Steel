@@ -1625,6 +1625,8 @@ dependencies = [
  "keymaker",
  "oracle",
  "penumbra",
+ "serde",
+ "serde_json",
  "stratum",
  "syntect",
  "tree-sitter",

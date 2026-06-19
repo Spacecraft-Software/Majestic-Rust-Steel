@@ -132,6 +132,20 @@ impl Editor {
         self.tab_width = width.clamp(1, 16);
     }
 
+    /// The viewport scroll offset as `(top_row, left_column)`. Captured into a saved session.
+    #[must_use]
+    pub fn viewport(&self) -> (usize, usize) {
+        (self.viewport_top, self.viewport_left)
+    }
+
+    /// Restores a saved session's cursor and viewport. The cursor is clamped to the buffer; the
+    /// viewport is reconciled with the cursor on the next render (`scroll_into_view`).
+    pub fn restore_position(&mut self, cursor: usize, viewport_top: usize, viewport_left: usize) {
+        self.buffer.set_cursor(cursor);
+        self.viewport_top = viewport_top;
+        self.viewport_left = viewport_left;
+    }
+
     /// Switches this editor to `profile`, live. Dispatch is synchronous (one key is fully handled
     /// before the next), so swapping the keymap between keystrokes drops nothing in flight — the
     /// "profile switch under load loses no keystrokes" guarantee (PRD §8).

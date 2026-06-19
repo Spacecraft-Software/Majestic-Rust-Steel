@@ -38,6 +38,7 @@ mod fuzzy;
 mod git;
 mod info;
 mod selector;
+mod session;
 mod syntax;
 #[cfg(feature = "syntect-highlighting")]
 mod syntect_hl;
@@ -56,6 +57,8 @@ pub use finder::{Action, Finder, HelpOverlay};
 pub use info::{InfoDocument, InfoReader};
 #[doc(inline)]
 pub use selector::ProfileSelector;
+#[doc(inline)]
+pub use session::{LayoutNode, PaneState, Session};
 #[doc(inline)]
 pub use whichkey::WhichKey;
 #[doc(inline)]
