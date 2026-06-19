@@ -42,4 +42,4 @@ pub use key::{KeyCode, KeyPress, Mods};
 #[doc(inline)]
 pub use keymap::{Command, Keymap, Lookup};
 #[doc(inline)]
-pub use profiles::{cua, emacs};
+pub use profiles::{cua, emacs, vim_insert, vim_normal, vim_visual};

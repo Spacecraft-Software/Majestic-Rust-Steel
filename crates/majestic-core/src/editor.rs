@@ -11,7 +11,9 @@
 
 use std::path::Path;
 
-use keymaker::{cua, Dispatcher, KeyCode, Mods, Resolution};
+use keymaker::{
+    cua, vim_insert, vim_normal, vim_visual, Dispatcher, KeyCode, Keymap, Mods, Resolution,
+};
 use penumbra::{char_width, Buffer as Surface, Cell, Rect, Style, Theme};
 
 use stratum::{Point, SpanLayer};
@@ -19,12 +21,55 @@ use stratum::{Point, SpanLayer};
 use crate::buffer::Buffer;
 use crate::syntax::{HighlightKind, HighlightWorker};
 
+/// The editing mode that governs key dispatch and whether printable keys self-insert.
+///
+/// Non-modal profiles (CUA, Emacs) stay in [`EditMode::Insert`]. The Vim profile cycles
+/// `Normal`/`Insert`/`Visual`; only `Insert` self-inserts an unclaimed printable key, so Normal-
+/// and Visual-mode keystrokes never leak into the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditMode {
+    /// Keys insert text — the default for non-modal profiles and for Vim insert mode.
+    Insert,
+    /// Vim Normal mode: motion and operators; printable keys do not self-insert.
+    Normal,
+    /// Vim Visual mode: motion extends the selection; printable keys do not self-insert.
+    Visual,
+}
+
+impl EditMode {
+    /// Whether an unclaimed printable key is inserted into the buffer in this mode.
+    #[must_use]
+    pub const fn inserts_text(self) -> bool {
+        matches!(self, Self::Insert)
+    }
+
+    /// A short uppercase label for the status line (`INSERT`, `NORMAL`, `VISUAL`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "INSERT",
+            Self::Normal => "NORMAL",
+            Self::Visual => "VISUAL",
+        }
+    }
+}
+
+/// The three Vim-mode keymaps an [`Editor`] swaps between while the Vim profile is active.
+#[derive(Clone, Debug)]
+struct VimKeymaps {
+    normal: Keymap,
+    insert: Keymap,
+    visual: Keymap,
+}
+
 /// The editing session: a buffer, its keymaps, a clipboard, and the visible viewport.
 #[derive(Debug)]
 pub struct Editor {
     buffer: Buffer,
     clipboard: String,
     dispatcher: Dispatcher,
+    mode: EditMode,
+    vim: Option<VimKeymaps>,
     viewport_top: usize,
     viewport_left: usize,
     page_rows: usize,
@@ -55,6 +100,8 @@ impl Editor {
             buffer,
             clipboard: String::new(),
             dispatcher: Dispatcher::new(vec![cua()]),
+            mode: EditMode::Insert,
+            vim: None,
             viewport_top: 0,
             viewport_left: 0,
             page_rows: 1,
@@ -81,6 +128,41 @@ impl Editor {
     /// Sets the indent width (columns), clamped to a sane `1..=16` range. Applied from config.
     pub fn set_tab_width(&mut self, width: usize) {
         self.tab_width = width.clamp(1, 16);
+    }
+
+    /// Switches this editor to the Vim profile, starting in Normal mode.
+    ///
+    /// Profile selection from config and live profile-switching land in the next chunk; this
+    /// installs the three modal keymaps and enters Normal mode so the modal dispatch and
+    /// self-insert gating are exercised end-to-end.
+    pub fn enable_vim(&mut self) {
+        self.vim = Some(VimKeymaps {
+            normal: vim_normal(),
+            insert: vim_insert(),
+            visual: vim_visual(),
+        });
+        self.set_mode(EditMode::Normal);
+    }
+
+    /// The current editing mode (always [`EditMode::Insert`] for non-modal profiles).
+    #[must_use]
+    pub fn mode(&self) -> EditMode {
+        self.mode
+    }
+
+    /// In a modal (Vim) editor, switches mode and rebinds the dispatcher to that mode's keymap.
+    /// A no-op for non-modal profiles. Rebinding is a cheap `Arc` clone (the prefix tree shares
+    /// structure), so it never disturbs dispatch.
+    fn set_mode(&mut self, mode: EditMode) {
+        let Some(vim) = &self.vim else { return };
+        let keymap = match mode {
+            EditMode::Insert => vim.insert.clone(),
+            EditMode::Normal => vim.normal.clone(),
+            EditMode::Visual => vim.visual.clone(),
+        };
+        self.dispatcher = Dispatcher::new(vec![keymap]);
+        self.mode = mode;
+        self.status = format!("-- {} --", mode.label());
     }
 
     /// The active buffer.
@@ -146,7 +228,8 @@ impl Editor {
                         let modified = press.mods.contains(Mods::CTRL)
                             || press.mods.contains(Mods::ALT)
                             || press.mods.contains(Mods::SUPER);
-                        if !modified {
+                        // Only insert in a mode that takes text — Vim Normal/Visual swallow the key.
+                        if !modified && self.mode.inserts_text() {
                             self.self_insert(ch);
                         }
                     }
@@ -191,6 +274,9 @@ impl Editor {
             "cut" => self.cut(),
             "kill-line" => self.kill_line(),
             "paste" => self.buffer.insert(&self.clipboard),
+            "enter-insert-mode" => self.set_mode(EditMode::Insert),
+            "enter-normal-mode" => self.set_mode(EditMode::Normal),
+            "enter-visual-mode" => self.set_mode(EditMode::Visual),
             "save" => self.save(),
             "find" => "find: not yet implemented (M1)".clone_into(&mut self.status),
             "quit" | "close-buffer" => self.quit = true,
@@ -636,5 +722,50 @@ mod tests {
                 "documented command `{name}` is not handled by Editor::execute"
             );
         }
+    }
+
+    #[test]
+    fn vim_normal_mode_swallows_printable_keys_until_insert() {
+        use super::EditMode;
+        let mut editor = Editor::with_buffer(Buffer::from_text("abc"));
+        editor.enable_vim();
+        assert_eq!(editor.mode(), EditMode::Normal);
+        // A printable key with no Normal-mode binding is swallowed, not inserted.
+        editor.handle_key(KeyPress::char('z'));
+        assert_eq!(editor.buffer().text(), "abc");
+        // `i` enters Insert mode; now printable keys insert.
+        editor.handle_key(KeyPress::char('i'));
+        assert_eq!(editor.mode(), EditMode::Insert);
+        editor.handle_key(KeyPress::char('Z'));
+        assert_eq!(editor.buffer().text(), "Zabc");
+        // `Esc` returns to Normal; keys are swallowed again.
+        editor.handle_key(KeyPress::key(KeyCode::Escape));
+        assert_eq!(editor.mode(), EditMode::Normal);
+        editor.handle_key(KeyPress::char('q'));
+        assert_eq!(editor.buffer().text(), "Zabc");
+    }
+
+    #[test]
+    fn vim_normal_motion_moves_the_cursor_without_inserting() {
+        let mut editor = Editor::with_buffer(Buffer::from_text("abc"));
+        editor.enable_vim();
+        editor.handle_key(KeyPress::char('l')); // move-right
+        editor.handle_key(KeyPress::char('l'));
+        assert_eq!(editor.buffer().cursor(), 2);
+        assert_eq!(editor.buffer().text(), "abc");
+    }
+
+    #[test]
+    fn vim_visual_mode_selects_then_yanks() {
+        use super::EditMode;
+        let mut editor = Editor::with_buffer(Buffer::from_text("abc"));
+        editor.enable_vim();
+        editor.handle_key(KeyPress::char('v')); // enter Visual mode
+        assert_eq!(editor.mode(), EditMode::Visual);
+        editor.handle_key(KeyPress::char('l')); // select-right
+        editor.handle_key(KeyPress::char('l'));
+        editor.handle_key(KeyPress::char('y')); // copy the selection
+        assert_eq!(editor.clipboard(), "ab");
+        assert_eq!(editor.buffer().text(), "abc");
     }
 }

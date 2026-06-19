@@ -114,6 +114,78 @@ pub fn emacs() -> Keymap {
     keymap
 }
 
+/// Builds the Vim **Normal**-mode keymap: `hjkl` motion, `i`/`v` to switch mode, and the common
+/// normal-mode editing chords. Printable keys not bound here do nothing in Normal mode — the
+/// editor only self-inserts while the [`EditMode`](../../majestic_core/index.html) is `Insert`.
+#[must_use]
+pub fn vim_normal() -> Keymap {
+    bind_all(&[
+        // Motion.
+        (KeyPress::char('h'), "move-left"),
+        (KeyPress::char('j'), "move-down"),
+        (KeyPress::char('k'), "move-up"),
+        (KeyPress::char('l'), "move-right"),
+        (KeyPress::char('0'), "move-line-start"),
+        (KeyPress::char('$'), "move-line-end"),
+        // Mode switches.
+        (KeyPress::char('i'), "enter-insert-mode"),
+        (KeyPress::char('v'), "enter-visual-mode"),
+        // Editing.
+        (KeyPress::char('x'), "delete-forward"),
+        (KeyPress::char('u'), "undo"),
+        (KeyPress::char('p'), "paste"),
+    ])
+}
+
+/// Builds the Vim **Insert**-mode keymap: `Esc` returns to Normal, the named keys edit, and
+/// printable keys self-insert (so only the non-printing keys are bound here).
+#[must_use]
+pub fn vim_insert() -> Keymap {
+    use KeyCode::{Backspace, Down, Enter, Escape, Left, Right, Tab, Up};
+
+    bind_all(&[
+        (KeyPress::key(Escape), "enter-normal-mode"),
+        (KeyPress::key(Enter), "insert-newline"),
+        (KeyPress::key(Tab), "indent"),
+        (KeyPress::key(Backspace), "delete-backward"),
+        (KeyPress::key(Left), "move-left"),
+        (KeyPress::key(Right), "move-right"),
+        (KeyPress::key(Up), "move-up"),
+        (KeyPress::key(Down), "move-down"),
+    ])
+}
+
+/// Builds the Vim **Visual**-mode keymap: `hjkl` extend the selection, `y`/`x` copy/cut it, and
+/// `Esc`/`v` return to Normal mode.
+#[must_use]
+pub fn vim_visual() -> Keymap {
+    use KeyCode::Escape;
+
+    bind_all(&[
+        // Motion extends the selection.
+        (KeyPress::char('h'), "select-left"),
+        (KeyPress::char('j'), "select-down"),
+        (KeyPress::char('k'), "select-up"),
+        (KeyPress::char('l'), "select-right"),
+        // Operate on the selection.
+        (KeyPress::char('y'), "copy"),
+        (KeyPress::char('x'), "cut"),
+        // Back to Normal mode.
+        (KeyPress::key(Escape), "enter-normal-mode"),
+        (KeyPress::char('v'), "enter-normal-mode"),
+    ])
+}
+
+/// Builds a keymap binding each `(chord, command)` as a single-key sequence — the shared tail of
+/// the single-chord profile builders.
+fn bind_all(bindings: &[(KeyPress, &str)]) -> Keymap {
+    let mut keymap = Keymap::new();
+    for &(key, command) in bindings {
+        keymap = keymap.bind(&[key], Command::new(command));
+    }
+    keymap
+}
+
 #[cfg(test)]
 mod tests {
     use super::cua;
@@ -177,5 +249,41 @@ mod tests {
     fn emacs_leaves_printable_keys_unbound_for_self_insert() {
         use super::emacs;
         assert_eq!(emacs().lookup(&[KeyPress::char('a')]), Lookup::Unbound);
+    }
+
+    #[test]
+    fn vim_normal_binds_motion_and_mode_switches() {
+        use super::vim_normal;
+        let keymap = vim_normal();
+        for (key, expected) in [
+            (KeyPress::char('h'), "move-left"),
+            (KeyPress::char('l'), "move-right"),
+            (KeyPress::char('i'), "enter-insert-mode"),
+            (KeyPress::char('v'), "enter-visual-mode"),
+            (KeyPress::char('x'), "delete-forward"),
+        ] {
+            assert_eq!(keymap.lookup(&[key]), Lookup::Bound(Command::new(expected)));
+        }
+        // A key with no normal-mode meaning stays unbound — Normal mode must not self-insert it.
+        assert_eq!(keymap.lookup(&[KeyPress::char('z')]), Lookup::Unbound);
+    }
+
+    #[test]
+    fn vim_insert_and_visual_return_to_normal_on_escape() {
+        use super::{vim_insert, vim_visual};
+        let escape = KeyPress::key(KeyCode::Escape);
+        assert_eq!(
+            vim_insert().lookup(&[escape]),
+            Lookup::Bound(Command::new("enter-normal-mode"))
+        );
+        assert_eq!(
+            vim_visual().lookup(&[escape]),
+            Lookup::Bound(Command::new("enter-normal-mode"))
+        );
+        // Visual-mode motion extends the selection.
+        assert_eq!(
+            vim_visual().lookup(&[KeyPress::char('l')]),
+            Lookup::Bound(Command::new("select-right"))
+        );
     }
 }

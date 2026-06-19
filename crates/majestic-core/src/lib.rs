@@ -45,7 +45,7 @@ mod workspace;
 #[doc(inline)]
 pub use buffer::Buffer;
 #[doc(inline)]
-pub use editor::Editor;
+pub use editor::{EditMode, Editor};
 #[doc(inline)]
 pub use files::FileTree;
 #[doc(inline)]
