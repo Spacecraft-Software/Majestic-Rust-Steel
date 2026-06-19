@@ -175,10 +175,12 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
         editors.push(Editor::new());
     }
     let mut workspace = Workspace::from_editors(editors);
+    // First run = no manifest yet (and not in safe mode): prompt for a keybinding profile.
+    let first_run = !safe_mode && Config::discover().is_none();
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    match tui::run(workspace, initial_info) {
+    match tui::run(workspace, initial_info, first_run) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
@@ -201,7 +203,8 @@ fn run_info(topic: Option<&str>, safe_mode: bool) -> ExitCode {
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    match tui::run(workspace, Some(path)) {
+    // `mj info` just views a manual — never prompt for first-run profile selection here.
+    match tui::run(workspace, Some(path), false) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");

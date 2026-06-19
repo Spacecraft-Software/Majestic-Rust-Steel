@@ -258,7 +258,7 @@ impl HelpOverlay {
 }
 
 /// Draws a bordered box (Steel-Blue rules on Void Navy) with `title` on the top edge.
-fn draw_box(surface: &mut Surface, area: Rect, theme: &Theme, title: &str) {
+pub(crate) fn draw_box(surface: &mut Surface, area: Rect, theme: &Theme, title: &str) {
     let border = Style::new(theme.accent, theme.background);
     let fill = theme.base_style();
     let (right, bottom) = (area.right() - 1, area.bottom() - 1);
