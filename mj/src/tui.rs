@@ -504,9 +504,16 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
 
 /// Runs the editor + terminal interactive loop until a quit command is issued.
 ///
+/// When `persist_session` is set, the workspace layout is saved to the session file on exit so a
+/// later plain `mj` reopens it (the transient `mj info` view passes `false`).
+///
 /// # Errors
 /// Returns any terminal I/O error from setup, reading events, or rendering.
-pub(crate) fn run(workspace: Workspace, initial_info: Option<PathBuf>) -> io::Result<()> {
+pub(crate) fn run(
+    workspace: Workspace,
+    initial_info: Option<PathBuf>,
+    persist_session: bool,
+) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let theme = Theme::steelbore();
     let (columns, lines) = terminal::size()?;
@@ -554,6 +561,12 @@ pub(crate) fn run(workspace: Workspace, initial_info: Option<PathBuf>) -> io::Re
         if app.should_quit() {
             break;
         }
+    }
+
+    // Persist the layout/open-files/cursors so the next plain `mj` resumes here. A save failure
+    // (e.g. no writable state dir) must not turn a clean quit into an error.
+    if persist_session {
+        let _ = app.workspace.to_session().save();
     }
     Ok(())
 }
