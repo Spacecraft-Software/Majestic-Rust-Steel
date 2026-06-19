@@ -151,13 +151,22 @@ mod tests {
 
     #[test]
     fn maps_textmate_scopes_to_kinds() {
-        assert_eq!(scope_to_kind("keyword.control.rust"), Some(HighlightKind::Keyword));
-        assert_eq!(scope_to_kind("constant.numeric.integer"), Some(HighlightKind::Number));
+        assert_eq!(
+            scope_to_kind("keyword.control.rust"),
+            Some(HighlightKind::Keyword)
+        );
+        assert_eq!(
+            scope_to_kind("constant.numeric.integer"),
+            Some(HighlightKind::Number)
+        );
         assert_eq!(
             scope_to_kind("entity.name.function.python"),
             Some(HighlightKind::Function)
         );
-        assert_eq!(scope_to_kind("variable.other"), Some(HighlightKind::Variable));
+        assert_eq!(
+            scope_to_kind("variable.other"),
+            Some(HighlightKind::Variable)
+        );
         assert_eq!(scope_to_kind("source.rust"), None);
     }
 
@@ -168,7 +177,10 @@ mod tests {
             SyntectHighlighter::for_path(Path::new("x.py")).expect("syntect has Python");
         let layer = highlighter.highlight(b"def f():\n    return 1  # done\n");
         let kinds: Vec<HighlightKind> = layer.iter().map(|span| span.value).collect();
-        assert!(kinds.contains(&HighlightKind::Keyword), "def/return are keywords");
+        assert!(
+            kinds.contains(&HighlightKind::Keyword),
+            "def/return are keywords"
+        );
         assert!(kinds.contains(&HighlightKind::Comment), "trailing comment");
         assert!(!layer.is_empty());
     }
@@ -180,8 +192,11 @@ mod tests {
 
     #[test]
     fn covers_languages_beyond_the_tree_sitter_core() {
-        // A sampling from bat's extended set that the tree-sitter tier does not wire.
-        for ext in ["nix", "swift", "kt", "dart", "toml", "zig", "asm", "adb"] {
+        // A sampling from bat's extended set that the tree-sitter tier does not wire — including
+        // Lua and Emacs Lisp (`.el`, via the bundled "Lisp" syntax).
+        for ext in [
+            "nix", "swift", "kt", "dart", "toml", "zig", "asm", "adb", "lua", "el",
+        ] {
             assert!(
                 SyntectHighlighter::supports(Path::new(&format!("x.{ext}"))),
                 ".{ext} should be covered by the syntect tier"
