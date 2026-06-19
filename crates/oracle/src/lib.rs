@@ -16,7 +16,7 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 
-use keymaker::{KeyCode, KeyPress, Keymap, Lookup, Mods};
+use keymaker::{KeyCode, KeyPress, Keymap, Lookup, Mods, Profile};
 
 /// A documented editor command — one entry of the live command registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,8 +124,36 @@ pub const COMMANDS: &[CommandDoc] = &[
         summary: "Cut the selection to the clipboard.",
     },
     CommandDoc {
+        name: "kill-line",
+        summary: "Kill from the cursor to the end of the line (Emacs C-k).",
+    },
+    CommandDoc {
         name: "paste",
         summary: "Paste the clipboard at the cursor.",
+    },
+    CommandDoc {
+        name: "enter-insert-mode",
+        summary: "Enter Vim insert mode (keys insert text).",
+    },
+    CommandDoc {
+        name: "enter-normal-mode",
+        summary: "Enter Vim normal mode (motion and operators).",
+    },
+    CommandDoc {
+        name: "enter-visual-mode",
+        summary: "Enter Vim visual mode (motion extends the selection).",
+    },
+    CommandDoc {
+        name: "profile-cua",
+        summary: "Switch to the CUA keybinding profile.",
+    },
+    CommandDoc {
+        name: "profile-emacs",
+        summary: "Switch to the Emacs keybinding profile.",
+    },
+    CommandDoc {
+        name: "profile-vim",
+        summary: "Switch to the Vim keybinding profile.",
     },
     CommandDoc {
         name: "save",
@@ -236,12 +264,28 @@ pub fn describe_variable(name: &str) -> String {
     )
 }
 
-/// `describe-mode`: the active keybinding profile. M1 ships only CUA.
+/// `describe-mode`: a short description of the active keybinding `profile`.
 #[must_use]
-pub fn describe_mode() -> String {
-    "CUA — Common User Access keybindings (Ctrl+C copy, Ctrl+X cut, Ctrl+V paste, \
-     Ctrl+Z/Ctrl+Y undo/redo, Ctrl+S save). The only profile in M1; Vim/Emacs/Acme land at M2."
-        .to_owned()
+pub fn describe_mode(profile: Profile) -> String {
+    match profile {
+        Profile::Cua => {
+            "CUA — Common User Access: Ctrl+C/X/V copy/cut/paste, Ctrl+Z/Y undo/redo, Ctrl+S \
+             save, arrows move. The non-modal default."
+        }
+        Profile::Emacs => {
+            "Emacs — C-/M- chords and the C-x prefix map: C-f/b/n/p motion, C-k kill-line, \
+             C-w/M-w/C-y kill/save/yank, C-x C-s save, C-x C-c quit. Non-modal."
+        }
+        Profile::Vim => {
+            "Vim — modal: Normal (hjkl motion, i/v switch), Insert (Esc returns to Normal), \
+             Visual (hjkl extends the selection, y/x copy/cut)."
+        }
+        Profile::Spacemacs => {
+            "Spacemacs — Vim modality with a SPC leader menu in Normal mode (SPC f s save, \
+             SPC f f find, SPC b d close-buffer, SPC q q quit); which-key lists the options."
+        }
+    }
+    .to_owned()
 }
 
 /// `apropos`: commands whose name or docstring contains `query` (case-insensitive).
@@ -260,6 +304,26 @@ pub fn apropos(query: &str) -> String {
         return format!("No commands match `{query}`.");
     }
     format!("Commands matching `{query}`:\n{}", matches.join("\n"))
+}
+
+/// The profile↔catalog guard: command names bound in `keymap` that are absent from [`COMMANDS`].
+///
+/// Every keybinding profile must bind only documented commands, so a built-in profile and the
+/// catalog can never drift (and a name typo in a profile is caught at test time rather than
+/// surfacing as a silent "unbound command" at runtime). An empty result means the profile is
+/// compliant. Names are returned sorted and de-duplicated.
+#[must_use]
+pub fn commands_missing_docs(keymap: &Keymap) -> Vec<String> {
+    let mut missing: Vec<String> = keymap
+        .bindings()
+        .iter()
+        .map(|(_, command)| command.name())
+        .filter(|name| command_doc(name).is_none())
+        .map(str::to_owned)
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
 }
 
 /// The CI docstring lint: command names whose docstring is empty (PRD §5.2.2). Empty means a
@@ -323,10 +387,10 @@ fn format_key(key: KeyPress) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apropos, command_names, describe_bindings, describe_function, describe_key,
-        describe_variable, undocumented_commands, COMMANDS,
+        apropos, command_names, commands_missing_docs, describe_bindings, describe_function,
+        describe_key, describe_variable, undocumented_commands, COMMANDS,
     };
-    use keymaker::{cua, KeyPress};
+    use keymaker::{cua, emacs, spacemacs_normal, vim_insert, vim_normal, vim_visual, KeyPress};
 
     #[test]
     fn every_command_is_documented() {
@@ -390,5 +454,21 @@ mod tests {
     #[test]
     fn catalog_is_non_empty() {
         assert!(COMMANDS.len() >= 20);
+    }
+
+    #[test]
+    fn built_in_profiles_bind_only_documented_commands() {
+        // The profile↔catalog guard: every command a built-in profile binds must be documented,
+        // so help is complete and a profile name typo can never become a silent runtime miss.
+        for keymap in [
+            cua(),
+            emacs(),
+            vim_normal(),
+            vim_insert(),
+            vim_visual(),
+            spacemacs_normal(),
+        ] {
+            assert_eq!(commands_missing_docs(&keymap), Vec::<String>::new());
+        }
     }
 }

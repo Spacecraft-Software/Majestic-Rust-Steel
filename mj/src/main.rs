@@ -14,6 +14,7 @@
 
 use std::process::ExitCode;
 
+use keymaker::Profile;
 use majestic_config::Config;
 use majestic_core::{Buffer, Editor, Session, Workspace};
 use majestic_steel::Runtime as SteelRuntime;
@@ -187,11 +188,13 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
         }
         Workspace::from_editors(editors)
     };
+    // First run = no manifest yet (and not in safe mode): prompt for a keybinding profile.
+    let first_run = !safe_mode && Config::discover().is_none();
     if !safe_mode {
         apply_config(&mut workspace);
     }
     // The editor path persists its layout on exit so the next plain `mj` resumes here.
-    match tui::run(workspace, initial_info, true) {
+    match tui::run(workspace, initial_info, first_run, true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
@@ -263,8 +266,9 @@ fn run_info(topic: Option<&str>, safe_mode: bool) -> ExitCode {
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    // `mj info` is a transient manual view — it must not overwrite the saved editing session.
-    match tui::run(workspace, Some(path), false) {
+    // `mj info` is a transient manual view: no first-run prompt, and it must not overwrite the
+    // saved editing session.
+    match tui::run(workspace, Some(path), false, false) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
@@ -318,12 +322,16 @@ fn info_dirs() -> Vec<std::path::PathBuf> {
 /// (run with `--safe` to skip configuration entirely).
 fn apply_config(workspace: &mut Workspace) {
     let mut tab_width: Option<usize> = None;
+    let mut keymap_name: Option<String> = None;
     let mut notices: Vec<String> = Vec::new();
 
     // 1. Declarative half — the Nickel manifest.
     if let Some(path) = Config::discover() {
         match Config::load(&path) {
-            Ok(config) => tab_width = Some(config.tab_width()),
+            Ok(config) => {
+                tab_width = Some(config.tab_width());
+                keymap_name = Some(config.keymap.clone());
+            }
             Err(error) => notices.push(format!(
                 "manifest {} invalid ({})",
                 path.display(),
@@ -340,6 +348,9 @@ fn apply_config(workspace: &mut Workspace) {
                 if let Some(columns) = runtime.settings().tab_width {
                     tab_width = Some(columns.clamp(1, 16));
                 }
+                if let Some(name) = runtime.settings().keymap.clone() {
+                    keymap_name = Some(name);
+                }
             }
             Err(error) => notices.push(format!(
                 "config.scm {} failed ({})",
@@ -351,6 +362,13 @@ fn apply_config(workspace: &mut Workspace) {
 
     if let Some(columns) = tab_width {
         workspace.set_tab_width(columns);
+    }
+    // An unknown profile name keeps the default (fail-soft) and surfaces a notice.
+    if let Some(name) = keymap_name {
+        match Profile::from_name(&name) {
+            Some(profile) => workspace.set_profile(profile),
+            None => notices.push(format!("unknown keymap profile `{name}`")),
+        }
     }
     if !notices.is_empty() {
         workspace.set_status(format!(
