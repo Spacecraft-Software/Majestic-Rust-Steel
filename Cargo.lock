@@ -1646,6 +1646,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "majestic-daemon"
+version = "0.0.0"
+dependencies = [
+ "majestic-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "majestic-steel"
 version = "0.0.0"
 dependencies = [
