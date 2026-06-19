@@ -308,9 +308,15 @@ impl Workspace {
 
     /// Inserts `text` into the focused buffer (used for bracketed paste).
     pub fn insert_text(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.active_mut().self_insert(ch);
-        }
+        self.active_mut().buffer_mut().insert(text); // one edit (clean undo + sibling propagation)
+        self.propagate_edits();
+    }
+
+    /// Runs editor command `command` on the focused pane, propagating any resulting edit to the
+    /// other views of the same buffer.
+    pub fn execute(&mut self, command: &str) {
+        self.active_mut().execute(command);
+        self.propagate_edits();
     }
 
     /// Opens `editor` as a new buffer and shows it in the focused pane (its previous buffer stays
@@ -333,6 +339,30 @@ impl Workspace {
             self.quit = true;
         }
         self.sync_clipboard(index);
+        self.propagate_edits();
+    }
+
+    /// Propagates each view's pending edit to the other views sharing its document, rebasing
+    /// their cursors so two views of one buffer track each other's forward edits.
+    fn propagate_edits(&mut self) {
+        let ids: Vec<usize> = self
+            .editors
+            .iter()
+            .map(|editor| editor.buffer().document_id())
+            .collect();
+        let pending: Vec<(usize, _)> = self
+            .editors
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, editor)| editor.buffer_mut().take_last_edit().map(|e| (index, e)))
+            .collect();
+        for (source, edit) in pending {
+            for index in 0..self.editors.len() {
+                if index != source && ids[index] == ids[source] {
+                    self.editors[index].buffer_mut().shift_cursor(&edit);
+                }
+            }
+        }
     }
 
     /// Handles the workspace-level window keys; returns `true` when `key` was one of them.
@@ -626,6 +656,20 @@ mod tests {
         // The edit is visible in the first view — they share one document.
         assert_eq!(workspace.editors[0].buffer().text(), "hi!");
         assert_eq!(workspace.editors[1].buffer().text(), "hi!");
+    }
+
+    #[test]
+    fn split_views_track_each_others_cursors() {
+        let mut workspace = Workspace::new(Editor::with_buffer(Buffer::from_text("hello")));
+        workspace.active_mut().buffer_mut().move_line_end(false); // pane 0 cursor at byte 5
+        workspace.handle_key(KeyPress::ctrl('\\')); // split -> pane 1 (a view, cursor 0), focused
+        workspace.handle_key(KeyPress::char('X')); // pane 1 inserts 'X' at the start
+        assert_eq!(workspace.editors[0].buffer().text(), "Xhello");
+        assert_eq!(
+            workspace.editors[0].buffer().cursor(),
+            6,
+            "pane 0's cursor tracked pane 1's insertion before it (5 -> 6)"
+        );
     }
 
     #[test]

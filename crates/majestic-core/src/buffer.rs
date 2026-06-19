@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use stratum::{replay, EditOp, Journal, Point, Rope, UndoTree};
+use stratum::{replay, Anchor, Bias, Edit, EditOp, Journal, Point, Rope, UndoTree};
 
 /// The shared document: content + undo history + file I/O + journal. Shared across views via
 /// `Rc<RefCell<Document>>`; cursor/selection/viewport are per-view (see [`Buffer`]).
@@ -104,7 +104,7 @@ impl Document {
         self.history.current_rope().clone()
     }
 
-    fn apply_edit(&mut self, range: Range<usize>, text: &str) {
+    fn apply_edit(&mut self, range: Range<usize>, text: &str) -> Edit {
         let start = range.start;
         let old_len = range.end - range.start;
         let (next, edit) = self.history.current_rope().edit(range, text);
@@ -118,6 +118,7 @@ impl Document {
         }
         self.dirty = true;
         self.revision += 1;
+        edit // for sibling views to rebase their cursors across (Anchor tracking)
     }
 
     fn undo(&mut self) -> bool {
@@ -149,6 +150,10 @@ pub struct Buffer {
     cursor: usize,
     selection_anchor: Option<usize>,
     goal_column: Option<usize>,
+    /// The most recent edit this view applied, pending propagation to sibling views (see
+    /// [`Buffer::take_last_edit`] / [`Buffer::shift_cursor`]). Forward edits only — undo/redo
+    /// rely on clamp-on-access.
+    last_edit: Option<Edit>,
 }
 
 impl Buffer {
@@ -175,6 +180,7 @@ impl Buffer {
             cursor: 0,
             selection_anchor: None,
             goal_column: None,
+            last_edit: None,
         }
     }
 
@@ -187,7 +193,30 @@ impl Buffer {
             cursor: 0,
             selection_anchor: None,
             goal_column: None,
+            last_edit: None,
         }
+    }
+
+    /// An opaque identity for this view's shared document — equal across views of the same
+    /// document (used to scope cursor propagation to siblings).
+    #[must_use]
+    pub fn document_id(&self) -> usize {
+        Rc::as_ptr(&self.doc).addr()
+    }
+
+    /// Takes the edit this view last applied (clearing it), for the host to propagate to sibling
+    /// views via [`Buffer::shift_cursor`].
+    pub fn take_last_edit(&mut self) -> Option<Edit> {
+        self.last_edit.take()
+    }
+
+    /// Rebases this view's cursor and selection across an `edit` made in another view, so its
+    /// logical position survives the shared-document change (Stratum [`Anchor`] semantics).
+    pub fn shift_cursor(&mut self, edit: &Edit) {
+        self.cursor = Anchor::new(self.cursor, Bias::Right).rebase(edit).offset();
+        self.selection_anchor = self
+            .selection_anchor
+            .map(|anchor| Anchor::new(anchor, Bias::Left).rebase(edit).offset());
     }
 
     /// Opens `path`, reading its contents (an empty buffer if the file does not exist).
@@ -450,7 +479,8 @@ impl Buffer {
 
     fn apply_edit(&mut self, range: Range<usize>, text: &str) {
         let start = range.start;
-        self.doc.borrow_mut().apply_edit(range, text); // records undo, journals, bumps revision
+        // records undo, journals, bumps revision; the returned edit lets sibling views rebase.
+        self.last_edit = Some(self.doc.borrow_mut().apply_edit(range, text));
         self.cursor = start + text.len();
         self.selection_anchor = None;
         self.goal_column = None;
@@ -667,6 +697,23 @@ mod tests {
         );
         a.move_left(false); // must not panic on the shrunk document
         assert_eq!(a.cursor(), 0);
+    }
+
+    #[test]
+    fn sibling_cursor_tracks_an_edit_in_another_view() {
+        let mut a = Buffer::from_text("hello");
+        a.move_line_end(false); // a's cursor at byte 5
+        let mut b = a.view();
+        b.move_line_start(false);
+        b.insert("AB"); // b inserts at the start of the shared document -> "ABhello"
+        let edit = b.take_last_edit().expect("b recorded its edit");
+        a.shift_cursor(&edit); // host propagates b's edit to a
+        assert_eq!(a.text(), "ABhello");
+        assert_eq!(
+            a.cursor(),
+            7,
+            "a's cursor tracked the insertion before it (5 -> 7)"
+        );
     }
 
     /// A unique temp document path and its journal sidecar, both removed up front.
