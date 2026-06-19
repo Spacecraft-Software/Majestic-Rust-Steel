@@ -11,13 +11,16 @@
 //! Window keys split the focused pane (either axis), move focus, resize, cycle the focused pane
 //! through background tabs, and close panes. One shared clipboard is mirrored across panes.
 
-use keymaker::{KeyCode, KeyPress, Mods};
+use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
+use crate::buffer::Buffer;
 use crate::editor::Editor;
+use crate::session::{LayoutNode, PaneState, Session};
+use crate::whichkey::WhichKey;
 
 /// The axis a split divides its two children along.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Split {
     /// Children side by side, separated by a vertical rule (`│`).
     Columns,
@@ -226,6 +229,8 @@ pub struct Workspace {
     clipboard: String,
     /// Indent width (columns) applied to every editor, including newly opened ones.
     tab_width: usize,
+    /// Keybinding profile applied to every editor, including newly opened ones.
+    profile: Profile,
     /// Latched once a quit command is issued.
     quit: bool,
 }
@@ -250,6 +255,7 @@ impl Workspace {
             focused: 0,
             clipboard: String::new(),
             tab_width: 4, // matches Editor's default; overridden by `set_tab_width` from config
+            profile: Profile::Cua, // matches Editor's default; overridden by `set_profile`
             quit: false,
         }
     }
@@ -260,6 +266,135 @@ impl Workspace {
         for editor in &mut self.editors {
             editor.set_tab_width(width);
         }
+    }
+
+    /// Captures the layout, open files, and cursor/viewport of every pane into a [`Session`] for
+    /// persistence. Unsaved scratch buffers are recorded with no path (they restore empty).
+    #[must_use]
+    pub fn to_session(&self) -> Session {
+        let mut panes = Vec::new();
+        let layout = self.node_to_layout(&self.root, &mut panes);
+        Session {
+            panes,
+            layout,
+            focused: self.focused,
+        }
+    }
+
+    /// Rebuilds a workspace from a saved [`Session`]: reopens each pane's file (a scratch pane, or
+    /// a file that no longer opens, becomes an empty buffer) and restores the layout, focus, and
+    /// cursor/viewport. The host applies config (indent width, …) afterward.
+    #[must_use]
+    pub fn from_session(session: &Session) -> Self {
+        let mut editors: Vec<Editor> = session
+            .panes
+            .iter()
+            .map(|pane| {
+                let mut editor = match &pane.path {
+                    Some(path) => Buffer::open(path.clone())
+                        .map_or_else(|_| Editor::new(), Editor::with_buffer),
+                    None => Editor::new(),
+                };
+                editor.restore_position(pane.cursor, pane.viewport_top, pane.viewport_left);
+                editor
+            })
+            .collect();
+        if editors.is_empty() {
+            editors.push(Editor::new());
+        }
+
+        // Trust the layout only if every leaf indexes a real pane; otherwise fall back to a single
+        // pane so a corrupt session file degrades gracefully rather than panicking (Stability P1).
+        let root = Self::layout_to_node(&session.layout);
+        let mut leaves = Vec::new();
+        root.collect_editors(&mut leaves);
+        let (root, focused) = if !leaves.is_empty() && leaves.iter().all(|&i| i < editors.len()) {
+            (root, session.focused.min(leaves.len() - 1))
+        } else {
+            (Node::Leaf(0), 0)
+        };
+
+        Self {
+            editors,
+            root,
+            focused,
+            clipboard: String::new(),
+            tab_width: 4,
+            profile: Profile::Cua,
+            quit: false,
+        }
+    }
+
+    /// Walks the window tree into a serializable [`LayoutNode`], collecting each pane's state into
+    /// `panes` and referencing it by its in-order ordinal.
+    fn node_to_layout(&self, node: &Node, panes: &mut Vec<PaneState>) -> LayoutNode {
+        match node {
+            Node::Leaf(index) => {
+                let editor = &self.editors[*index];
+                let (viewport_top, viewport_left) = editor.viewport();
+                panes.push(PaneState {
+                    path: editor.buffer().path(),
+                    cursor: editor.buffer().cursor(),
+                    viewport_top,
+                    viewport_left,
+                });
+                LayoutNode::Leaf(panes.len() - 1)
+            }
+            Node::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => LayoutNode::Split {
+                dir: *dir,
+                ratio: *ratio,
+                first: Box::new(self.node_to_layout(first, panes)),
+                second: Box::new(self.node_to_layout(second, panes)),
+            },
+        }
+    }
+
+    /// Rebuilds the window tree from a serialized [`LayoutNode`] (leaves index `editors` directly,
+    /// since `from_session` builds them in ordinal order).
+    fn layout_to_node(layout: &LayoutNode) -> Node {
+        match layout {
+            LayoutNode::Leaf(ordinal) => Node::Leaf(*ordinal),
+            LayoutNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => Node::Split {
+                dir: *dir,
+                ratio: *ratio,
+                first: Box::new(Self::layout_to_node(first)),
+                second: Box::new(Self::layout_to_node(second)),
+            },
+        }
+    }
+
+    /// Sets the keybinding profile for every open editor and any opened later. Applied from the
+    /// `keymap` config field at startup and by the profile-switch commands at runtime; switching
+    /// live never drops a keystroke (dispatch is synchronous — see [`Editor::set_profile`]).
+    pub fn set_profile(&mut self, profile: Profile) {
+        self.profile = profile;
+        for editor in &mut self.editors {
+            editor.set_profile(profile);
+        }
+    }
+
+    /// The active keybinding profile (applied to every pane).
+    #[must_use]
+    pub fn profile(&self) -> Profile {
+        self.profile
+    }
+
+    /// The which-key hint for the focused pane's in-progress key prefix, or `None` when no
+    /// multi-key sequence is pending. The host renders it over the editor area.
+    #[must_use]
+    pub fn which_key(&self) -> Option<WhichKey> {
+        let rows = self.active().which_key();
+        (!rows.is_empty()).then(|| WhichKey::new(rows))
     }
 
     /// Sets the focused editor's status-line message (e.g. a startup notice from the host).
@@ -323,6 +458,7 @@ impl Workspace {
     /// open as a background tab). Used by the explorer and the fuzzy file finder.
     pub fn open(&mut self, mut editor: Editor) {
         editor.set_tab_width(self.tab_width);
+        editor.set_profile(self.profile);
         self.editors.push(editor);
         let index = self.editors.len() - 1;
         self.root.set_nth_editor(self.focused, index);
@@ -604,7 +740,7 @@ mod tests {
     use super::{first_size, split_area, Node, Split, Workspace};
     use crate::buffer::Buffer;
     use crate::editor::Editor;
-    use keymaker::{KeyCode, KeyPress, Mods};
+    use keymaker::{KeyCode, KeyPress, Mods, Profile};
     use penumbra::{Buffer as Surface, Rect, Theme};
 
     fn alt(code: KeyCode) -> KeyPress {
@@ -754,6 +890,23 @@ mod tests {
     }
 
     #[test]
+    fn set_profile_reaches_every_pane_and_new_buffers() {
+        let mut workspace = Workspace::new(Editor::new());
+        workspace.set_profile(Profile::Vim);
+        assert_eq!(workspace.profile(), Profile::Vim);
+        // The existing pane is now in Vim Normal mode: `i` switches to Insert, then text inserts.
+        workspace.handle_key(KeyPress::char('x')); // Normal mode: swallowed
+        assert_eq!(workspace.active().buffer().text(), "");
+        // A newly opened buffer inherits the workspace profile (still Vim/Normal).
+        workspace.open(Editor::new());
+        workspace.handle_key(KeyPress::char('x')); // Normal mode: swallowed
+        assert_eq!(workspace.active().buffer().text(), "");
+        workspace.handle_key(KeyPress::char('i')); // enter Insert
+        workspace.handle_key(KeyPress::char('x'));
+        assert_eq!(workspace.active().buffer().text(), "x");
+    }
+
+    #[test]
     fn clipboard_is_shared_across_panes() {
         let editors = vec![
             Editor::with_buffer(Buffer::from_text("hello")),
@@ -814,5 +967,45 @@ mod tests {
             has_divider,
             "expected a vertical divider between the two panes"
         );
+    }
+
+    #[test]
+    fn single_scratch_session_round_trips_to_one_pane() {
+        let workspace = Workspace::new(Editor::new());
+        let session = workspace.to_session();
+        assert_eq!(session.panes.len(), 1);
+        assert!(session.panes[0].path.is_none());
+        assert_eq!(Workspace::from_session(&session).pane_count(), 1);
+    }
+
+    #[test]
+    fn session_captures_and_restores_split_layout_and_cursor() {
+        // Open a real file (so it reopens on restore), split it, move the cursor, round-trip.
+        let mut path = std::env::temp_dir();
+        path.push(format!("majestic-ws-session-{}.txt", std::process::id()));
+        let mut journal = path.clone().into_os_string();
+        journal.push(".mjjournal");
+        std::fs::write(&path, "hello world\nsecond line\n").unwrap();
+
+        let mut workspace =
+            Workspace::new(Editor::with_buffer(Buffer::open(path.clone()).unwrap()));
+        workspace.handle_key(KeyPress::ctrl('\\')); // split into two panes
+        workspace.active_mut().execute("move-right");
+        workspace.active_mut().execute("move-right");
+        let cursor = workspace.active().buffer().cursor();
+
+        let session = workspace.to_session();
+        assert_eq!(session.panes.len(), 2);
+
+        let restored = Workspace::from_session(&session);
+        assert_eq!(restored.pane_count(), 2);
+        assert_eq!(restored.active().buffer().cursor(), cursor);
+        assert_eq!(
+            restored.active().buffer().text(),
+            "hello world\nsecond line\n"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
     }
 }

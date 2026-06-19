@@ -1619,6 +1619,7 @@ dependencies = [
  "keymaker",
  "majestic-config",
  "majestic-core",
+ "majestic-daemon",
  "majestic-steel",
  "majestic-term",
  "oracle",
@@ -1651,7 +1652,10 @@ name = "majestic-core"
 version = "0.0.0"
 dependencies = [
  "keymaker",
+ "oracle",
  "penumbra",
+ "serde",
+ "serde_json",
  "stratum",
  "syntect",
  "tree-sitter",
@@ -1669,6 +1673,15 @@ dependencies = [
  "tree-sitter-scheme",
  "tree-sitter-typescript",
  "two-face",
+]
+
+[[package]]
+name = "majestic-daemon"
+version = "0.0.0"
+dependencies = [
+ "majestic-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

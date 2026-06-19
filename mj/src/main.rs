@@ -14,8 +14,9 @@
 
 use std::process::ExitCode;
 
+use keymaker::Profile;
 use majestic_config::Config;
-use majestic_core::{Buffer, Editor, Workspace};
+use majestic_core::{Buffer, Editor, Session, Workspace};
 use majestic_steel::Runtime as SteelRuntime;
 
 mod tui;
@@ -41,6 +42,10 @@ enum Action {
     Apropos(Option<String>),
     /// Open the built-in Info reader: a topic's manual, or the `dir` directory with no argument.
     Info(Option<String>),
+    /// `session [list|clear]`: manage the saved session (WS2).
+    Session(Option<String>),
+    /// `daemon [start|status|stop]`: run or control the session daemon (WS3).
+    Daemon(Option<String>),
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -63,8 +68,12 @@ fn classify(args: &[String]) -> Action {
         "describe" => Action::Describe(args.get(1).cloned()),
         "apropos" => Action::Apropos(args.get(1).cloned()),
         "info" => Action::Info(args.get(1).cloned()),
+        "session" => Action::Session(args.get(1).cloned()),
+        "daemon" => Action::Daemon(args.get(1).cloned()),
+        // `mj --daemon` is an alias for `mj daemon start` (the spelling in PRD §6.8).
+        "--daemon" => Action::Daemon(Some("start".to_owned())),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
-        "config" | "session" | "ed" => Action::Pending(first.clone()),
+        "config" | "ed" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
         "--" => Action::Open(args[1..].to_vec()),
         other if other.starts_with('-') => Action::Unknown(other.to_owned()),
@@ -100,7 +109,8 @@ COMMANDS:
     apropos <WORD>     Search commands by keyword (Oracle)
     info [TOPIC]       Open the built-in Info/Texinfo reader (the `dir` index if no topic)
     config             Validate/inspect configuration (M1)
-    session            Manage daemon sessions (M2)
+    session [list|clear]  Show or clear the saved session (`mj` reopens it)
+    daemon [start|status|stop]  Run or control the headless session daemon
     ed                 Line-editor mode (M4)
 
 OPTIONS:
@@ -133,6 +143,8 @@ fn main() -> ExitCode {
         Action::Describe(query) => run_describe(query.as_deref()),
         Action::Apropos(query) => run_apropos(query.as_deref()),
         Action::Info(topic) => run_info(topic.as_deref(), safe_mode),
+        Action::Session(sub) => run_session(sub.as_deref()),
+        Action::Daemon(sub) => run_daemon(sub.as_deref()),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -170,17 +182,135 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
             }
         }
     }
-    if editors.is_empty() {
-        editors.push(Editor::new());
-    }
-    let mut workspace = Workspace::from_editors(editors);
+    // Plain `mj` (no file arguments) reopens the last saved session, if any; otherwise a scratch
+    // buffer. Launching with files opens those instead and does not restore.
+    let mut workspace = if paths.is_empty() {
+        Session::load().map_or_else(
+            || Workspace::from_editors(vec![Editor::new()]),
+            |session| Workspace::from_session(&session),
+        )
+    } else {
+        if editors.is_empty() {
+            editors.push(Editor::new());
+        }
+        Workspace::from_editors(editors)
+    };
+    // First run = no manifest yet (and not in safe mode): prompt for a keybinding profile.
+    let first_run = !safe_mode && Config::discover().is_none();
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    match tui::run(workspace, initial_info) {
+    // The editor path persists its layout on exit so the next plain `mj` resumes here.
+    match tui::run(workspace, initial_info, first_run, true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Manages the saved session: `session` / `session list` prints it, `session clear` deletes it.
+fn run_session(sub: Option<&str>) -> ExitCode {
+    match sub {
+        None | Some("list") => {
+            let Some(session) = Session::load() else {
+                println!("No saved session.");
+                return ExitCode::SUCCESS;
+            };
+            println!(
+                "Saved session — {} pane(s), focused #{}:",
+                session.panes.len(),
+                session.focused
+            );
+            for (index, pane) in session.panes.iter().enumerate() {
+                let location = pane
+                    .path
+                    .as_deref()
+                    .map_or_else(|| "[scratch]".to_owned(), |path| path.display().to_string());
+                println!("  {index}: {location}");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("clear") => {
+            let Some(path) = Session::default_path() else {
+                eprintln!("{PROGRAM}: no state directory to clear");
+                return ExitCode::FAILURE;
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("Cleared session {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("No saved session.");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{PROGRAM}: cannot clear session: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("{PROGRAM}: unknown `session` subcommand `{other}` (try: list, clear)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs or controls the session daemon: `daemon start` (default) serves headlessly until stopped;
+/// `daemon status` prints a running daemon's session summary; `daemon stop` shuts it down.
+fn run_daemon(sub: Option<&str>) -> ExitCode {
+    match sub {
+        None | Some("start") => {
+            println!(
+                "{PROGRAM}: daemon listening on {} (Ctrl+C or `{PROGRAM} daemon stop` to quit)",
+                majestic_daemon::socket_path().display()
+            );
+            match majestic_daemon::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{PROGRAM}: daemon error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("status") => match majestic_daemon::status() {
+            Ok(Some(status)) => {
+                println!(
+                    "daemon running — {} pane(s), focused #{}",
+                    status.panes, status.focused
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("no daemon running");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PROGRAM}: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("stop") => match majestic_daemon::stop() {
+            Ok(true) => {
+                println!("daemon stopped");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("no daemon running");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PROGRAM}: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            eprintln!(
+                "{PROGRAM}: unknown `daemon` subcommand `{other}` (try: start, status, stop)"
+            );
             ExitCode::FAILURE
         }
     }
@@ -200,7 +330,9 @@ fn run_info(topic: Option<&str>, safe_mode: bool) -> ExitCode {
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    match tui::run(workspace, Some(path)) {
+    // `mj info` is a transient manual view: no first-run prompt, and it must not overwrite the
+    // saved editing session.
+    match tui::run(workspace, Some(path), false, false) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");
@@ -254,12 +386,16 @@ fn info_dirs() -> Vec<std::path::PathBuf> {
 /// (run with `--safe` to skip configuration entirely).
 fn apply_config(workspace: &mut Workspace) {
     let mut tab_width: Option<usize> = None;
+    let mut keymap_name: Option<String> = None;
     let mut notices: Vec<String> = Vec::new();
 
     // 1. Declarative half — the Nickel manifest.
     if let Some(path) = Config::discover() {
         match Config::load(&path) {
-            Ok(config) => tab_width = Some(config.tab_width()),
+            Ok(config) => {
+                tab_width = Some(config.tab_width());
+                keymap_name = Some(config.keymap.clone());
+            }
             Err(error) => notices.push(format!(
                 "manifest {} invalid ({})",
                 path.display(),
@@ -276,6 +412,9 @@ fn apply_config(workspace: &mut Workspace) {
                 if let Some(columns) = runtime.settings().tab_width {
                     tab_width = Some(columns.clamp(1, 16));
                 }
+                if let Some(name) = runtime.settings().keymap.clone() {
+                    keymap_name = Some(name);
+                }
             }
             Err(error) => notices.push(format!(
                 "config.scm {} failed ({})",
@@ -287,6 +426,13 @@ fn apply_config(workspace: &mut Workspace) {
 
     if let Some(columns) = tab_width {
         workspace.set_tab_width(columns);
+    }
+    // An unknown profile name keeps the default (fail-soft) and surfaces a notice.
+    if let Some(name) = keymap_name {
+        match Profile::from_name(&name) {
+            Some(profile) => workspace.set_profile(profile),
+            None => notices.push(format!("unknown keymap profile `{name}`")),
+        }
     }
     if !notices.is_empty() {
         workspace.set_status(format!(
@@ -362,6 +508,20 @@ mod tests {
         assert_eq!(
             classify(&owned(&["config", "check"])),
             Action::Pending("config".to_owned())
+        );
+        assert_eq!(classify(&owned(&["session"])), Action::Session(None));
+        assert_eq!(
+            classify(&owned(&["session", "clear"])),
+            Action::Session(Some("clear".to_owned()))
+        );
+        assert_eq!(
+            classify(&owned(&["daemon", "status"])),
+            Action::Daemon(Some("status".to_owned()))
+        );
+        // `--daemon` is an alias for `daemon start`.
+        assert_eq!(
+            classify(&owned(&["--daemon"])),
+            Action::Daemon(Some("start".to_owned()))
         );
         assert_eq!(
             classify(&owned(&["--", "-weird.txt"])),
