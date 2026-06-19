@@ -9,6 +9,45 @@
 use crate::key::{KeyCode, KeyPress, Mods};
 use crate::keymap::{Command, Keymap};
 
+/// A built-in keybinding profile, selected by the `keymap` config field or a profile-switch
+/// command. The Spacemacs profile lands in a later M2 chunk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// Common User Access — the default (`Ctrl+C/X/V`, arrows). Non-modal.
+    #[default]
+    Cua,
+    /// Classic Emacs — `C-`/`M-` chords and the `C-x` prefix map. Non-modal.
+    Emacs,
+    /// Modal Vim — Normal / Insert / Visual.
+    Vim,
+}
+
+impl Profile {
+    /// Parses a profile from its config name (`"cua"`, `"emacs"`, `"vim"`), case-insensitively.
+    ///
+    /// Returns `None` for an unknown name so the caller can warn and keep the current default
+    /// rather than guessing (config stays fail-soft).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "cua" => Some(Self::Cua),
+            "emacs" => Some(Self::Emacs),
+            "vim" => Some(Self::Vim),
+            _ => None,
+        }
+    }
+
+    /// The canonical config name for this profile.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cua => "cua",
+            Self::Emacs => "emacs",
+            Self::Vim => "vim",
+        }
+    }
+}
+
 /// Builds the global CUA keymap: the standard editing chords plus cursor motion.
 ///
 /// Printable keys are intentionally unbound — the editor self-inserts any key the active
@@ -285,5 +324,17 @@ mod tests {
             vim_visual().lookup(&[KeyPress::char('l')]),
             Lookup::Bound(Command::new("select-right"))
         );
+    }
+
+    #[test]
+    fn profile_round_trips_through_its_name() {
+        use super::Profile;
+        for profile in [Profile::Cua, Profile::Emacs, Profile::Vim] {
+            assert_eq!(Profile::from_name(profile.name()), Some(profile));
+        }
+        // Case-insensitive, whitespace-tolerant; unknown names fall through to `None`.
+        assert_eq!(Profile::from_name("  VIM "), Some(Profile::Vim));
+        assert_eq!(Profile::from_name("spacemacs"), None);
+        assert_eq!(Profile::default(), Profile::Cua);
     }
 }

@@ -14,6 +14,7 @@
 
 use std::process::ExitCode;
 
+use keymaker::Profile;
 use majestic_config::Config;
 use majestic_core::{Buffer, Editor, Workspace};
 use majestic_steel::Runtime as SteelRuntime;
@@ -254,12 +255,16 @@ fn info_dirs() -> Vec<std::path::PathBuf> {
 /// (run with `--safe` to skip configuration entirely).
 fn apply_config(workspace: &mut Workspace) {
     let mut tab_width: Option<usize> = None;
+    let mut keymap_name: Option<String> = None;
     let mut notices: Vec<String> = Vec::new();
 
     // 1. Declarative half — the Nickel manifest.
     if let Some(path) = Config::discover() {
         match Config::load(&path) {
-            Ok(config) => tab_width = Some(config.tab_width()),
+            Ok(config) => {
+                tab_width = Some(config.tab_width());
+                keymap_name = Some(config.keymap.clone());
+            }
             Err(error) => notices.push(format!(
                 "manifest {} invalid ({})",
                 path.display(),
@@ -276,6 +281,9 @@ fn apply_config(workspace: &mut Workspace) {
                 if let Some(columns) = runtime.settings().tab_width {
                     tab_width = Some(columns.clamp(1, 16));
                 }
+                if let Some(name) = runtime.settings().keymap.clone() {
+                    keymap_name = Some(name);
+                }
             }
             Err(error) => notices.push(format!(
                 "config.scm {} failed ({})",
@@ -287,6 +295,13 @@ fn apply_config(workspace: &mut Workspace) {
 
     if let Some(columns) = tab_width {
         workspace.set_tab_width(columns);
+    }
+    // An unknown profile name keeps the default (fail-soft) and surfaces a notice.
+    if let Some(name) = keymap_name {
+        match Profile::from_name(&name) {
+            Some(profile) => workspace.set_profile(profile),
+            None => notices.push(format!("unknown keymap profile `{name}`")),
+        }
     }
     if !notices.is_empty() {
         workspace.set_status(format!(
