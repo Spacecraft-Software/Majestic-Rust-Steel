@@ -1591,6 +1591,7 @@ dependencies = [
  "keymaker",
  "majestic-config",
  "majestic-core",
+ "majestic-daemon",
  "majestic-steel",
  "majestic-term",
  "oracle",

@@ -43,6 +43,8 @@ enum Action {
     Info(Option<String>),
     /// `session [list|clear]`: manage the saved session (WS2).
     Session(Option<String>),
+    /// `daemon [start|status|stop]`: run or control the session daemon (WS3).
+    Daemon(Option<String>),
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -66,6 +68,9 @@ fn classify(args: &[String]) -> Action {
         "apropos" => Action::Apropos(args.get(1).cloned()),
         "info" => Action::Info(args.get(1).cloned()),
         "session" => Action::Session(args.get(1).cloned()),
+        "daemon" => Action::Daemon(args.get(1).cloned()),
+        // `mj --daemon` is an alias for `mj daemon start` (the spelling in PRD §6.8).
+        "--daemon" => Action::Daemon(Some("start".to_owned())),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
         "config" | "ed" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
@@ -104,6 +109,7 @@ COMMANDS:
     info [TOPIC]       Open the built-in Info/Texinfo reader (the `dir` index if no topic)
     config             Validate/inspect configuration (M1)
     session [list|clear]  Show or clear the saved session (`mj` reopens it)
+    daemon [start|status|stop]  Run or control the headless session daemon
     ed                 Line-editor mode (M4)
 
 OPTIONS:
@@ -137,6 +143,7 @@ fn main() -> ExitCode {
         Action::Apropos(query) => run_apropos(query.as_deref()),
         Action::Info(topic) => run_info(topic.as_deref(), safe_mode),
         Action::Session(sub) => run_session(sub.as_deref()),
+        Action::Daemon(sub) => run_daemon(sub.as_deref()),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -244,6 +251,63 @@ fn run_session(sub: Option<&str>) -> ExitCode {
         }
         Some(other) => {
             eprintln!("{PROGRAM}: unknown `session` subcommand `{other}` (try: list, clear)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs or controls the session daemon: `daemon start` (default) serves headlessly until stopped;
+/// `daemon status` prints a running daemon's session summary; `daemon stop` shuts it down.
+fn run_daemon(sub: Option<&str>) -> ExitCode {
+    match sub {
+        None | Some("start") => {
+            println!(
+                "{PROGRAM}: daemon listening on {} (Ctrl+C or `{PROGRAM} daemon stop` to quit)",
+                majestic_daemon::socket_path().display()
+            );
+            match majestic_daemon::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{PROGRAM}: daemon error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("status") => match majestic_daemon::status() {
+            Ok(Some(status)) => {
+                println!(
+                    "daemon running — {} pane(s), focused #{}",
+                    status.panes, status.focused
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("no daemon running");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PROGRAM}: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("stop") => match majestic_daemon::stop() {
+            Ok(true) => {
+                println!("daemon stopped");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("no daemon running");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PROGRAM}: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            eprintln!(
+                "{PROGRAM}: unknown `daemon` subcommand `{other}` (try: start, status, stop)"
+            );
             ExitCode::FAILURE
         }
     }
@@ -431,6 +495,15 @@ mod tests {
         assert_eq!(
             classify(&owned(&["session", "clear"])),
             Action::Session(Some("clear".to_owned()))
+        );
+        assert_eq!(
+            classify(&owned(&["daemon", "status"])),
+            Action::Daemon(Some("status".to_owned()))
+        );
+        // `--daemon` is an alias for `daemon start`.
+        assert_eq!(
+            classify(&owned(&["--daemon"])),
+            Action::Daemon(Some("start".to_owned()))
         );
         assert_eq!(
             classify(&owned(&["--", "-weird.txt"])),
