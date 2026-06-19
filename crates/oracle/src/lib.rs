@@ -132,6 +132,18 @@ pub const COMMANDS: &[CommandDoc] = &[
         summary: "Paste the clipboard at the cursor.",
     },
     CommandDoc {
+        name: "enter-insert-mode",
+        summary: "Enter Vim insert mode (keys insert text).",
+    },
+    CommandDoc {
+        name: "enter-normal-mode",
+        summary: "Enter Vim normal mode (motion and operators).",
+    },
+    CommandDoc {
+        name: "enter-visual-mode",
+        summary: "Enter Vim visual mode (motion extends the selection).",
+    },
+    CommandDoc {
         name: "save",
         summary: "Save the active buffer to its file.",
     },
@@ -350,7 +362,7 @@ mod tests {
         apropos, command_names, commands_missing_docs, describe_bindings, describe_function,
         describe_key, describe_variable, undocumented_commands, COMMANDS,
     };
-    use keymaker::{cua, emacs, KeyPress};
+    use keymaker::{cua, emacs, vim_insert, vim_normal, vim_visual, KeyPress};
 
     #[test]
     fn every_command_is_documented() {
@@ -420,7 +432,8 @@ mod tests {
     fn built_in_profiles_bind_only_documented_commands() {
         // The profile↔catalog guard: every command a built-in profile binds must be documented,
         // so help is complete and a profile name typo can never become a silent runtime miss.
-        assert_eq!(commands_missing_docs(&cua()), Vec::<String>::new());
-        assert_eq!(commands_missing_docs(&emacs()), Vec::<String>::new());
+        for keymap in [cua(), emacs(), vim_normal(), vim_insert(), vim_visual()] {
+            assert_eq!(commands_missing_docs(&keymap), Vec::<String>::new());
+        }
     }
 }
