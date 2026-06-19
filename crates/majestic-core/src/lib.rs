@@ -41,6 +41,7 @@ mod selector;
 mod syntax;
 #[cfg(feature = "syntect-highlighting")]
 mod syntect_hl;
+mod whichkey;
 mod workspace;
 
 #[doc(inline)]
@@ -55,5 +56,7 @@ pub use finder::{Action, Finder, HelpOverlay};
 pub use info::{InfoDocument, InfoReader};
 #[doc(inline)]
 pub use selector::ProfileSelector;
+#[doc(inline)]
+pub use whichkey::WhichKey;
 #[doc(inline)]
 pub use workspace::{Split, Workspace};

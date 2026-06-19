@@ -20,10 +20,13 @@ pub enum Profile {
     Emacs,
     /// Modal Vim — Normal / Insert / Visual.
     Vim,
+    /// Modal Spacemacs — Vim modality with a `SPC` leader menu in Normal mode.
+    Spacemacs,
 }
 
 impl Profile {
-    /// Parses a profile from its config name (`"cua"`, `"emacs"`, `"vim"`), case-insensitively.
+    /// Parses a profile from its config name (`"cua"`, `"emacs"`, `"vim"`, `"spacemacs"`),
+    /// case-insensitively.
     ///
     /// Returns `None` for an unknown name so the caller can warn and keep the current default
     /// rather than guessing (config stays fail-soft).
@@ -33,6 +36,7 @@ impl Profile {
             "cua" => Some(Self::Cua),
             "emacs" => Some(Self::Emacs),
             "vim" => Some(Self::Vim),
+            "spacemacs" => Some(Self::Spacemacs),
             _ => None,
         }
     }
@@ -44,6 +48,7 @@ impl Profile {
             Self::Cua => "cua",
             Self::Emacs => "emacs",
             Self::Vim => "vim",
+            Self::Spacemacs => "spacemacs",
         }
     }
 }
@@ -215,6 +220,29 @@ pub fn vim_visual() -> Keymap {
     ])
 }
 
+/// Builds the Spacemacs **Normal**-mode keymap: the Vim Normal motions/operators plus a `SPC`
+/// leader menu (`SPC f s` save, `SPC f f` find, `SPC b d` close-buffer, `SPC q q` quit). The
+/// nested prefixes are what the which-key hint surfaces. Insert and Visual modes reuse the Vim
+/// keymaps, so `SPC` is the leader only in Normal mode and inserts a space in Insert mode.
+#[must_use]
+pub fn spacemacs_normal() -> Keymap {
+    let leader = KeyPress::char(' ');
+    let leader_binds: &[(&[KeyPress], &str)] = &[
+        (&[leader, KeyPress::char('f'), KeyPress::char('s')], "save"),
+        (&[leader, KeyPress::char('f'), KeyPress::char('f')], "find"),
+        (
+            &[leader, KeyPress::char('b'), KeyPress::char('d')],
+            "close-buffer",
+        ),
+        (&[leader, KeyPress::char('q'), KeyPress::char('q')], "quit"),
+    ];
+    let mut keymap = vim_normal();
+    for &(sequence, command) in leader_binds {
+        keymap = keymap.bind(sequence, Command::new(command));
+    }
+    keymap
+}
+
 /// Builds a keymap binding each `(chord, command)` as a single-key sequence — the shared tail of
 /// the single-chord profile builders.
 fn bind_all(bindings: &[(KeyPress, &str)]) -> Keymap {
@@ -329,12 +357,36 @@ mod tests {
     #[test]
     fn profile_round_trips_through_its_name() {
         use super::Profile;
-        for profile in [Profile::Cua, Profile::Emacs, Profile::Vim] {
+        for profile in [
+            Profile::Cua,
+            Profile::Emacs,
+            Profile::Vim,
+            Profile::Spacemacs,
+        ] {
             assert_eq!(Profile::from_name(profile.name()), Some(profile));
         }
         // Case-insensitive, whitespace-tolerant; unknown names fall through to `None`.
         assert_eq!(Profile::from_name("  VIM "), Some(Profile::Vim));
-        assert_eq!(Profile::from_name("spacemacs"), None);
+        assert_eq!(Profile::from_name("acme"), None);
         assert_eq!(Profile::default(), Profile::Cua);
+    }
+
+    #[test]
+    fn spacemacs_leader_nests_under_space() {
+        use super::spacemacs_normal;
+        let keymap = spacemacs_normal();
+        let space = KeyPress::char(' ');
+        // `SPC` and `SPC f` are prefixes; `SPC f s` completes to `save`.
+        assert_eq!(keymap.lookup(&[space]), Lookup::Prefix);
+        assert_eq!(keymap.lookup(&[space, KeyPress::char('f')]), Lookup::Prefix);
+        assert_eq!(
+            keymap.lookup(&[space, KeyPress::char('f'), KeyPress::char('s')]),
+            Lookup::Bound(Command::new("save"))
+        );
+        // Vim Normal motions are still present.
+        assert_eq!(
+            keymap.lookup(&[KeyPress::char('l')]),
+            Lookup::Bound(Command::new("move-right"))
+        );
     }
 }

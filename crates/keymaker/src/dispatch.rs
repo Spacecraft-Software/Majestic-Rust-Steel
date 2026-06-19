@@ -9,8 +9,10 @@
 //! incomplete prefix in any layer means "wait for more", and a sequence bound nowhere is
 //! reported (so the editor can fall back to self-insert) and the pending sequence resets.
 
+use std::collections::BTreeMap;
+
 use crate::key::KeyPress;
-use crate::keymap::{Command, Keymap, Lookup};
+use crate::keymap::{Command, Continuation, Keymap, Lookup};
 
 /// What feeding a key to a [`Dispatcher`] produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +51,24 @@ impl Dispatcher {
     /// Clears any in-progress sequence.
     pub fn reset(&mut self) {
         self.pending.clear();
+    }
+
+    /// The keys that may follow the current pending sequence, merged across layers (a
+    /// higher-priority layer wins per key), in key order — the data a which-key hint renders.
+    /// Empty when no multi-key sequence is in progress.
+    #[must_use]
+    pub fn continuations(&self) -> Vec<(KeyPress, Continuation)> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        // Insert lowest-priority layer first so a higher-priority layer overwrites per key.
+        let mut merged: BTreeMap<KeyPress, Continuation> = BTreeMap::new();
+        for layer in self.layers.iter().rev() {
+            for (key, continuation) in layer.continuations(&self.pending) {
+                merged.insert(key, continuation);
+            }
+        }
+        merged.into_iter().collect()
     }
 
     /// Feeds one key and resolves it against the layers.

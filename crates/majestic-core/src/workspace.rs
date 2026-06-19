@@ -15,6 +15,7 @@ use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
 use crate::editor::Editor;
+use crate::whichkey::WhichKey;
 
 /// The axis a split divides its two children along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +280,14 @@ impl Workspace {
     #[must_use]
     pub fn profile(&self) -> Profile {
         self.profile
+    }
+
+    /// The which-key hint for the focused pane's in-progress key prefix, or `None` when no
+    /// multi-key sequence is pending. The host renders it over the editor area.
+    #[must_use]
+    pub fn which_key(&self) -> Option<WhichKey> {
+        let rows = self.active().which_key();
+        (!rows.is_empty()).then(|| WhichKey::new(rows))
     }
 
     /// Sets the focused editor's status-line message (e.g. a startup notice from the host).

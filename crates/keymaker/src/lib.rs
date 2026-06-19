@@ -40,6 +40,6 @@ pub use dispatch::{Dispatcher, Resolution};
 #[doc(inline)]
 pub use key::{KeyCode, KeyPress, Mods};
 #[doc(inline)]
-pub use keymap::{Command, Keymap, Lookup};
+pub use keymap::{Command, Continuation, Keymap, Lookup};
 #[doc(inline)]
-pub use profiles::{cua, emacs, vim_insert, vim_normal, vim_visual, Profile};
+pub use profiles::{cua, emacs, spacemacs_normal, vim_insert, vim_normal, vim_visual, Profile};

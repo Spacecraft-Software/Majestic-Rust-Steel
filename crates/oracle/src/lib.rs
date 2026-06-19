@@ -280,6 +280,10 @@ pub fn describe_mode(profile: Profile) -> String {
             "Vim — modal: Normal (hjkl motion, i/v switch), Insert (Esc returns to Normal), \
              Visual (hjkl extends the selection, y/x copy/cut)."
         }
+        Profile::Spacemacs => {
+            "Spacemacs — Vim modality with a SPC leader menu in Normal mode (SPC f s save, \
+             SPC f f find, SPC b d close-buffer, SPC q q quit); which-key lists the options."
+        }
     }
     .to_owned()
 }
@@ -386,7 +390,7 @@ mod tests {
         apropos, command_names, commands_missing_docs, describe_bindings, describe_function,
         describe_key, describe_variable, undocumented_commands, COMMANDS,
     };
-    use keymaker::{cua, emacs, vim_insert, vim_normal, vim_visual, KeyPress};
+    use keymaker::{cua, emacs, spacemacs_normal, vim_insert, vim_normal, vim_visual, KeyPress};
 
     #[test]
     fn every_command_is_documented() {
@@ -456,7 +460,14 @@ mod tests {
     fn built_in_profiles_bind_only_documented_commands() {
         // The profile↔catalog guard: every command a built-in profile binds must be documented,
         // so help is complete and a profile name typo can never become a silent runtime miss.
-        for keymap in [cua(), emacs(), vim_normal(), vim_insert(), vim_visual()] {
+        for keymap in [
+            cua(),
+            emacs(),
+            vim_normal(),
+            vim_insert(),
+            vim_visual(),
+            spacemacs_normal(),
+        ] {
             assert_eq!(commands_missing_docs(&keymap), Vec::<String>::new());
         }
     }
