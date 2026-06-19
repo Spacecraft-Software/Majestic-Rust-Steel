@@ -255,6 +255,14 @@ impl Buffer {
         self.clamped(self.cursor)
     }
 
+    /// Moves the cursor to `offset` (snapped to the nearest `char` boundary `<=` length), dropping
+    /// any selection. Used to restore a saved session's cursor position.
+    pub fn set_cursor(&mut self, offset: usize) {
+        self.cursor = self.clamped(offset);
+        self.selection_anchor = None;
+        self.goal_column = None;
+    }
+
     /// The cursor's `(row, byte-column)` position.
     #[must_use]
     pub fn cursor_point(&self) -> Point {
@@ -378,6 +386,31 @@ impl Buffer {
         self.selection_anchor = Some(0);
         self.cursor = self.rope().len_bytes();
         self.goal_column = None;
+    }
+
+    /// Kills the text from the cursor to the end of the line, returning it. If the cursor is
+    /// already at the line end, the line break is killed instead (joining the next line) — the
+    /// Emacs `C-k` `kill-line` semantics. The returned text is the caller's to push onto the kill
+    /// ring / clipboard; an empty return means there was nothing to kill (cursor at buffer end).
+    pub fn kill_line(&mut self) -> String {
+        self.clamp();
+        let rope = self.rope();
+        // Mirror `move_line_end`: the end-of-line column excludes the trailing line break, so
+        // `line_end` is the byte just before it.
+        let row = rope.byte_to_point(self.cursor).row;
+        let end_col = rope.line(row).len();
+        let line_end = rope.point_to_byte(Point::new(row, end_col));
+        let range = if self.cursor < line_end {
+            self.cursor..line_end
+        } else {
+            self.cursor..self.next_boundary(self.cursor)
+        };
+        if range.is_empty() {
+            return String::new();
+        }
+        let killed = rope.slice(range.clone());
+        self.apply_edit(range, "");
+        killed
     }
 
     /// Undoes the last edit, if any; returns whether the buffer changed.
