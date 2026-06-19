@@ -31,6 +31,7 @@
 //! journal + recovery, and the interactive `crossterm` loop land in the following steps.
 
 mod buffer;
+mod diagnostic;
 mod editor;
 mod files;
 mod finder;
@@ -47,6 +48,8 @@ mod workspace;
 
 #[doc(inline)]
 pub use buffer::Buffer;
+#[doc(inline)]
+pub use diagnostic::{Diagnostic, Severity};
 #[doc(inline)]
 pub use editor::{EditMode, Editor};
 #[doc(inline)]

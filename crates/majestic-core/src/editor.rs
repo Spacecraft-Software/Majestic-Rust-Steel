@@ -15,11 +15,12 @@ use keymaker::{
     cua, emacs, spacemacs_normal, vim_insert, vim_normal, vim_visual, Continuation, Dispatcher,
     KeyCode, KeyPress, Keymap, Mods, Profile, Resolution,
 };
-use penumbra::{char_width, Buffer as Surface, Cell, Rect, Style, Theme};
+use penumbra::{char_width, Buffer as Surface, Cell, Rect, Rgb, Style, Theme};
 
 use stratum::{Point, SpanLayer};
 
 use crate::buffer::Buffer;
+use crate::diagnostic::{Diagnostic, Severity};
 use crate::syntax::{HighlightKind, HighlightWorker};
 
 /// The editing mode that governs key dispatch and whether printable keys self-insert.
@@ -82,10 +83,32 @@ pub struct Editor {
     highlighted_revision: Option<u64>,
     requested_revision: Option<u64>,
     tab_width: usize,
+    /// Language-server diagnostics for this buffer (byte ranges), underlined when rendered.
+    diagnostics: Vec<Diagnostic>,
 }
 
 /// Default indent width in columns (CUA convention; overridden by `majestic-config`).
 const DEFAULT_TAB_WIDTH: usize = 4;
+
+/// Ranks a severity so the most serious sorts first (for `min_by_key`).
+fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Information => 2,
+        Severity::Hint => 3,
+    }
+}
+
+/// The Steelbore palette color for a severity (§9): error = Red Oxide, warning = Molten Amber,
+/// info/hint = Liquid Coolant.
+fn severity_color(severity: Severity, theme: &Theme) -> Rgb {
+    match severity {
+        Severity::Error => theme.error,
+        Severity::Warning => theme.foreground,
+        Severity::Information | Severity::Hint => theme.info,
+    }
+}
 
 impl Editor {
     /// Creates an editor on a scratch buffer with the CUA keymap.
@@ -114,7 +137,20 @@ impl Editor {
             highlighted_revision: None,
             requested_revision: None,
             tab_width: DEFAULT_TAB_WIDTH,
+            diagnostics: Vec::new(),
         }
+    }
+
+    /// Replaces this buffer's diagnostics (the host sets these from the language server's
+    /// `publishDiagnostics`). They are underlined on the next render until superseded.
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        self.diagnostics = diagnostics;
+    }
+
+    /// The diagnostics currently shown for this buffer.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 
     /// A second view of this editor's buffer: a new editor sharing the document (and thus text +
@@ -436,6 +472,7 @@ impl Editor {
                     }
                     if let Ok(col) = u16::try_from(screen) {
                         let style = styles.get(byte - start_byte).copied().unwrap_or(base);
+                        let style = self.apply_diagnostic(byte, style, theme);
                         surface.set_char(area.x + col, area.y + row, ch, style);
                     }
                 }
@@ -449,6 +486,35 @@ impl Editor {
         if focused {
             self.draw_cursor(surface, theme, area);
         }
+    }
+
+    /// If `byte` is covered by a diagnostic, returns `style` underlined in the diagnostic's
+    /// severity color (the most severe covering diagnostic wins); otherwise `style` unchanged.
+    fn apply_diagnostic(&self, byte: usize, mut style: Style, theme: &Theme) -> Style {
+        if self.diagnostics.is_empty() {
+            return style;
+        }
+        let severity = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.covers(byte))
+            .map(|diagnostic| diagnostic.severity)
+            .min_by_key(|severity| severity_rank(*severity));
+        if let Some(severity) = severity {
+            style.fg = severity_color(severity, theme);
+            style.attrs.underline = true;
+        }
+        style
+    }
+
+    /// The most severe diagnostic covering the cursor, if any (shown in the status line).
+    #[must_use]
+    pub fn cursor_diagnostic(&self) -> Option<&Diagnostic> {
+        let cursor = self.buffer.cursor();
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.covers(cursor))
+            .min_by_key(|diagnostic| severity_rank(diagnostic.severity))
     }
 
     /// Reconciles highlights with the background worker — never blocks the render path.
@@ -584,8 +650,17 @@ impl Editor {
     pub fn status_line(&self) -> String {
         let point = self.buffer.cursor_point();
         let dirty = if self.buffer.is_dirty() { " *" } else { "" };
+        // A diagnostic under the cursor is shown inline (its first line, prefixed with a marker).
+        let diagnostic = self
+            .cursor_diagnostic()
+            .map_or_else(String::new, |diagnostic| {
+                format!(
+                    "   ⚠ {}",
+                    diagnostic.message.lines().next().unwrap_or_default()
+                )
+            });
         format!(
-            " {}{dirty}   Ln {}, Col {}   {}",
+            " {}{dirty}   Ln {}, Col {}   {}{diagnostic}",
             self.display_name(),
             point.row + 1,
             self.buffer.cursor_column() + 1,
@@ -893,5 +968,45 @@ mod tests {
         editor.handle_key(KeyPress::char(' '));
         editor.handle_key(KeyPress::char('b'));
         assert_eq!(editor.buffer().text(), "a b");
+    }
+
+    #[test]
+    fn diagnostics_underline_their_span_in_the_severity_color() {
+        use crate::diagnostic::{Diagnostic, Severity};
+        let theme = Theme::steelbore();
+        let mut editor = Editor::with_buffer(Buffer::from_text("let x = oops;"));
+        // Underline `oops` (bytes 8..12) as an error.
+        editor.set_diagnostics(vec![Diagnostic::new(
+            8..12,
+            Severity::Error,
+            "cannot find value `oops`",
+        )]);
+        let mut surface = Surface::new(40, 2, theme.base_style());
+        editor.render(&mut surface, &theme);
+
+        let inside = surface.cell(8, 0).unwrap(); // 'o' of `oops`
+        assert!(inside.style.attrs.underline, "the span is underlined");
+        assert_eq!(inside.style.fg, theme.error, "in the error color");
+        // Text outside the diagnostic is untouched.
+        assert!(!surface.cell(0, 0).unwrap().style.attrs.underline);
+    }
+
+    #[test]
+    fn cursor_diagnostic_appears_in_the_status_line() {
+        use crate::diagnostic::{Diagnostic, Severity};
+        let mut editor = Editor::with_buffer(Buffer::from_text("let x = oops;"));
+        editor.set_diagnostics(vec![Diagnostic::new(
+            8..12,
+            Severity::Error,
+            "cannot find value `oops`",
+        )]);
+        for _ in 0..9 {
+            editor.handle_key(KeyPress::key(KeyCode::Right)); // move into the span (byte 9)
+        }
+        assert!(editor.cursor_diagnostic().is_some());
+        assert!(editor.status_line().contains("cannot find value"));
+
+        editor.handle_key(KeyPress::key(KeyCode::Home)); // move out of the span
+        assert!(editor.cursor_diagnostic().is_none());
     }
 }
