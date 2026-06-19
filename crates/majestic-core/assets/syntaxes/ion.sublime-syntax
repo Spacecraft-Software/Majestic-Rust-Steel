@@ -1,0 +1,36 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# A focused Ion shell (.ion) syntax for Majestic's syntect tier — the Redox/Pop!_OS shell.
+# Scopes use TextMate roots that map to Majestic's HighlightKind.
+---
+name: Ion
+file_extensions:
+  - ion
+scope: source.ion
+
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.ion
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.ion
+        - match: '\\.'
+          scope: constant.character.escape.ion
+        - match: '"'
+          pop: true
+    - match: "'"
+      push:
+        - meta_scope: string.quoted.single.ion
+        - match: "'"
+          pop: true
+    - match: '[$@]\{?[A-Za-z_][A-Za-z0-9_]*\}?'
+      scope: variable.other.ion
+    - match: '\b(let|export|if|else|end|for|in|while|fn|match|case|break|continue|return|exit|and|or|not|exists|test)\b'
+      scope: keyword.control.ion
+    - match: '\b(true|false)\b'
+      scope: constant.language.ion
+    - match: '\b\d+(\.\d+)?\b'
+      scope: constant.numeric.ion

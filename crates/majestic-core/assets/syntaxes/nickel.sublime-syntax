@@ -1,0 +1,33 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# A focused Nickel (.ncl) syntax for Majestic's syntect tier. Scopes use TextMate roots that
+# map to Majestic's HighlightKind (keyword, string, comment, constant, storage.type, …).
+---
+name: Nickel
+file_extensions:
+  - ncl
+scope: source.nickel
+
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.nickel
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.nickel
+        - match: '\\.'
+          scope: constant.character.escape.nickel
+        - match: '"'
+          pop: true
+    - match: "'[A-Za-z_][A-Za-z0-9_]*"
+      scope: constant.other.enum.nickel
+    - match: '\b(let|rec|in|if|then|else|fun|import|match|forall|default|doc|optional|priority|force|merge|null|true|false)\b'
+      scope: keyword.control.nickel
+    - match: '\b(Number|String|Bool|Array|Dyn)\b'
+      scope: storage.type.nickel
+    - match: '\b\d+(\.\d+)?\b'
+      scope: constant.numeric.nickel
+    - match: '[{}\[\]()]'
+      scope: punctuation.section.nickel

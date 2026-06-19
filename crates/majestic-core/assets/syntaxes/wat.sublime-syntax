@@ -1,0 +1,41 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# A focused WebAssembly text format (.wat, .wast) syntax for Majestic's syntect tier. Scopes use
+# TextMate roots that map to Majestic's HighlightKind (keyword, storage.type, variable, …).
+---
+name: WebAssembly
+file_extensions:
+  - wat
+  - wast
+scope: source.wat
+
+contexts:
+  main:
+    - match: '\(;'
+      push:
+        - meta_scope: comment.block.wat
+        - match: ';\)'
+          pop: true
+    - match: ';;.*$'
+      scope: comment.line.double-semicolon.wat
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.wat
+        - match: '\\.'
+          scope: constant.character.escape.wat
+        - match: '"'
+          pop: true
+    - match: '\$[A-Za-z0-9_.$+\-*/\\^~=<>!?@#%&|:'']+'
+      scope: variable.other.wat
+    - match: '\b(i32|i64|f32|f64|v128|funcref|externref|anyref)\b'
+      scope: storage.type.wat
+    - match: '\b(module|func|param|result|local|global|memory|table|elem|data|export|import|type|start|mut|offset|align|block|loop|if|else|then|end|br|br_if|br_table|return|call|call_indirect|unreachable|nop|drop|select)\b'
+      scope: keyword.control.wat
+    - match: '\b[a-z][a-z0-9_]*\.[a-z0-9_.]+'
+      scope: support.function.instruction.wat
+    - match: '\b\d[\d_]*(\.\d+)?\b'
+      scope: constant.numeric.wat
+    - match: '[()]'
+      scope: punctuation.section.wat

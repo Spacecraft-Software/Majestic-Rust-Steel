@@ -1,0 +1,37 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# A focused tcsh / csh (.tcsh, .csh) syntax for Majestic's syntect tier. Scopes use TextMate
+# roots that map to Majestic's HighlightKind.
+---
+name: Tcsh
+file_extensions:
+  - tcsh
+  - csh
+scope: source.tcsh
+
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.tcsh
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.tcsh
+        - match: '\\.'
+          scope: constant.character.escape.tcsh
+        - match: '"'
+          pop: true
+    - match: "'"
+      push:
+        - meta_scope: string.quoted.single.tcsh
+        - match: "'"
+          pop: true
+    - match: '\$[#?]?\{?[A-Za-z_][A-Za-z0-9_]*\}?'
+      scope: variable.other.tcsh
+    - match: '\b(if|then|else|endif|while|end|foreach|switch|case|default|endsw|breaksw|break|continue|goto|onintr|repeat|eval|exit)\b'
+      scope: keyword.control.tcsh
+    - match: '\b(set|setenv|unset|unsetenv|alias|unalias|source)\b'
+      scope: keyword.declaration.tcsh
+    - match: '\b\d+\b'
+      scope: constant.numeric.tcsh

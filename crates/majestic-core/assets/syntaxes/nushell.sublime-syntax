@@ -1,0 +1,40 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# A focused Nushell (.nu) syntax for Majestic's syntect tier. Scopes use TextMate roots that
+# map to Majestic's HighlightKind (keyword, string, comment, variable, constant, …).
+---
+name: Nushell
+file_extensions:
+  - nu
+scope: source.nushell
+
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.nushell
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.nushell
+        - match: '\\.'
+          scope: constant.character.escape.nushell
+        - match: '"'
+          pop: true
+    - match: "'"
+      push:
+        - meta_scope: string.quoted.single.nushell
+        - match: "'"
+          pop: true
+    - match: '\$[A-Za-z_][A-Za-z0-9_]*'
+      scope: variable.other.nushell
+    - match: '\b(def|def-env|export|export-env|let|mut|const|alias|use|hide|module|source|overlay|register|extern)\b'
+      scope: keyword.declaration.nushell
+    - match: '\b(if|else|match|for|while|loop|do|try|catch|return|break|continue|where|in)\b'
+      scope: keyword.control.nushell
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.nushell
+    - match: '(^|\s)--?[A-Za-z][A-Za-z0-9-]*'
+      scope: variable.parameter.flag.nushell
+    - match: '\b\d+(\.\d+)?\b'
+      scope: constant.numeric.nushell

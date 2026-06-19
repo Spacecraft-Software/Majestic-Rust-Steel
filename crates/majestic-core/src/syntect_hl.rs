@@ -24,7 +24,14 @@ use crate::syntax::HighlightKind;
 
 /// Extra `.sublime-syntax` definitions bundled for languages absent from bat's set (each carries
 /// its own SPDX header). Folded into [`SYNTAXES`] at build time.
-const EXTRA_SYNTAXES: &[&str] = &[include_str!("../assets/syntaxes/texinfo.sublime-syntax")];
+const EXTRA_SYNTAXES: &[&str] = &[
+    include_str!("../assets/syntaxes/texinfo.sublime-syntax"),
+    include_str!("../assets/syntaxes/nickel.sublime-syntax"),
+    include_str!("../assets/syntaxes/nushell.sublime-syntax"),
+    include_str!("../assets/syntaxes/ion.sublime-syntax"),
+    include_str!("../assets/syntaxes/tcsh.sublime-syntax"),
+    include_str!("../assets/syntaxes/wat.sublime-syntax"),
+];
 
 /// The shared syntax set: bat's extended `.sublime-syntax` collection (~150 languages) via
 /// `two-face`, plus [`EXTRA_SYNTAXES`]. Built once, lazily, on first use — off the UI thread.
@@ -223,6 +230,29 @@ mod tests {
             kinds.contains(&HighlightKind::Keyword),
             "@chapter / @code are keywords"
         );
+    }
+
+    #[test]
+    fn highlights_bundled_gap_languages() {
+        // Each hand-authored gap syntax loads and highlights its comments and keywords.
+        let cases: &[(&str, &[u8])] = &[
+            ("x.ncl", b"# a comment\nlet x = 1 in x\n"),
+            ("x.nu", b"# a comment\ndef greet [] { 1 }\n"),
+            ("x.ion", b"# a comment\nlet x = 1\nif test\nend\n"),
+            ("x.tcsh", b"# a comment\nif ( 1 ) then\nendif\n"),
+            ("x.wat", b";; a comment\n(module (func))\n"),
+        ];
+        for (name, source) in cases {
+            let mut highlighter = SyntectHighlighter::for_path(Path::new(name))
+                .unwrap_or_else(|| panic!("{name} should be bundled"));
+            let kinds: Vec<HighlightKind> = highlighter
+                .highlight(source)
+                .iter()
+                .map(|s| s.value)
+                .collect();
+            assert!(kinds.contains(&HighlightKind::Comment), "{name}: comment");
+            assert!(kinds.contains(&HighlightKind::Keyword), "{name}: keyword");
+        }
     }
 
     #[test]

@@ -14,10 +14,11 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
 SPDX-License-Identifier = "GPL-3.0-or-later"
 
-# The hand-authored Texinfo syntax carries an inline SPDX header, but REUSE may not recognize the
-# `.sublime-syntax` comment style — declare it here too so the lint gate is unambiguous.
+# The hand-authored `.sublime-syntax` definitions carry inline SPDX headers, but REUSE may not
+# recognize that comment style — declare them here too so the lint gate is unambiguous. (All are
+# first-party GPL; a future third-party-sourced syntax would get its own per-file annotation.)
 [[annotations]]
-path = "crates/majestic-core/assets/syntaxes/texinfo.sublime-syntax"
+path = "crates/majestic-core/assets/syntaxes/*.sublime-syntax"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"
 SPDX-License-Identifier = "GPL-3.0-or-later"
