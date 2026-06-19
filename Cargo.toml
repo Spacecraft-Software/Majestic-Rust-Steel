@@ -21,6 +21,7 @@ members = [
     "crates/majestic-config",
     "crates/majestic-steel",
     "crates/majestic-core",
+    "crates/majestic-daemon",
     "crates/majestic-cli",
     # Tooling (not shipped with `mj`): the §7 performance harness.
     "crates/majestic-bench",

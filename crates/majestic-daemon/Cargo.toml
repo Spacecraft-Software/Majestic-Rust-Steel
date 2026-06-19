@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "majestic-daemon"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Majestic daemon: a headless session server over a local Unix socket (PRD #1 §6.8)."
+
+[dependencies]
+majestic-core = { version = "0.0.0", path = "../majestic-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+[lints]
+workspace = true
