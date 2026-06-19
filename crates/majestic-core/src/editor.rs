@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use keymaker::{
-    cua, emacs, vim_insert, vim_normal, vim_visual, Dispatcher, KeyCode, Keymap, Mods, Profile,
-    Resolution,
+    cua, emacs, spacemacs_normal, vim_insert, vim_normal, vim_visual, Continuation, Dispatcher,
+    KeyCode, KeyPress, Keymap, Mods, Profile, Resolution,
 };
 use penumbra::{char_width, Buffer as Surface, Cell, Rect, Style, Theme};
 
@@ -55,9 +55,10 @@ impl EditMode {
     }
 }
 
-/// The three Vim-mode keymaps an [`Editor`] swaps between while the Vim profile is active.
+/// The three mode keymaps an [`Editor`] swaps between while a modal profile (Vim or Spacemacs)
+/// is active. Insert and Visual are shared; only the Normal map differs between the two.
 #[derive(Clone, Debug)]
-struct VimKeymaps {
+struct ModalKeymaps {
     normal: Keymap,
     insert: Keymap,
     visual: Keymap,
@@ -70,7 +71,7 @@ pub struct Editor {
     clipboard: String,
     dispatcher: Dispatcher,
     mode: EditMode,
-    vim: Option<VimKeymaps>,
+    modal: Option<ModalKeymaps>,
     viewport_top: usize,
     viewport_left: usize,
     page_rows: usize,
@@ -102,7 +103,7 @@ impl Editor {
             clipboard: String::new(),
             dispatcher: Dispatcher::new(vec![cua()]),
             mode: EditMode::Insert,
-            vim: None,
+            modal: None,
             viewport_top: 0,
             viewport_left: 0,
             page_rows: 1,
@@ -139,13 +140,14 @@ impl Editor {
             Profile::Cua => self.set_non_modal(cua()),
             Profile::Emacs => self.set_non_modal(emacs()),
             Profile::Vim => self.enable_vim(),
+            Profile::Spacemacs => self.enable_spacemacs(),
         }
     }
 
-    /// Installs a single-layer, non-modal keymap (CUA, Emacs): always [`EditMode::Insert`], no Vim
-    /// state. The new keymap shares structure with the old via `Arc`, so this is cheap.
+    /// Installs a single-layer, non-modal keymap (CUA, Emacs): always [`EditMode::Insert`], no
+    /// modal state. The new keymap shares structure with the old via `Arc`, so this is cheap.
     fn set_non_modal(&mut self, keymap: Keymap) {
-        self.vim = None;
+        self.modal = None;
         self.mode = EditMode::Insert;
         self.dispatcher = Dispatcher::new(vec![keymap]);
     }
@@ -153,8 +155,20 @@ impl Editor {
     /// Switches this editor to the Vim profile, starting in Normal mode; installs the three modal
     /// keymaps. Prefer [`Editor::set_profile`] at call sites that select by [`Profile`].
     pub fn enable_vim(&mut self) {
-        self.vim = Some(VimKeymaps {
-            normal: vim_normal(),
+        self.set_modal(vim_normal());
+    }
+
+    /// Switches this editor to the Spacemacs profile (Vim modality + a `SPC` leader in Normal
+    /// mode), starting in Normal mode.
+    pub fn enable_spacemacs(&mut self) {
+        self.set_modal(spacemacs_normal());
+    }
+
+    /// Installs a modal profile with `normal` as the Normal-mode keymap (Insert/Visual are the
+    /// shared Vim maps) and enters Normal mode.
+    fn set_modal(&mut self, normal: Keymap) {
+        self.modal = Some(ModalKeymaps {
+            normal,
             insert: vim_insert(),
             visual: vim_visual(),
         });
@@ -167,15 +181,33 @@ impl Editor {
         self.mode
     }
 
-    /// In a modal (Vim) editor, switches mode and rebinds the dispatcher to that mode's keymap.
-    /// A no-op for non-modal profiles. Rebinding is a cheap `Arc` clone (the prefix tree shares
+    /// The which-key hint rows for the in-progress key prefix: each `(key, label)` pairs the next
+    /// key with the command it runs (or `+prefix` when it descends further). Empty when no
+    /// multi-key sequence is pending, so the host shows the hint only mid-chord.
+    #[must_use]
+    pub fn which_key(&self) -> Vec<(KeyPress, String)> {
+        self.dispatcher
+            .continuations()
+            .into_iter()
+            .map(|(key, continuation)| {
+                let label = match continuation {
+                    Continuation::Command(command) => command.name().to_owned(),
+                    Continuation::Prefix => "+prefix".to_owned(),
+                };
+                (key, label)
+            })
+            .collect()
+    }
+
+    /// In a modal editor, switches mode and rebinds the dispatcher to that mode's keymap. A no-op
+    /// for non-modal profiles. Rebinding is a cheap `Arc` clone (the prefix tree shares
     /// structure), so it never disturbs dispatch.
     fn set_mode(&mut self, mode: EditMode) {
-        let Some(vim) = &self.vim else { return };
+        let Some(modal) = &self.modal else { return };
         let keymap = match mode {
-            EditMode::Insert => vim.insert.clone(),
-            EditMode::Normal => vim.normal.clone(),
-            EditMode::Visual => vim.visual.clone(),
+            EditMode::Insert => modal.insert.clone(),
+            EditMode::Normal => modal.normal.clone(),
+            EditMode::Visual => modal.visual.clone(),
         };
         self.dispatcher = Dispatcher::new(vec![keymap]);
         self.mode = mode;
@@ -815,5 +847,37 @@ mod tests {
         editor.handle_key(KeyPress::char('c')); // Emacs is also insert-mode
         editor.handle_key(KeyPress::char('d'));
         assert_eq!(editor.buffer().text(), "abcd");
+    }
+
+    #[test]
+    fn spacemacs_leader_surfaces_which_key_then_runs_a_command() {
+        use keymaker::Profile;
+        let mut editor = Editor::with_buffer(Buffer::from_text(""));
+        editor.set_profile(Profile::Spacemacs);
+        assert!(editor.which_key().is_empty()); // nothing pending yet
+        editor.handle_key(KeyPress::char(' ')); // SPC starts the leader
+        let hints = editor.which_key();
+        assert!(
+            !hints.is_empty(),
+            "SPC should surface which-key continuations"
+        );
+        // SPC f s runs `save` (no file -> it fails, but the leader sequence inserts nothing).
+        editor.handle_key(KeyPress::char('f'));
+        editor.handle_key(KeyPress::char('s'));
+        assert_eq!(editor.buffer().text(), "");
+        assert!(editor.which_key().is_empty()); // sequence resolved -> hint gone
+    }
+
+    #[test]
+    fn spacemacs_space_inserts_in_insert_mode() {
+        // SPC is the leader only in Normal mode; in Insert mode it must insert a space.
+        use keymaker::Profile;
+        let mut editor = Editor::with_buffer(Buffer::from_text(""));
+        editor.set_profile(Profile::Spacemacs);
+        editor.handle_key(KeyPress::char('i')); // enter Insert
+        editor.handle_key(KeyPress::char('a'));
+        editor.handle_key(KeyPress::char(' '));
+        editor.handle_key(KeyPress::char('b'));
+        assert_eq!(editor.buffer().text(), "a b");
     }
 }

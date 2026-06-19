@@ -183,6 +183,19 @@ impl App {
 
         self.draw_status_bar(surface, status.y, theme);
 
+        // which-key hint: while a prefix is in progress in the editor (Spacemacs SPC, Emacs C-x)
+        // and no modal is open, list the keys that may come next over the editor area.
+        if self.focus == Focus::Editor
+            && self.finder.is_none()
+            && self.help.is_none()
+            && self.info.is_none()
+            && self.selector.is_none()
+        {
+            if let Some(which_key) = self.workspace.which_key() {
+                which_key.render(surface, main, theme);
+            }
+        }
+
         // Modal overlays are drawn last, over everything else.
         let area = surface.area();
         if let Some(finder) = self.finder.as_ref() {

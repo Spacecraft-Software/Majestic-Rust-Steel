@@ -52,6 +52,11 @@ impl ProfileSelector {
                     profile: Profile::Vim,
                     label: "[V]im — modal editing (Normal / Insert / Visual)",
                 },
+                Choice {
+                    key: 's',
+                    profile: Profile::Spacemacs,
+                    label: "[S]pacemacs — Vim modality with a SPC leader menu",
+                },
             ],
         }
     }
@@ -134,6 +139,7 @@ mod tests {
         assert_eq!(selector.choose('c'), Some(Profile::Cua));
         assert_eq!(selector.choose('E'), Some(Profile::Emacs));
         assert_eq!(selector.choose('v'), Some(Profile::Vim));
+        assert_eq!(selector.choose('S'), Some(Profile::Spacemacs));
         assert_eq!(selector.choose('z'), None);
     }
 

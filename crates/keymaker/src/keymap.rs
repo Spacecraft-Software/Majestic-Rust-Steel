@@ -52,6 +52,16 @@ pub enum Lookup {
     Unbound,
 }
 
+/// One key available after a prefix, for which-key hints: pressing it either runs a command or
+/// descends into a deeper prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Continuation {
+    /// Pressing this key runs `command`.
+    Command(Command),
+    /// Pressing this key descends into a further prefix (more keys follow).
+    Prefix,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Node {
     command: Option<Command>,
@@ -99,6 +109,31 @@ impl Keymap {
         } else {
             Lookup::Prefix
         }
+    }
+
+    /// The keys that may follow `prefix`, in key order — the data a which-key hint renders.
+    ///
+    /// Each entry is a leaf [`Continuation::Command`] or a deeper [`Continuation::Prefix`].
+    /// Returns an empty vector when `prefix` is unbound or has no continuations.
+    #[must_use]
+    pub fn continuations(&self, prefix: &[KeyPress]) -> Vec<(KeyPress, Continuation)> {
+        let mut node = &self.root;
+        for key in prefix {
+            match node.children.get(key) {
+                Some(child) => node = child,
+                None => return Vec::new(),
+            }
+        }
+        node.children
+            .iter()
+            .map(|(key, child)| {
+                let continuation = match &child.command {
+                    Some(command) => Continuation::Command(command.clone()),
+                    None => Continuation::Prefix,
+                };
+                (*key, continuation)
+            })
+            .collect()
     }
 
     /// Returns every bound key sequence paired with its command, in key order.
@@ -151,8 +186,39 @@ fn bind_node(node: &Node, sequence: &[KeyPress], command: Command) -> Node {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Keymap, Lookup};
+    use super::{Command, Continuation, Keymap, Lookup};
     use crate::key::{KeyCode, KeyPress};
+
+    #[test]
+    fn continuations_list_the_keys_after_a_prefix() {
+        let keymap = Keymap::new()
+            .bind(
+                &[KeyPress::ctrl('x'), KeyPress::ctrl('s')],
+                Command::new("save"),
+            )
+            .bind(
+                &[
+                    KeyPress::ctrl('x'),
+                    KeyPress::ctrl('f'),
+                    KeyPress::char('o'),
+                ],
+                Command::new("find"),
+            );
+        let after_c_x = keymap.continuations(&[KeyPress::ctrl('x')]);
+        // `C-x C-s` is a leaf command; `C-x C-f` is a deeper prefix.
+        assert_eq!(
+            after_c_x,
+            vec![
+                (KeyPress::ctrl('f'), Continuation::Prefix),
+                (
+                    KeyPress::ctrl('s'),
+                    Continuation::Command(Command::new("save"))
+                ),
+            ]
+        );
+        // An unbound or leaf prefix has no continuations.
+        assert!(keymap.continuations(&[KeyPress::ctrl('z')]).is_empty());
+    }
 
     #[test]
     fn bind_and_lookup_single_chord() {
