@@ -1,42 +1,226 @@
 // SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The [`Workspace`] — multiple open buffers arranged into panes with a tab bar (PRD #1 §6:
-//! majestic-core owns buffers and windows; UI.md §3 editor area).
+//! The [`Workspace`] — multiple open buffers arranged into a window tree with a tab bar (PRD #1
+//! §6: majestic-core owns buffers and windows; UI.md §3 editor area).
 //!
-//! Each open buffer is an [`Editor`] (its own viewport, highlighter, and cursor). The editor
-//! area is divided into one or more *panes* along a single [`Split`] axis; each pane shows one
-//! buffer, exactly one pane is focused, and a tab bar lists every open buffer. Window keys
-//! split the focused pane, move focus, cycle the focused pane through background tabs, and
-//! close panes. One shared clipboard is mirrored across panes so copy/cut/paste crosses them.
-//!
-//! Nested (grid) splits and two views of one buffer are deferred: v1 keeps one buffer per pane
-//! along a single axis, which already covers the daily-driver side-by-side and tabbed workflow.
+//! Each open buffer is an [`Editor`] (its own viewport, highlighter, and cursor). The editor area
+//! is a **binary split tree**: every node is either a leaf (one pane showing one buffer) or a
+//! split (an axis + a ratio + two child nodes), so panes nest into arbitrary grids and each split
+//! is independently resizable. Exactly one leaf is focused; a tab bar lists every open buffer.
+//! Window keys split the focused pane (either axis), move focus, resize, cycle the focused pane
+//! through background tabs, and close panes. One shared clipboard is mirrored across panes.
 
 use keymaker::{KeyCode, KeyPress, Mods};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
 use crate::editor::Editor;
 
-/// The axis a [`Workspace`] divides its panes along.
+/// The axis a split divides its two children along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Split {
-    /// Panes side by side, separated by vertical rules (`│`).
+    /// Children side by side, separated by a vertical rule (`│`).
     Columns,
-    /// Panes stacked top to bottom, separated by horizontal rules (`─`).
+    /// Children stacked top to bottom, separated by a horizontal rule (`─`).
     Rows,
 }
 
-/// A set of open buffers shown as tabs, with the editor area split into panes.
+/// A node of the window tree: a single pane, or a split of two child nodes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Node {
+    /// A pane showing the buffer at this editor index.
+    Leaf(usize),
+    /// A split: `ratio` is the percent of the span given to `first` (the rest, less a divider
+    /// cell, goes to `second`).
+    Split {
+        dir: Split,
+        ratio: u16,
+        first: Box<Node>,
+        second: Box<Node>,
+    },
+}
+
+impl Node {
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
+    /// The editor index of the `n`th leaf (in-order), if any.
+    fn nth_editor(&self, n: usize) -> Option<usize> {
+        match self {
+            Self::Leaf(editor) => (n == 0).then_some(*editor),
+            Self::Split { first, second, .. } => {
+                let left = first.leaf_count();
+                if n < left {
+                    first.nth_editor(n)
+                } else {
+                    second.nth_editor(n - left)
+                }
+            }
+        }
+    }
+
+    /// Points the `n`th leaf at editor `editor`.
+    fn set_nth_editor(&mut self, n: usize, editor: usize) {
+        match self {
+            Self::Leaf(slot) => {
+                if n == 0 {
+                    *slot = editor;
+                }
+            }
+            Self::Split { first, second, .. } => {
+                let left = first.leaf_count();
+                if n < left {
+                    first.set_nth_editor(n, editor);
+                } else {
+                    second.set_nth_editor(n - left, editor);
+                }
+            }
+        }
+    }
+
+    /// Collects every leaf's editor index, in-order.
+    fn collect_editors(&self, out: &mut Vec<usize>) {
+        match self {
+            Self::Leaf(editor) => out.push(*editor),
+            Self::Split { first, second, .. } => {
+                first.collect_editors(out);
+                second.collect_editors(out);
+            }
+        }
+    }
+
+    /// Tiles `area`, pushing each leaf's `(editor, rect)` in-order and each split's divider.
+    fn layout(
+        &self,
+        area: Rect,
+        panes: &mut Vec<(usize, Rect)>,
+        dividers: &mut Vec<(Split, Rect)>,
+    ) {
+        match self {
+            Self::Leaf(editor) => panes.push((*editor, area)),
+            Self::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let (a, divider, b) = split_area(area, *dir, *ratio);
+                if let Some(rect) = divider {
+                    dividers.push((*dir, rect));
+                }
+                first.layout(a, panes, dividers);
+                second.layout(b, panes, dividers);
+            }
+        }
+    }
+}
+
+/// Replaces the `n`th leaf with a `dir` split of itself (first) and a `new` leaf (second).
+fn split_leaf(node: &mut Node, n: usize, dir: Split, new: usize) {
+    match node {
+        Node::Leaf(editor) => {
+            let editor = *editor;
+            *node = Node::Split {
+                dir,
+                ratio: 50,
+                first: Box::new(Node::Leaf(editor)),
+                second: Box::new(Node::Leaf(new)),
+            };
+        }
+        Node::Split { first, second, .. } => {
+            let left = first.leaf_count();
+            if n < left {
+                split_leaf(first, n, dir, new);
+            } else {
+                split_leaf(second, n - left, dir, new);
+            }
+        }
+    }
+}
+
+/// Removes the `n`th leaf, collapsing its parent split into the surviving sibling. The root leaf
+/// (a single pane) is returned unchanged.
+fn remove_leaf(node: Node, n: usize) -> Node {
+    match node {
+        Node::Leaf(editor) => Node::Leaf(editor),
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let left = first.leaf_count();
+            if n < left {
+                if matches!(*first, Node::Leaf(_)) {
+                    *second
+                } else {
+                    Node::Split {
+                        dir,
+                        ratio,
+                        first: Box::new(remove_leaf(*first, n)),
+                        second,
+                    }
+                }
+            } else if matches!(*second, Node::Leaf(_)) {
+                *first
+            } else {
+                Node::Split {
+                    dir,
+                    ratio,
+                    first,
+                    second: Box::new(remove_leaf(*second, n - left)),
+                }
+            }
+        }
+    }
+}
+
+/// Adjusts the ratio of the split directly above the `n`th leaf, growing or shrinking that pane.
+fn resize_leaf(node: &mut Node, n: usize, grow: bool) {
+    if let Node::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = node
+    {
+        let left = first.leaf_count();
+        if n < left {
+            if matches!(**first, Node::Leaf(_)) {
+                *ratio = adjust(*ratio, grow); // grow the first child → larger ratio
+            } else {
+                resize_leaf(first, n, grow);
+            }
+        } else if matches!(**second, Node::Leaf(_)) {
+            *ratio = adjust(*ratio, !grow); // grow the second child → smaller ratio
+        } else {
+            resize_leaf(second, n - left, grow);
+        }
+    }
+}
+
+/// Nudges a split ratio by a fixed step, clamped to a sane `10..=90` so neither pane vanishes.
+fn adjust(ratio: u16, increase: bool) -> u16 {
+    const STEP: u16 = 6;
+    if increase {
+        (ratio + STEP).min(90)
+    } else {
+        ratio.saturating_sub(STEP).max(10)
+    }
+}
+
+/// A set of open buffers shown as tabs, with the editor area as a binary window tree.
 #[derive(Debug)]
 pub struct Workspace {
     /// Every open buffer; never removed in v1, so indices stay stable.
     editors: Vec<Editor>,
-    /// The editor index shown in each pane, in layout order. Non-empty and distinct.
-    panes: Vec<usize>,
-    /// The axis panes are divided along.
-    split: Split,
-    /// Index into [`Self::panes`] of the focused pane.
+    /// The window tree over [`Self::editors`].
+    root: Node,
+    /// In-order position of the focused leaf.
     focused: usize,
     /// Shared clipboard, mirrored into every editor so copy/paste crosses panes.
     clipboard: String,
@@ -53,8 +237,8 @@ impl Workspace {
         Self::from_editors(vec![editor])
     }
 
-    /// Builds a workspace from one or more open buffers; the first is shown in the sole pane,
-    /// the rest are background tabs. An empty input becomes a single scratch buffer.
+    /// Builds a workspace from one or more open buffers; the first is shown in the sole pane, the
+    /// rest are background tabs. An empty input becomes a single scratch buffer.
     #[must_use]
     pub fn from_editors(mut editors: Vec<Editor>) -> Self {
         if editors.is_empty() {
@@ -62,8 +246,7 @@ impl Workspace {
         }
         Self {
             editors,
-            panes: vec![0],
-            split: Split::Columns,
+            root: Node::Leaf(0),
             focused: 0,
             clipboard: String::new(),
             tab_width: 4, // matches Editor's default; overridden by `set_tab_width` from config
@@ -103,7 +286,13 @@ impl Workspace {
     }
 
     fn active_index(&self) -> usize {
-        self.panes[self.focused]
+        self.root.nth_editor(self.focused).unwrap_or(0)
+    }
+
+    /// The number of panes (leaves) in the window tree.
+    #[must_use]
+    pub fn pane_count(&self) -> usize {
+        self.root.leaf_count()
     }
 
     /// The focused buffer's status line, with its tab position appended.
@@ -124,12 +313,13 @@ impl Workspace {
         }
     }
 
-    /// Opens `editor` as a new buffer and shows it in the focused pane (its previous buffer
-    /// stays open as a background tab). Used by the explorer and the fuzzy file finder.
+    /// Opens `editor` as a new buffer and shows it in the focused pane (its previous buffer stays
+    /// open as a background tab). Used by the explorer and the fuzzy file finder.
     pub fn open(&mut self, mut editor: Editor) {
         editor.set_tab_width(self.tab_width);
         self.editors.push(editor);
-        self.panes[self.focused] = self.editors.len() - 1;
+        let index = self.editors.len() - 1;
+        self.root.set_nth_editor(self.focused, index);
     }
 
     /// Feeds a key: runs a window command, or forwards it to the focused editor.
@@ -147,14 +337,20 @@ impl Workspace {
 
     /// Handles the workspace-level window keys; returns `true` when `key` was one of them.
     ///
-    /// Provisional bindings (full Keymaker rebinding lands at M2): `Ctrl+\` split the focused
-    /// pane, `Alt+o` focus the next pane, `Alt+←/→` previous/next buffer in the focused pane,
-    /// `Ctrl+W` close the focused pane.
+    /// Provisional bindings (full Keymaker rebinding lands at M2): `Ctrl+\` split the focused pane
+    /// into columns, `Alt+\` into rows; `Alt+o` focus the next pane; `Alt+↑/↓` grow/shrink the
+    /// focused pane; `Alt+←/→` previous/next buffer in the focused pane; `Ctrl+W` close the pane.
     fn window_command(&mut self, key: KeyPress) -> bool {
         if key == KeyPress::ctrl('\\') {
-            self.split_focused();
+            self.split_focused(Split::Columns);
+        } else if key == KeyPress::new(Mods::ALT, KeyCode::Char('\\')) {
+            self.split_focused(Split::Rows);
         } else if key == KeyPress::new(Mods::ALT, KeyCode::Char('o')) {
             self.focus_next();
+        } else if key == KeyPress::new(Mods::ALT, KeyCode::Up) {
+            self.resize(true);
+        } else if key == KeyPress::new(Mods::ALT, KeyCode::Down) {
+            self.resize(false);
         } else if key == KeyPress::new(Mods::ALT, KeyCode::Right) {
             self.cycle_buffer(true);
         } else if key == KeyPress::new(Mods::ALT, KeyCode::Left) {
@@ -178,25 +374,40 @@ impl Workspace {
         }
     }
 
-    /// Splits the focused pane, showing a not-yet-visible buffer (or a fresh scratch) beside it.
-    fn split_focused(&mut self) {
+    /// Splits the focused pane along `dir`, showing a not-yet-visible buffer (or a fresh scratch)
+    /// in the new pane, which becomes focused.
+    fn split_focused(&mut self, dir: Split) {
         let next = self.hidden_buffer().unwrap_or_else(|| {
             self.editors.push(Editor::new());
             self.editors.len() - 1
         });
-        self.focused += 1;
-        self.panes.insert(self.focused, next);
+        split_leaf(&mut self.root, self.focused, dir, next);
+        self.focused += 1; // the new leaf is the second child, just after the old one
+    }
+
+    /// Grows (or shrinks) the focused pane by adjusting its enclosing split's ratio.
+    fn resize(&mut self, grow: bool) {
+        resize_leaf(&mut self.root, self.focused, grow);
+    }
+
+    /// Editor indices shown across all panes, in-order.
+    fn shown_editors(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.root.collect_editors(&mut out);
+        out
     }
 
     /// The first open buffer not currently shown in any pane, if any.
     fn hidden_buffer(&self) -> Option<usize> {
-        (0..self.editors.len()).find(|index| !self.panes.contains(index))
+        let shown = self.shown_editors();
+        (0..self.editors.len()).find(|index| !shown.contains(index))
     }
 
     /// Moves focus to the next pane (wrapping).
     fn focus_next(&mut self) {
-        if !self.panes.is_empty() {
-            self.focused = (self.focused + 1) % self.panes.len();
+        let count = self.root.leaf_count();
+        if count > 0 {
+            self.focused = (self.focused + 1) % count;
         }
     }
 
@@ -219,12 +430,12 @@ impl Workspace {
         } else {
             (position + len - 1) % len
         };
-        self.panes[self.focused] = candidates[next];
+        self.root.set_nth_editor(self.focused, candidates[next]);
     }
 
     /// Whether buffer `index` is shown in a pane other than the focused one.
     fn shown_in_other_pane(&self, index: usize) -> bool {
-        self.panes
+        self.shown_editors()
             .iter()
             .enumerate()
             .any(|(pane, &buffer)| pane != self.focused && buffer == index)
@@ -232,16 +443,18 @@ impl Workspace {
 
     /// Closes the focused pane (the buffer stays open as a tab); a no-op with a single pane.
     fn close_pane(&mut self) {
-        if self.panes.len() <= 1 {
+        if self.root.leaf_count() <= 1 {
             return;
         }
-        self.panes.remove(self.focused);
-        if self.focused >= self.panes.len() {
-            self.focused = self.panes.len() - 1;
+        let root = std::mem::replace(&mut self.root, Node::Leaf(0));
+        self.root = remove_leaf(root, self.focused);
+        let count = self.root.leaf_count();
+        if self.focused >= count {
+            self.focused = count - 1;
         }
     }
 
-    /// Draws the tab bar and the pane splits into `area`. `focused` is whether the editor area
+    /// Draws the tab bar and the window tree into `area`. `focused` is whether the editor area
     /// (vs. the terminal panel) holds the application's focus.
     pub fn render(&mut self, surface: &mut Surface, area: Rect, theme: &Theme, focused: bool) {
         if area.is_empty() {
@@ -256,17 +469,24 @@ impl Workspace {
         if body.is_empty() {
             return;
         }
-        if let Some(rects) = pane_rects(body, self.split, self.panes.len()) {
-            draw_dividers(surface, body, self.split, &rects, theme);
-            for (pane, rect) in rects.iter().enumerate() {
-                let index = self.panes[pane];
-                let pane_focused = focused && pane == self.focused;
-                self.editors[index].render_in(surface, *rect, theme, pane_focused);
+        let mut panes = Vec::new();
+        let mut dividers = Vec::new();
+        self.root.layout(body, &mut panes, &mut dividers);
+        for (position, (index, rect)) in panes.into_iter().enumerate() {
+            let pane_focused = focused && position == self.focused;
+            self.editors[index].render_in(surface, rect, theme, pane_focused);
+        }
+        let style = Style::new(theme.accent, theme.background); // Steel Blue rules
+        for (dir, rect) in dividers {
+            let glyph = match dir {
+                Split::Columns => '│',
+                Split::Rows => '─',
+            };
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    surface.set_char(x, y, glyph, style);
+                }
             }
-        } else {
-            // Too small to tile every pane: show just the focused one full-area.
-            let index = self.active_index();
-            self.editors[index].render_in(surface, body, theme, focused);
         }
     }
 
@@ -279,6 +499,7 @@ impl Workspace {
             surface.set_char(x, area.y, ' ', base);
         }
         let active = self.active_index();
+        let shown = self.shown_editors();
         let mut x = area.x;
         for (index, editor) in self.editors.iter().enumerate() {
             if x >= area.right() {
@@ -294,7 +515,7 @@ impl Workspace {
                 Style::new(theme.background, theme.accent) // active tab, area focused
             } else if index == active {
                 Style::new(theme.background, theme.foreground) // active tab, area unfocused
-            } else if self.panes.contains(&index) {
+            } else if shown.contains(&index) {
                 Style::new(theme.accent, theme.background) // shown in another pane
             } else {
                 base // background tab
@@ -304,63 +525,58 @@ impl Workspace {
     }
 }
 
-/// The rectangle for each of `count` panes tiling `area` along `split`, with 1-cell dividers
-/// between them — or `None` if `area` is too small to give every pane at least one cell.
-fn pane_rects(area: Rect, split: Split, count: usize) -> Option<Vec<Rect>> {
-    let count = u16::try_from(count).ok()?;
-    if count == 0 {
-        return None;
-    }
-    let dividers = count - 1;
-    let (mut cursor, span) = match split {
-        Split::Columns => (area.x, area.width.checked_sub(dividers)?),
-        Split::Rows => (area.y, area.height.checked_sub(dividers)?),
-    };
-    if span < count {
-        return None;
-    }
-    let base = span / count;
-    let extra = span % count;
-    let mut rects = Vec::with_capacity(usize::from(count));
-    for i in 0..count {
-        let size = base + u16::from(i < extra);
-        rects.push(match split {
-            Split::Columns => Rect::new(cursor, area.y, size, area.height),
-            Split::Rows => Rect::new(area.x, cursor, area.width, size),
-        });
-        cursor = cursor.saturating_add(size);
-        if i + 1 < count {
-            cursor = cursor.saturating_add(1); // skip the divider cell
+/// Splits `area` along `dir` at `ratio` percent, returning `(first, divider, second)`. The
+/// divider is a one-cell rule between the children (omitted when there is no room for it). Sizes
+/// are clamped so each child keeps at least one cell whenever the area can hold both.
+fn split_area(area: Rect, dir: Split, ratio: u16) -> (Rect, Option<Rect>, Rect) {
+    match dir {
+        Split::Columns => {
+            if area.width < 2 {
+                return (area, None, Rect::new(area.right(), area.y, 0, area.height));
+            }
+            let with_divider = area.width >= 3;
+            let span = if with_divider {
+                area.width - 1
+            } else {
+                area.width
+            };
+            let first_w = first_size(span, ratio);
+            let first = Rect::new(area.x, area.y, first_w, area.height);
+            let second_x = area.x + first_w + u16::from(with_divider);
+            let divider = with_divider.then(|| Rect::new(area.x + first_w, area.y, 1, area.height));
+            let second = Rect::new(second_x, area.y, area.right() - second_x, area.height);
+            (first, divider, second)
+        }
+        Split::Rows => {
+            if area.height < 2 {
+                return (area, None, Rect::new(area.x, area.bottom(), area.width, 0));
+            }
+            let with_divider = area.height >= 3;
+            let span = if with_divider {
+                area.height - 1
+            } else {
+                area.height
+            };
+            let first_h = first_size(span, ratio);
+            let first = Rect::new(area.x, area.y, area.width, first_h);
+            let second_y = area.y + first_h + u16::from(with_divider);
+            let divider = with_divider.then(|| Rect::new(area.x, area.y + first_h, area.width, 1));
+            let second = Rect::new(area.x, second_y, area.width, area.bottom() - second_y);
+            (first, divider, second)
         }
     }
-    Some(rects)
 }
 
-/// Draws the 1-cell rules between panes in the Steelbore accent (Steel Blue).
-fn draw_dividers(surface: &mut Surface, area: Rect, split: Split, rects: &[Rect], theme: &Theme) {
-    let style = Style::new(theme.accent, theme.background);
-    let last = rects.len().saturating_sub(1);
-    for rect in rects.iter().take(last) {
-        match split {
-            Split::Columns => {
-                let x = rect.right();
-                for y in area.y..area.bottom() {
-                    surface.set_char(x, y, '│', style);
-                }
-            }
-            Split::Rows => {
-                let y = rect.bottom();
-                for x in area.x..area.right() {
-                    surface.set_char(x, y, '─', style);
-                }
-            }
-        }
-    }
+/// The first child's size: `ratio` percent of `span`, clamped to `1..=span-1` so both children
+/// keep at least one cell.
+fn first_size(span: u16, ratio: u16) -> u16 {
+    let scaled = u32::from(span) * u32::from(ratio) / 100;
+    u16::try_from(scaled).unwrap_or(span).clamp(1, span - 1)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_rects, Split, Workspace};
+    use super::{first_size, split_area, Node, Split, Workspace};
     use crate::buffer::Buffer;
     use crate::editor::Editor;
     use keymaker::{KeyCode, KeyPress, Mods};
@@ -373,7 +589,7 @@ mod tests {
     #[test]
     fn starts_with_a_single_pane_and_tab() {
         let workspace = Workspace::new(Editor::new());
-        assert_eq!(workspace.panes, vec![0]);
+        assert_eq!(workspace.pane_count(), 1);
         assert_eq!(workspace.active_index(), 0);
         assert!(!workspace.should_quit());
     }
@@ -382,7 +598,7 @@ mod tests {
     fn split_with_one_buffer_opens_a_scratch_pane() {
         let mut workspace = Workspace::new(Editor::new());
         workspace.handle_key(KeyPress::ctrl('\\'));
-        assert_eq!(workspace.panes.len(), 2);
+        assert_eq!(workspace.pane_count(), 2);
         assert_eq!(workspace.editors.len(), 2); // a fresh scratch was created
         assert_eq!(workspace.focused, 1); // focus moved to the new pane
     }
@@ -394,20 +610,59 @@ mod tests {
             Editor::with_buffer(Buffer::from_text("two")),
         ];
         let mut workspace = Workspace::from_editors(editors);
-        assert_eq!(workspace.panes, vec![0]); // editor 1 is a background tab
         workspace.handle_key(KeyPress::ctrl('\\'));
-        assert_eq!(workspace.panes, vec![0, 1]); // it became the second pane
+        assert_eq!(workspace.pane_count(), 2);
         assert_eq!(workspace.editors.len(), 2); // no new scratch needed
         assert_eq!(workspace.active().buffer().text(), "two");
     }
 
     #[test]
-    fn close_pane_keeps_the_buffer() {
+    fn nested_splits_form_a_grid() {
+        let mut workspace = Workspace::new(Editor::new());
+        workspace.handle_key(KeyPress::ctrl('\\')); // split into columns -> 2 panes
+        workspace.handle_key(alt(KeyCode::Char('\\'))); // split the focused pane into rows -> 3
+        assert_eq!(workspace.pane_count(), 3);
+        // The root is a Columns split whose second child is itself a Rows split (a grid).
+        let Node::Split { dir, second, .. } = &workspace.root else {
+            panic!("root should be a split");
+        };
+        assert_eq!(*dir, Split::Columns);
+        assert!(matches!(
+            **second,
+            Node::Split {
+                dir: Split::Rows,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resize_adjusts_the_enclosing_split_ratio() {
+        let mut workspace = Workspace::new(Editor::new());
+        workspace.handle_key(KeyPress::ctrl('\\')); // 2 columns, focus on the second pane
+        workspace.handle_key(alt(KeyCode::Up)); // grow the focused (second) pane
+        let Node::Split { ratio, .. } = &workspace.root else {
+            panic!("root should be a split");
+        };
+        assert!(
+            *ratio < 50,
+            "growing the second pane lowers the first's ratio: {ratio}"
+        );
+        workspace.handle_key(alt(KeyCode::Down)); // shrink it back
+        let Node::Split { ratio, .. } = &workspace.root else {
+            unreachable!()
+        };
+        assert_eq!(*ratio, 50);
+    }
+
+    #[test]
+    fn close_pane_keeps_the_buffer_and_collapses_the_split() {
         let mut workspace = Workspace::new(Editor::new());
         workspace.handle_key(KeyPress::ctrl('\\')); // 2 panes, 2 editors
         workspace.handle_key(KeyPress::ctrl('w')); // close focused pane
-        assert_eq!(workspace.panes.len(), 1);
+        assert_eq!(workspace.pane_count(), 1);
         assert_eq!(workspace.editors.len(), 2); // the buffer survives as a tab
+        assert!(matches!(workspace.root, Node::Leaf(_))); // the split collapsed
     }
 
     #[test]
@@ -430,7 +685,6 @@ mod tests {
         workspace.set_tab_width(3);
         workspace.active_mut().execute("indent");
         assert_eq!(workspace.active().buffer().text(), "   ");
-        // A buffer opened afterwards inherits the configured width.
         workspace.open(Editor::new());
         workspace.active_mut().execute("indent");
         assert_eq!(workspace.active().buffer().text(), "   ");
@@ -459,18 +713,19 @@ mod tests {
     }
 
     #[test]
-    fn pane_rects_tile_columns_with_dividers() {
-        // width 10, two columns: 1 divider, 9 cells split 5 + 4.
-        let rects = pane_rects(Rect::new(0, 0, 10, 4), Split::Columns, 2).unwrap();
-        assert_eq!(rects, vec![Rect::new(0, 0, 5, 4), Rect::new(6, 0, 4, 4)]);
-        // The divider sits at column 5 (just past the first pane).
-        assert_eq!(rects[0].right(), 5);
+    fn split_area_columns_reserves_a_divider() {
+        // width 10 at 50%: 1 divider, 9 cells split 4 + 5.
+        let (first, divider, second) = split_area(Rect::new(0, 0, 10, 4), Split::Columns, 50);
+        assert_eq!(first, Rect::new(0, 0, 4, 4));
+        assert_eq!(divider, Some(Rect::new(4, 0, 1, 4)));
+        assert_eq!(second, Rect::new(5, 0, 5, 4));
     }
 
     #[test]
-    fn pane_rects_bail_when_too_small() {
-        // Three columns need ≥3 cells + 2 dividers; width 4 cannot tile them.
-        assert!(pane_rects(Rect::new(0, 0, 4, 4), Split::Columns, 3).is_none());
+    fn first_size_clamps_so_both_children_survive() {
+        assert_eq!(first_size(9, 50), 4);
+        assert_eq!(first_size(9, 0), 1); // never zero
+        assert_eq!(first_size(9, 100), 8); // never the whole span
     }
 
     #[test]
@@ -487,16 +742,14 @@ mod tests {
         let area = surface.area();
         workspace.render(&mut surface, area, &theme, true);
 
-        // The tab bar (row 0) lists the open buffers (both unsaved → `[scratch]`).
         let tabs: String = (0..surface.width())
             .filter_map(|x| surface.cell(x, 0).map(|c| c.symbol))
             .collect();
         assert!(
             tabs.contains("scratch"),
-            "tab bar should list the buffers: {tabs:?}"
+            "tab bar lists the buffers: {tabs:?}"
         );
 
-        // A vertical divider appears somewhere in the body.
         let has_divider = (0..surface.width()).any(|x| {
             (1..surface.height()).any(|y| surface.cell(x, y).is_some_and(|c| c.symbol == '│'))
         });
