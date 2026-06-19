@@ -408,7 +408,7 @@ impl App {
         self.finder = None;
         match action {
             Action::OpenFile(path) => self.open_path(&path),
-            Action::RunCommand(name) => self.workspace.active_mut().execute(&name),
+            Action::RunCommand(name) => self.workspace.execute(&name),
         }
     }
 
