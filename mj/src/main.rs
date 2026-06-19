@@ -146,7 +146,17 @@ fn main() -> ExitCode {
 /// Unless `safe_mode` is set, the Nickel manifest is loaded and applied before launch.
 fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
     let mut editors = Vec::with_capacity(paths.len());
+    let mut initial_info: Option<std::path::PathBuf> = None;
     for path in paths {
+        // The first `.info` argument opens in the built-in Info reader, not the text editor.
+        if initial_info.is_none()
+            && std::path::Path::new(path)
+                .extension()
+                .is_some_and(|e| e == "info")
+        {
+            initial_info = Some(path.into());
+            continue;
+        }
         match Buffer::open(path) {
             Ok(buffer) => editors.push(Editor::with_buffer(buffer)),
             Err(error) => {
@@ -162,7 +172,7 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
     if !safe_mode {
         apply_config(&mut workspace);
     }
-    match tui::run(workspace) {
+    match tui::run(workspace, initial_info) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: terminal error: {error}");

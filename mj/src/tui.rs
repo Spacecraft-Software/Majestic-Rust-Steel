@@ -26,7 +26,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods};
-use majestic_core::{Action, Editor, FileTree, Finder, HelpOverlay, Workspace};
+use majestic_core::{Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, Workspace};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -99,6 +99,7 @@ struct App {
     terminal: Option<PtyTerminal>,
     finder: Option<Finder>,
     help: Option<HelpOverlay>,
+    info: Option<InfoReader>,
     focus: Focus,
 }
 
@@ -111,6 +112,7 @@ impl App {
             terminal: None,
             finder: None,
             help: None,
+            info: None,
             focus: Focus::Editor,
         }
     }
@@ -143,7 +145,10 @@ impl App {
         let (body, status) = surface.area().split_bottom(1);
         let main = self.render_sidebar(surface, body, theme);
 
-        if self.terminal.is_some() && main.height > MIN_EDITOR_ROWS + 1 {
+        if let Some(info) = self.info.as_ref() {
+            // The Info reader takes over the editor region (the sidebar + status bar remain).
+            info.render(surface, main, theme);
+        } else if self.terminal.is_some() && main.height > MIN_EDITOR_ROWS + 1 {
             let panel_rows = PANEL_ROWS.min(main.height - (MIN_EDITOR_ROWS + 1));
             let (editor_area, block) = main.split_bottom(panel_rows + 1);
             let (divider, panel_area) = block.split_top(1);
@@ -241,6 +246,10 @@ impl App {
             self.finder_key(key);
             return Ok(());
         }
+        if self.info.is_some() {
+            self.info_key(key);
+            return Ok(());
+        }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
                 "Key Bindings (Esc to close)",
@@ -309,6 +318,17 @@ impl App {
 
     /// Opens `path` as a new buffer in the workspace and moves focus to the editor.
     fn open_path(&mut self, path: &Path) {
+        // GNU Info documents open in the built-in reader (M1 §5.7) rather than the text editor.
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "info")
+        {
+            if let Ok(reader) = InfoReader::open(path) {
+                self.info = Some(reader);
+                self.focus = Focus::Editor;
+                return;
+            }
+        }
         if let Ok(buffer) = majestic_core::Buffer::open(path) {
             self.workspace.open(Editor::with_buffer(buffer));
             self.focus = Focus::Editor;
@@ -392,6 +412,30 @@ impl App {
         }
     }
 
+    /// Routes a key to the open Info reader: `n`/`p`/`u` navigate, Enter follows the selected
+    /// menu entry, `l` goes back, arrows/Page scroll and move the menu selection, `q`/Esc closes.
+    fn info_key(&mut self, key: KeyPress) {
+        if key.code == KeyCode::Escape || key == KeyPress::char('q') {
+            self.info = None;
+            return;
+        }
+        let Some(info) = self.info.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('n') => info.next(),
+            KeyCode::Char('p') => info.prev(),
+            KeyCode::Char('u') => info.up(),
+            KeyCode::Char('l') => info.back(),
+            KeyCode::Enter => info.enter(),
+            KeyCode::Up => info.select_up(),
+            KeyCode::Down => info.select_down(),
+            KeyCode::PageUp => info.scroll_up(10),
+            KeyCode::PageDown | KeyCode::Char(' ') => info.scroll_down(10),
+            _ => {}
+        }
+    }
+
     /// Routes a key to the open help overlay: arrows/Page scroll, Esc or F1 close.
     fn help_key(&mut self, key: KeyPress) {
         if key.code == KeyCode::Escape || key == HELP_KEY {
@@ -462,13 +506,16 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
 ///
 /// # Errors
 /// Returns any terminal I/O error from setup, reading events, or rendering.
-pub(crate) fn run(workspace: Workspace) -> io::Result<()> {
+pub(crate) fn run(workspace: Workspace, initial_info: Option<PathBuf>) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let theme = Theme::steelbore();
     let (columns, lines) = terminal::size()?;
     let mut screen = Screen::new(columns, lines, theme.base_style());
     let mut out = io::stdout();
     let mut app = App::new(workspace);
+    if let Some(path) = initial_info {
+        app.open_path(&path); // an `.info` launch argument opens the reader
+    }
 
     loop {
         app.reap_dead_terminal();
@@ -644,6 +691,40 @@ mod tests {
             tail.contains("F12"),
             "status bar shows the terminal hint: {tail:?}"
         );
+    }
+
+    #[test]
+    fn dot_info_opens_in_the_reader_and_q_closes_it() {
+        let dir = std::env::temp_dir().join(format!("mj-info-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sample.info");
+        std::fs::write(
+            &path,
+            "\u{001f}\nFile: sample.info,  Node: Top,  Up: (dir)\n\nHello, info world.\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(Workspace::new(Editor::new()));
+        app.open_path(&path);
+        assert!(app.info.is_some(), ".info opens in the Info reader");
+
+        // The reader renders its body into the editor region.
+        let theme = Theme::steelbore();
+        let mut surface = Buffer::new(60, 6, theme.base_style());
+        app.render(&mut surface, &theme);
+        let mut text = String::new();
+        for y in 0..surface.height() {
+            for x in 0..surface.width() {
+                if let Some(cell) = surface.cell(x, y) {
+                    text.push(cell.symbol);
+                }
+            }
+        }
+        assert!(text.contains("Hello, info world."), "node body is shown");
+
+        app.handle_key(KeyPress::char('q'), 60, 6).unwrap();
+        assert!(app.info.is_none(), "q closes the reader");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
