@@ -13,6 +13,7 @@
 //! keys are encoded to bytes and written to the PTY. Each frame is presented through a Penumbra
 //! [`Screen`]. The editor model itself is backend-agnostic and tested headless.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,6 +30,7 @@ use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
     Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector, Session, Workspace,
 };
+use majestic_lsp::LspManager;
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -104,6 +106,11 @@ struct App {
     info: Option<InfoReader>,
     /// The first-run profile picker; `Some` until the user chooses (modal while open).
     selector: Option<ProfileSelector>,
+    /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
+    lsp: LspManager,
+    /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
+    /// is not re-synced each frame).
+    lsp_synced: HashMap<PathBuf, u64>,
     focus: Focus,
 }
 
@@ -118,7 +125,39 @@ impl App {
             help: None,
             info: None,
             selector: None,
+            lsp: LspManager::with_defaults(),
+            lsp_synced: HashMap::new(),
             focus: Focus::Editor,
+        }
+    }
+
+    /// Reconciles the focused buffer with its language server and applies any published
+    /// diagnostics. Cheap each frame: it only sends `didOpen`/`didChange` when the buffer's
+    /// revision changed, and `poll` is non-blocking (servers start on a background thread).
+    fn sync_lsp(&mut self) {
+        let active = {
+            let editor = self.workspace.active();
+            editor
+                .buffer()
+                .path()
+                .map(|path| (path, editor.buffer().revision()))
+        };
+        if let Some((path, revision)) = active {
+            if self.lsp.handles(&path) && self.lsp_synced.get(&path).copied() != Some(revision) {
+                let first = !self.lsp_synced.contains_key(&path);
+                let text = self.workspace.active().buffer().text();
+                let result = if first {
+                    self.lsp.open(&path, &text)
+                } else {
+                    self.lsp.change(&path, &text)
+                };
+                if result.is_ok() {
+                    self.lsp_synced.insert(path, revision);
+                }
+            }
+        }
+        for (path, diagnostics) in self.lsp.poll() {
+            self.workspace.apply_diagnostics(&path, &diagnostics);
         }
     }
 
@@ -151,6 +190,7 @@ impl App {
     /// Draws the sidebar, the editor area, the bottom terminal panel (when present), and the
     /// status bar — the full UI.md layout.
     fn render(&mut self, surface: &mut Buffer, theme: &Theme) {
+        self.sync_lsp(); // reconcile document sync + apply diagnostics before drawing
         surface.clear(theme.base_style());
         let (body, status) = surface.area().split_bottom(1);
         let main = self.render_sidebar(surface, body, theme);

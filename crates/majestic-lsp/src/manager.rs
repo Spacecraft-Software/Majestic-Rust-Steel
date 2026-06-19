@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread::{self, JoinHandle};
 
 use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, PublishDiagnosticsParams, Uri};
 use majestic_core::{Diagnostic, Severity};
@@ -47,6 +48,22 @@ struct DocState {
     language_id: String,
     version: i32,
     text: String,
+    /// The `file://` URI sent to the server — used to match its `publishDiagnostics` back to this
+    /// document (the URI is canonicalized, so it may differ from the editor's path).
+    uri: Uri,
+}
+
+/// A language server's lifecycle state. Startup (spawn + the blocking `initialize` handshake) runs
+/// on a background thread so opening a file never freezes the editor; the server is used only once
+/// it is [`ServerSlot::Ready`].
+#[derive(Debug)]
+enum ServerSlot {
+    /// Spawning + initializing on a background thread.
+    Starting(JoinHandle<io::Result<LanguageServer>>),
+    /// Initialized and ready for sync/diagnostics.
+    Ready(LanguageServer),
+    /// Startup failed (e.g. the server program is not installed); not retried.
+    Failed,
 }
 
 /// Manages language servers and open-document sync.
@@ -54,8 +71,8 @@ struct DocState {
 pub struct LspManager {
     /// Server launch config keyed by file extension (without the dot), e.g. `rs`.
     configs: HashMap<String, ServerConfig>,
-    /// Running servers keyed by `languageId`.
-    servers: HashMap<String, LanguageServer>,
+    /// Servers keyed by `languageId`, each in its lifecycle state.
+    servers: HashMap<String, ServerSlot>,
     /// Open documents keyed by path.
     docs: HashMap<PathBuf, DocState>,
 }
@@ -81,10 +98,11 @@ impl LspManager {
         self.configs.insert(ext.to_owned(), config);
     }
 
-    /// Registers an already-connected server for `language_id` (tests inject a mock this way,
-    /// bypassing process spawning).
+    /// Registers an already-initialized server for `language_id` as [`ServerSlot::Ready`] (tests
+    /// inject a mock this way, bypassing process spawning + the handshake).
     pub fn register_server(&mut self, language_id: &str, server: LanguageServer) {
-        self.servers.insert(language_id.to_owned(), server);
+        self.servers
+            .insert(language_id.to_owned(), ServerSlot::Ready(server));
     }
 
     /// Whether a server is configured for `path`'s extension.
@@ -102,19 +120,22 @@ impl LspManager {
         let Some(config) = self.config_for(path) else {
             return Ok(());
         };
-        self.ensure_server(path, &config)?;
-        let language_id = config.language_id;
-        if let Some(server) = self.servers.get(&language_id) {
-            server.did_open(file_uri(path)?, &language_id, 1, text.to_owned())?;
-        }
+        self.ensure_server_starting(&config, path);
+        let uri = file_uri(path)?;
         self.docs.insert(
             path.to_owned(),
             DocState {
-                language_id,
+                language_id: config.language_id.clone(),
                 version: 1,
                 text: text.to_owned(),
+                uri: uri.clone(),
             },
         );
+        // If the server is already up, notify now; otherwise `poll` sends `didOpen` once it is
+        // ready (with the document's then-current text, absorbing any edits made meanwhile).
+        if let Some(ServerSlot::Ready(server)) = self.servers.get(&config.language_id) {
+            server.did_open(uri, &config.language_id, 1, text.to_owned())?;
+        }
         Ok(())
     }
 
@@ -129,38 +150,82 @@ impl LspManager {
         };
         doc.version += 1;
         text.clone_into(&mut doc.text);
-        let (version, language_id) = (doc.version, doc.language_id.clone());
-        if let Some(server) = self.servers.get(&language_id) {
-            server.did_change(file_uri(path)?, version, text.to_owned())?;
+        let (version, language_id, uri) = (doc.version, doc.language_id.clone(), doc.uri.clone());
+        // Only a ready server is notified; a still-starting one picks up the new text via the
+        // `didOpen` sent on ready.
+        if let Some(ServerSlot::Ready(server)) = self.servers.get(&language_id) {
+            server.did_change(uri, version, text.to_owned())?;
         }
         Ok(())
     }
 
-    /// Drains every server's published diagnostics, returning them per document as byte-range
-    /// [`Diagnostic`]s (converted against the document's current text). The host applies each list
-    /// to the matching editor. Non-blocking.
-    #[must_use]
-    pub fn poll(&self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+    /// Advances any finished startups and drains every ready server's published diagnostics,
+    /// returning them per document as byte-range [`Diagnostic`]s (converted against the document's
+    /// current text). The host calls this each frame and applies each list to the matching editor.
+    /// Non-blocking — joining a startup thread only happens once it has finished.
+    pub fn poll(&mut self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+        self.advance_startups();
         let mut updates = Vec::new();
-        for server in self.servers.values() {
-            for published in server.diagnostics() {
-                if let Some(update) = self.convert(&published) {
-                    updates.push(update);
+        for slot in self.servers.values() {
+            if let ServerSlot::Ready(server) = slot {
+                for published in server.diagnostics() {
+                    if let Some(update) = self.convert(&published) {
+                        updates.push(update);
+                    }
                 }
             }
         }
         updates
     }
 
+    /// Promotes any background startup that has finished to [`ServerSlot::Ready`] (or `Failed`),
+    /// sending `didOpen` for every already-open document of that language on success.
+    fn advance_startups(&mut self) {
+        let finished: Vec<String> = self
+            .servers
+            .iter()
+            .filter(
+                |(_, slot)| matches!(slot, ServerSlot::Starting(handle) if handle.is_finished()),
+            )
+            .map(|(language, _)| language.clone())
+            .collect();
+        for language in finished {
+            let Some(ServerSlot::Starting(handle)) = self.servers.remove(&language) else {
+                continue;
+            };
+            let slot = match handle.join() {
+                Ok(Ok(server)) => {
+                    for doc in self.docs.values() {
+                        if doc.language_id == language {
+                            let _ = server.did_open(
+                                doc.uri.clone(),
+                                &language,
+                                doc.version,
+                                doc.text.clone(),
+                            );
+                        }
+                    }
+                    ServerSlot::Ready(server)
+                }
+                _ => ServerSlot::Failed,
+            };
+            self.servers.insert(language, slot);
+        }
+    }
+
     fn convert(&self, published: &PublishDiagnosticsParams) -> Option<(PathBuf, Vec<Diagnostic>)> {
-        let path = uri_to_path(&published.uri)?;
-        let text = self.docs.get(&path).map_or("", |doc| doc.text.as_str());
+        // Match the published URI back to the document we opened (the URI is canonicalized, so it
+        // need not equal the editor's path) and convert against that document's current text.
+        let (path, doc) = self
+            .docs
+            .iter()
+            .find(|(_, doc)| doc.uri.as_str() == published.uri.as_str())?;
         let diagnostics = published
             .diagnostics
             .iter()
-            .map(|diagnostic| to_core_diagnostic(text, diagnostic))
+            .map(|diagnostic| to_core_diagnostic(&doc.text, diagnostic))
             .collect();
-        Some((path, diagnostics))
+        Some((path.clone(), diagnostics))
     }
 
     fn config_for(&self, path: &Path) -> Option<ServerConfig> {
@@ -168,16 +233,24 @@ impl LspManager {
         self.configs.get(extension).cloned()
     }
 
-    fn ensure_server(&mut self, path: &Path, config: &ServerConfig) -> io::Result<()> {
+    /// Starts a server for `config`'s language on a background thread if one is not already
+    /// present. The thread spawns the process and runs the blocking `initialize` handshake; the
+    /// editor keeps running and `poll` adopts the server once it is ready.
+    fn ensure_server_starting(&mut self, config: &ServerConfig, path: &Path) {
         if self.servers.contains_key(&config.language_id) {
-            return Ok(());
+            return;
         }
-        let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
-        let server = LanguageServer::spawn(&config.command, &args)?;
-        let root = path.parent().unwrap_or_else(|| Path::new("."));
-        server.initialize(file_uri(root)?)?;
-        self.servers.insert(config.language_id.clone(), server);
-        Ok(())
+        let command = config.command.clone();
+        let args = config.args.clone();
+        let root = project_root(path);
+        let handle = thread::spawn(move || {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let server = LanguageServer::spawn(&command, &arg_refs)?;
+            server.initialize(file_uri(&root)?)?;
+            Ok(server)
+        });
+        self.servers
+            .insert(config.language_id.clone(), ServerSlot::Starting(handle));
     }
 }
 
@@ -232,9 +305,20 @@ fn position_to_byte(text: &str, line: u32, character: u32) -> usize {
     text.len()
 }
 
-/// Best-effort `file://` URI → filesystem path (v1 assumes no percent-encoding).
-fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    uri.as_str().strip_prefix("file://").map(PathBuf::from)
+/// The project root the language server should be pointed at: the nearest ancestor of `path`
+/// containing a `Cargo.toml`, falling back to `path`'s directory.
+fn project_root(path: &Path) -> PathBuf {
+    let start = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut dir = start;
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return start.to_path_buf(),
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -314,5 +398,56 @@ mod tests {
         assert_eq!(diagnostics[0].message, "cannot find value `oops`");
 
         mock.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_reports_a_diagnostic() {
+        use std::fs;
+
+        // A throwaway cargo project with a deliberate type error.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source = "fn main() {\n    let _x: i32 = \"a type error\";\n}\n";
+        fs::write(&main_rs, source).unwrap();
+
+        // The manager spawns + initializes rust-analyzer on a background thread; poll until it
+        // finishes analyzing and publishes diagnostics (analysis takes a few seconds).
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        let mut found = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            for (path, diagnostics) in manager.poll() {
+                if path == main_rs && !diagnostics.is_empty() {
+                    found = diagnostics;
+                }
+            }
+            if !found.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !found.is_empty(),
+            "rust-analyzer should report at least one diagnostic for a type error"
+        );
+        // The byte ranges the editor underlines must be real spans within the document — this is
+        // exactly the data the App applies to the buffer.
+        assert!(
+            found
+                .iter()
+                .any(|d| d.range.start < d.range.end && d.range.end <= source.len()),
+            "a diagnostic should cover a non-empty span inside the document: {found:?}"
+        );
     }
 }
