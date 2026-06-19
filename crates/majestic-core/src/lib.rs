@@ -37,6 +37,8 @@ mod finder;
 mod fuzzy;
 mod git;
 mod syntax;
+#[cfg(feature = "syntect-highlighting")]
+mod syntect_hl;
 mod workspace;
 
 #[doc(inline)]

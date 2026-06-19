@@ -295,6 +295,53 @@ fn dim(fg: Rgb, bg: Rgb) -> Rgb {
     )
 }
 
+/// The hybrid highlighter: tree-sitter for its structural core, syntect for the broad regex tier.
+///
+/// Routing precedence: a file goes to **tree-sitter** when a grammar is compiled in for it
+/// (structural parsing, §6.9), otherwise to **syntect** (broad coverage from `.sublime-syntax`
+/// data), otherwise nothing. Both engines yield the same `SpanLayer<HighlightKind>`, so the
+/// background worker is engine-agnostic.
+enum Engine {
+    // Boxed: a `SyntaxHighlighter` (tree-sitter config + highlighter) dwarfs the syntect handle.
+    TreeSitter(Box<SyntaxHighlighter>),
+    #[cfg(feature = "syntect-highlighting")]
+    Syntect(crate::syntect_hl::SyntectHighlighter),
+}
+
+impl Engine {
+    /// Whether either tier can highlight `path`.
+    fn supports(path: &Path) -> bool {
+        if SyntaxHighlighter::supports(path) {
+            return true;
+        }
+        #[cfg(feature = "syntect-highlighting")]
+        if crate::syntect_hl::SyntectHighlighter::supports(path) {
+            return true;
+        }
+        false
+    }
+
+    /// Builds the highlighter for `path`, preferring the structural tree-sitter tier.
+    fn for_path(path: &Path) -> Option<Self> {
+        if let Some(highlighter) = SyntaxHighlighter::for_path(path) {
+            return Some(Self::TreeSitter(Box::new(highlighter)));
+        }
+        #[cfg(feature = "syntect-highlighting")]
+        if let Some(highlighter) = crate::syntect_hl::SyntectHighlighter::for_path(path) {
+            return Some(Self::Syntect(highlighter));
+        }
+        None
+    }
+
+    fn highlight(&mut self, source: &[u8]) -> SpanLayer<HighlightKind> {
+        match self {
+            Self::TreeSitter(highlighter) => highlighter.highlight(source),
+            #[cfg(feature = "syntect-highlighting")]
+            Self::Syntect(highlighter) => highlighter.highlight(source),
+        }
+    }
+}
+
 /// A finished highlight result, tagged with the buffer revision it was computed from.
 pub(crate) struct Highlighted {
     /// The buffer revision the snapshot reflected.
@@ -328,7 +375,7 @@ impl HighlightWorker {
     /// Spawns a worker for `path`'s language, or `None` if the file type is unsupported.
     #[must_use]
     pub(crate) fn for_path(path: &Path) -> Option<Self> {
-        if !SyntaxHighlighter::supports(path) {
+        if !Engine::supports(path) {
             return None;
         }
         let path = path.to_path_buf();
@@ -386,7 +433,7 @@ impl Drop for HighlightWorker {
 /// The worker thread body: own a highlighter, then highlight the newest pending snapshot in a
 /// loop, streaming results back until the editor (and its request sender) is gone.
 fn run_worker(path: &Path, requests: &Receiver<Request>, results: &Sender<Highlighted>) {
-    let Some(mut highlighter) = SyntaxHighlighter::for_path(path) else {
+    let Some(mut highlighter) = Engine::for_path(path) else {
         return; // unsupported despite `supports` — exit; the editor simply gets no highlights
     };
     while let Ok(request) = requests.recv() {
@@ -410,8 +457,25 @@ fn run_worker(path: &Path, requests: &Receiver<Request>, results: &Sender<Highli
 
 #[cfg(test)]
 mod tests {
-    use super::{HighlightKind, SyntaxHighlighter};
+    use super::{Engine, HighlightKind, SyntaxHighlighter};
     use std::path::Path;
+
+    #[cfg(all(feature = "lang-rust", feature = "syntect-highlighting"))]
+    #[test]
+    fn routing_prefers_tree_sitter_then_falls_back_to_syntect() {
+        // Rust has a tree-sitter grammar (structural tier) — it must win.
+        assert!(matches!(
+            Engine::for_path(Path::new("x.rs")),
+            Some(Engine::TreeSitter(_))
+        ));
+        // Ruby has no tree-sitter grammar wired but is in syntect's default set — broad tier.
+        assert!(matches!(
+            Engine::for_path(Path::new("x.rb")),
+            Some(Engine::Syntect(_))
+        ));
+        // A language neither tier knows is unsupported.
+        assert!(Engine::for_path(Path::new("x.unknownext")).is_none());
+    }
 
     #[cfg(feature = "lang-rust")]
     #[test]

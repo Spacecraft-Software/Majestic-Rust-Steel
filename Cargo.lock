@@ -1625,6 +1625,7 @@ dependencies = [
  "keymaker",
  "penumbra",
  "stratum",
+ "syntect",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",

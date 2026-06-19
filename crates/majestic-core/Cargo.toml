@@ -37,11 +37,24 @@ tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-erlang = { version = "0.19.0", optional = true }
 tree-sitter-powershell = { version = "0.26.4", optional = true }
 tree-sitter-typescript = { version = "0.23.2", optional = true }
+# syntect drives the broad "regex tier" of the hybrid highlighter: ~dozens of languages from a
+# compact serialized `.sublime-syntax` set instead of one compiled C grammar each. Pure-Rust
+# `regex-fancy` backend (no Oniguruma C) keeps memory-safety first (§3.1). `yaml-load` lets us
+# fold in extra `.sublime-syntax` definitions for languages absent from the bundled set.
+syntect = { version = "5.3", default-features = false, optional = true, features = [
+    "parsing",
+    "default-syntaxes",
+    "yaml-load",
+    "regex-fancy",
+] }
 
 [features]
-# Lean default: the common languages keep the release binary under the §7 25 MB target
-# (~21 MB). Build `--features grammars-all` for every supported language (~28 MB).
-default = ["grammars-common"]
+# Lean default: the common tree-sitter grammars (structural tier) + syntect (broad regex tier)
+# keep the release binary under the §7 25 MB target. Build `--features grammars-all` for every
+# tree-sitter grammar; syntect already covers the long tail of languages as data.
+default = ["grammars-common", "syntect-highlighting"]
+# The broad regex tier (syntect). On by default; disable for a tree-sitter-only build.
+syntect-highlighting = ["dep:syntect"]
 grammars-common = ["lang-rust", "lang-python", "lang-go", "lang-c", "lang-bash", "lang-json"]
 grammars-extra = [
     "lang-nix",
