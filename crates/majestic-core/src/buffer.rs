@@ -1,29 +1,31 @@
 // SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The editable [`Buffer`] — a document model over Stratum's rope and undo tree.
+//! The editable [`Buffer`] — a *view* over a shared [`Document`].
 //!
-//! A [`Buffer`] owns a [`stratum::UndoTree`] (whose current node is the live rope), a byte
-//! cursor kept on a `char` boundary, an optional selection anchor, and a goal column for
-//! vertical motion. Every edit goes through one path that records a new undo node and moves
-//! the cursor, so undo/redo and editing stay consistent. Each edit is appended to a
-//! crash-safe journal; opening a file replays any journal a crashed session left behind
-//! (recovery), and saving checkpoints a fresh journal.
+//! A [`Document`] owns a [`stratum::UndoTree`] (whose current node is the live rope), the file
+//! path, the crash-safe journal, and the dirty/revision flags — the *document* state. A
+//! [`Buffer`] is a lightweight **view** holding an `Rc<RefCell<Document>>` plus per-view cursor,
+//! selection anchor, and goal column. Multiple `Buffer`s can share one `Document` (two views of
+//! one buffer): edits and undo are shared, while each view scrolls and places its cursor
+//! independently. Every edit records a new undo node and is appended to the journal; opening a
+//! file replays any journal a crashed session left behind (recovery), and saving checkpoints a
+//! fresh journal.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use stratum::{replay, EditOp, Journal, Point, Rope, UndoTree};
 
-/// An editable text document: content, cursor, selection, and undo history.
+/// The shared document: content + undo history + file I/O + journal. Shared across views via
+/// `Rc<RefCell<Document>>`; cursor/selection/viewport are per-view (see [`Buffer`]).
 #[derive(Debug)]
-pub struct Buffer {
+pub struct Document {
     history: UndoTree,
-    cursor: usize,
-    selection_anchor: Option<usize>,
-    goal_column: Option<usize>,
     path: Option<PathBuf>,
     journal: Option<Journal>,
     journal_error: Option<io::Error>,
@@ -32,25 +34,10 @@ pub struct Buffer {
     revision: u64,
 }
 
-impl Buffer {
-    /// Creates an empty, unnamed buffer.
-    #[must_use]
-    pub fn scratch() -> Self {
-        Self::from_rope(Rope::new(), None)
-    }
-
-    /// Creates an unnamed buffer holding `text`.
-    #[must_use]
-    pub fn from_text(text: &str) -> Self {
-        Self::from_rope(Rope::from(text), None)
-    }
-
+impl Document {
     fn from_rope(rope: Rope, path: Option<PathBuf>) -> Self {
         Self {
             history: UndoTree::new(rope),
-            cursor: 0,
-            selection_anchor: None,
-            goal_column: None,
             path,
             journal: None,
             journal_error: None,
@@ -60,12 +47,7 @@ impl Buffer {
         }
     }
 
-    /// Opens `path`, reading its contents (an empty buffer if the file does not exist).
-    ///
-    /// # Errors
-    /// Returns an I/O error if the file exists but cannot be read.
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let path = path.into();
+    fn open(path: PathBuf) -> io::Result<Self> {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -92,27 +74,23 @@ impl Buffer {
             (base, Journal::create(&jpath, base_len)?, false)
         };
 
-        let mut buffer = Self::from_rope(rope, Some(path));
-        buffer.journal = Some(journal);
-        buffer.recovered = recovered;
-        buffer.dirty = recovered; // recovered edits are unsaved
-        Ok(buffer)
+        let mut doc = Self::from_rope(rope, Some(path));
+        doc.journal = Some(journal);
+        doc.recovered = recovered;
+        doc.dirty = recovered; // recovered edits are unsaved
+        Ok(doc)
     }
 
-    /// Writes the buffer to its path and clears the dirty flag.
-    ///
-    /// # Errors
-    /// Returns [`io::ErrorKind::InvalidInput`] if the buffer has no path, or any write error.
-    pub fn save(&mut self) -> io::Result<()> {
+    fn save(&mut self) -> io::Result<()> {
         let Some(path) = self.path.clone() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "buffer has no path",
             ));
         };
-        fs::write(&path, self.text())?;
+        fs::write(&path, self.history.current_rope().to_string())?;
         // Checkpoint: the file now holds the current content, so start a fresh journal.
-        let base_len = self.rope().len_bytes() as u64;
+        let base_len = self.history.current_rope().len_bytes() as u64;
         self.journal = Some(Journal::create(&journal_path(&path), base_len)?);
         self.journal_error = None;
         self.recovered = false;
@@ -120,18 +98,126 @@ impl Buffer {
         Ok(())
     }
 
+    /// A cheap clone of the live rope (an `Arc` bump) — used in place of a `&Rope` borrow, which
+    /// cannot outlive the `RefCell` guard.
+    fn rope(&self) -> Rope {
+        self.history.current_rope().clone()
+    }
+
+    fn apply_edit(&mut self, range: Range<usize>, text: &str) {
+        let start = range.start;
+        let old_len = range.end - range.start;
+        let (next, edit) = self.history.current_rope().edit(range, text);
+        self.history.record(next, edit);
+        if let Some(journal) = self.journal.as_mut() {
+            if let Err(error) = journal.append(&EditOp::new(start, old_len, text)) {
+                // Degrade gracefully: stop journaling and keep the error to surface.
+                self.journal = None;
+                self.journal_error = Some(error);
+            }
+        }
+        self.dirty = true;
+        self.revision += 1;
+    }
+
+    fn undo(&mut self) -> bool {
+        if self.history.undo().is_some() {
+            self.dirty = true;
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn redo(&mut self) -> bool {
+        if self.history.redo().is_some() {
+            self.dirty = true;
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A view over a shared [`Document`]: the document plus a per-view cursor, selection, and goal
+/// column. Clone a view with [`Buffer::view`] to show one document in two panes.
+#[derive(Clone, Debug)]
+pub struct Buffer {
+    doc: Rc<RefCell<Document>>,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    goal_column: Option<usize>,
+}
+
+impl Buffer {
+    /// Creates an empty, unnamed buffer.
+    #[must_use]
+    pub fn scratch() -> Self {
+        Self::from_rope(Rope::new(), None)
+    }
+
+    /// Creates an unnamed buffer holding `text`.
+    #[must_use]
+    pub fn from_text(text: &str) -> Self {
+        Self::from_rope(Rope::from(text), None)
+    }
+
+    fn from_rope(rope: Rope, path: Option<PathBuf>) -> Self {
+        Self::wrap(Document::from_rope(rope, path))
+    }
+
+    /// Wraps a freshly-built document in a first view (cursor at the start).
+    fn wrap(doc: Document) -> Self {
+        Self {
+            doc: Rc::new(RefCell::new(doc)),
+            cursor: 0,
+            selection_anchor: None,
+            goal_column: None,
+        }
+    }
+
+    /// A second view of the same document: shares text + undo + journal, with an independent
+    /// cursor (reset to the start) and no selection.
+    #[must_use]
+    pub fn view(&self) -> Self {
+        Self {
+            doc: Rc::clone(&self.doc),
+            cursor: 0,
+            selection_anchor: None,
+            goal_column: None,
+        }
+    }
+
+    /// Opens `path`, reading its contents (an empty buffer if the file does not exist).
+    ///
+    /// # Errors
+    /// Returns an I/O error if the file exists but cannot be read.
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        Ok(Self::wrap(Document::open(path.into())?))
+    }
+
+    /// Writes the buffer to its path and clears the dirty flag.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] if the buffer has no path, or any write error.
+    pub fn save(&mut self) -> io::Result<()> {
+        self.doc.borrow_mut().save()
+    }
+
     // --- Queries ---------------------------------------------------------------------
 
-    /// The live rope.
+    /// A cheap clone of the live rope (an `Arc` bump).
     #[must_use]
-    pub fn rope(&self) -> &Rope {
-        self.history.current_rope()
+    pub fn rope(&self) -> Rope {
+        self.doc.borrow().rope()
     }
 
     /// The buffer contents as a `String`.
     #[must_use]
     pub fn text(&self) -> String {
-        self.rope().to_string()
+        self.doc.borrow().history.current_rope().to_string()
     }
 
     /// The cursor's byte offset.
@@ -154,34 +240,38 @@ impl Buffer {
         rope.byte_to_char(self.cursor) - rope.byte_to_char(line_start)
     }
 
-    /// Whether the buffer has unsaved changes.
+    /// Whether the document has unsaved changes.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.doc.borrow().dirty
     }
 
-    /// The buffer's file path, if any.
+    /// The document's file path, if any.
     #[must_use]
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+    pub fn path(&self) -> Option<PathBuf> {
+        self.doc.borrow().path.clone()
     }
 
     /// A counter that increments on every content change (for cache invalidation).
     #[must_use]
     pub fn revision(&self) -> u64 {
-        self.revision
+        self.doc.borrow().revision
     }
 
-    /// Whether this buffer's content was recovered from a journal when opened.
+    /// Whether this document's content was recovered from a journal when opened.
     #[must_use]
     pub fn was_recovered(&self) -> bool {
-        self.recovered
+        self.doc.borrow().recovered
     }
 
-    /// The error that disabled journaling, if one occurred.
+    /// The message of the error that disabled journaling, if one occurred.
     #[must_use]
-    pub fn journal_error(&self) -> Option<&io::Error> {
-        self.journal_error.as_ref()
+    pub fn journal_error(&self) -> Option<String> {
+        self.doc
+            .borrow()
+            .journal_error
+            .as_ref()
+            .map(io::Error::to_string)
     }
 
     /// The selected byte range, if a (non-empty) selection is active.
@@ -255,7 +345,7 @@ impl Buffer {
 
     /// Undoes the last edit, if any; returns whether the buffer changed.
     pub fn undo(&mut self) -> bool {
-        if self.history.undo().is_some() {
+        if self.doc.borrow_mut().undo() {
             self.after_history_move();
             true
         } else {
@@ -265,7 +355,7 @@ impl Buffer {
 
     /// Redoes a previously undone edit, if any; returns whether the buffer changed.
     pub fn redo(&mut self) -> bool {
-        if self.history.redo().is_some() {
+        if self.doc.borrow_mut().redo() {
             self.after_history_move();
             true
         } else {
@@ -352,29 +442,17 @@ impl Buffer {
 
     fn apply_edit(&mut self, range: Range<usize>, text: &str) {
         let start = range.start;
-        let old_len = range.end - range.start;
-        let (next, edit) = self.rope().edit(range, text);
-        self.history.record(next, edit);
-        if let Some(journal) = self.journal.as_mut() {
-            if let Err(error) = journal.append(&EditOp::new(start, old_len, text)) {
-                // Degrade gracefully: stop journaling and keep the error to surface.
-                self.journal = None;
-                self.journal_error = Some(error);
-            }
-        }
+        self.doc.borrow_mut().apply_edit(range, text); // records undo, journals, bumps revision
         self.cursor = start + text.len();
         self.selection_anchor = None;
         self.goal_column = None;
-        self.dirty = true;
-        self.revision += 1;
     }
 
     fn after_history_move(&mut self) {
-        self.cursor = snap_to_boundary(self.rope(), self.cursor);
+        let rope = self.rope();
+        self.cursor = snap_to_boundary(&rope, self.cursor);
         self.selection_anchor = None;
         self.goal_column = None;
-        self.dirty = true;
-        self.revision += 1;
     }
 
     fn start_motion(&mut self, extend: bool) {

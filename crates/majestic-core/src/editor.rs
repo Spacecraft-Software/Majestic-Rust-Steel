@@ -9,6 +9,8 @@
 //! the visible lines, a reverse-video cursor cell, and a status line into a Penumbra buffer.
 //! The interactive `crossterm` loop and the `mj FILE` binary wire this up in M0 step 7.
 
+use std::path::Path;
+
 use keymaker::{cua, Dispatcher, KeyCode, Mods, Resolution};
 use penumbra::{char_width, Buffer as Surface, Cell, Rect, Style, Theme};
 
@@ -48,7 +50,7 @@ impl Editor {
     /// Creates an editor on `buffer` with the CUA keymap.
     #[must_use]
     pub fn with_buffer(buffer: Buffer) -> Self {
-        let highlighter = buffer.path().and_then(HighlightWorker::for_path);
+        let highlighter = buffer.path().as_deref().and_then(HighlightWorker::for_path);
         Self {
             buffer,
             clipboard: String::new(),
@@ -113,12 +115,13 @@ impl Editor {
 
     /// The buffer's display name: its file name, or `[scratch]` for an unsaved buffer.
     #[must_use]
-    pub fn display_name(&self) -> &str {
+    pub fn display_name(&self) -> String {
         self.buffer
             .path()
-            .and_then(|path| path.file_name())
+            .as_deref()
+            .and_then(Path::file_name)
             .and_then(|name| name.to_str())
-            .unwrap_or("[scratch]")
+            .map_or_else(|| "[scratch]".to_owned(), str::to_owned)
     }
 
     /// Feeds one key: runs the resolved command, waits on a prefix, or self-inserts.
@@ -288,7 +291,7 @@ impl Editor {
         let revision = self.buffer.revision();
         if self.requested_revision != Some(revision) {
             if let Some(worker) = self.highlighter.as_ref() {
-                worker.request(revision, self.buffer.rope().clone());
+                worker.request(revision, self.buffer.rope());
             }
             self.requested_revision = Some(revision);
         }
@@ -302,7 +305,7 @@ impl Editor {
         let revision = self.buffer.revision();
         if self.requested_revision != Some(revision) {
             if let Some(worker) = self.highlighter.as_ref() {
-                worker.request(revision, self.buffer.rope().clone());
+                worker.request(revision, self.buffer.rope());
             }
             self.requested_revision = Some(revision);
         }
