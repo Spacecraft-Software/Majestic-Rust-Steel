@@ -21,6 +21,39 @@ mod protocol;
 pub use daemon::Daemon;
 pub use protocol::{read_frame, write_frame, DaemonStatus, Request, Response};
 
+#[cfg(unix)]
+mod transport;
+
+/// The Unix-socket transport. Off Unix, the daemon is unsupported and these return an error.
+#[cfg(not(unix))]
+mod transport {
+    use std::io;
+
+    use crate::DaemonStatus;
+
+    fn unsupported<T>() -> io::Result<T> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the Majestic daemon requires a Unix platform",
+        ))
+    }
+
+    /// Stub: errors on a non-Unix platform.
+    pub fn run() -> io::Result<()> {
+        unsupported()
+    }
+    /// Stub: errors on a non-Unix platform.
+    pub fn status() -> io::Result<Option<DaemonStatus>> {
+        unsupported()
+    }
+    /// Stub: errors on a non-Unix platform.
+    pub fn stop() -> io::Result<bool> {
+        unsupported()
+    }
+}
+
+pub use transport::{run, status, stop};
+
 /// The daemon's Unix socket path: `$XDG_RUNTIME_DIR/majestic/daemon.sock`, else a path under the
 /// system temp directory. The serve loop creates the parent directory with `0700` permissions.
 #[must_use]
