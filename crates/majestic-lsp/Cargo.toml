@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "majestic-lsp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Majestic LSP client: JSON-RPC over a language server's stdio (PRD #1 §6.9)."
+
+[dependencies]
+morpheus = { version = "0.0.0", path = "../morpheus" }
+serde_json = "1.0.145"
+
+[lints]
+workspace = true
