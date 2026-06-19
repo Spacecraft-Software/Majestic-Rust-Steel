@@ -20,9 +20,9 @@ use syntect::util::LinesWithEndings;
 
 use crate::syntax::HighlightKind;
 
-/// The shared syntax set: syntect's bundled defaults (plus any extra `.sublime-syntax` folded in
-/// for languages the defaults omit). Built once, lazily, on first use — off the UI thread.
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+/// The shared syntax set: bat's extended `.sublime-syntax` collection (~150 languages) via
+/// `two-face`. Built once, lazily, on first use — off the UI thread.
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
 /// A syntect-backed highlighter bound to one language.
 pub(crate) struct SyntectHighlighter {
@@ -176,5 +176,16 @@ mod tests {
     #[test]
     fn unknown_extension_is_unsupported() {
         assert!(!SyntectHighlighter::supports(Path::new("notes.unknownext")));
+    }
+
+    #[test]
+    fn covers_languages_beyond_the_tree_sitter_core() {
+        // A sampling from bat's extended set that the tree-sitter tier does not wire.
+        for ext in ["nix", "swift", "kt", "dart", "toml", "zig", "asm", "adb"] {
+            assert!(
+                SyntectHighlighter::supports(Path::new(&format!("x.{ext}"))),
+                ".{ext} should be covered by the syntect tier"
+            );
+        }
     }
 }

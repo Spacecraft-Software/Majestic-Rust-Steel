@@ -43,9 +43,13 @@ tree-sitter-typescript = { version = "0.23.2", optional = true }
 # fold in extra `.sublime-syntax` definitions for languages absent from the bundled set.
 syntect = { version = "5.3", default-features = false, optional = true, features = [
     "parsing",
-    "default-syntaxes",
-    "yaml-load",
     "regex-fancy",
+] }
+# two-face bundles bat's extended `.sublime-syntax` set (~150 languages) for syntect — the data
+# that gives the broad tier its reach without one compiled grammar each. `syntect-fancy` keeps the
+# pure-Rust regex backend. It also exposes per-syntax license acknowledgements (§4.2 / §14.3).
+two-face = { version = "0.5", default-features = false, optional = true, features = [
+    "syntect-fancy",
 ] }
 
 [features]
@@ -53,8 +57,9 @@ syntect = { version = "5.3", default-features = false, optional = true, features
 # keep the release binary under the §7 25 MB target. Build `--features grammars-all` for every
 # tree-sitter grammar; syntect already covers the long tail of languages as data.
 default = ["grammars-common", "syntect-highlighting"]
-# The broad regex tier (syntect). On by default; disable for a tree-sitter-only build.
-syntect-highlighting = ["dep:syntect"]
+# The broad regex tier (syntect + bat's syntax set via two-face). On by default; disable for a
+# tree-sitter-only build.
+syntect-highlighting = ["dep:syntect", "dep:two-face"]
 grammars-common = ["lang-rust", "lang-python", "lang-go", "lang-c", "lang-bash", "lang-json"]
 grammars-extra = [
     "lang-nix",

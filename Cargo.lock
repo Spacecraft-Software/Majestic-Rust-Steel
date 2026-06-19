@@ -1640,6 +1640,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-scheme",
  "tree-sitter-typescript",
+ "two-face",
 ]
 
 [[package]]
@@ -3430,6 +3431,17 @@ checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
 dependencies = [
  "cc",
  "tree-sitter-language",
+]
+
+[[package]]
+name = "two-face"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b285c51f8a6ade109ed4566d33ac4fb289fb5d6cf87ed70908a5eaf65e948e34"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "syntect",
 ]
 
 [[package]]
