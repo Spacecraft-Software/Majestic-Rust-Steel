@@ -189,6 +189,7 @@ impl Editor {
             }
             "copy" => self.copy(),
             "cut" => self.cut(),
+            "kill-line" => self.kill_line(),
             "paste" => self.buffer.insert(&self.clipboard),
             "save" => self.save(),
             "find" => "find: not yet implemented (M1)".clone_into(&mut self.status),
@@ -209,6 +210,16 @@ impl Editor {
             self.clipboard = text;
             self.buffer.delete_selection();
             "cut".clone_into(&mut self.status);
+        }
+    }
+
+    /// Emacs `kill-line` (`C-k`): kills from the cursor to the line end (or the line break) and
+    /// puts the killed text on the clipboard so `paste` (`C-y` yank) restores it.
+    fn kill_line(&mut self) {
+        let killed = self.buffer.kill_line();
+        if !killed.is_empty() {
+            self.clipboard = killed;
+            "killed line".clone_into(&mut self.status);
         }
     }
 
@@ -599,5 +610,31 @@ mod tests {
             cell.style.attrs.reverse,
             "cursor should highlight `x` at column 2"
         );
+    }
+
+    #[test]
+    fn kill_line_cuts_to_line_end_then_joins() {
+        let mut editor = Editor::with_buffer(Buffer::from_text("hello\nworld"));
+        // Cursor at the start of line 0: `kill-line` removes "hello" onto the clipboard.
+        editor.execute("kill-line");
+        assert_eq!(editor.buffer().text(), "\nworld");
+        assert_eq!(editor.clipboard(), "hello");
+        // Cursor now sits at the empty line end: a second kill removes the line break (join).
+        editor.execute("kill-line");
+        assert_eq!(editor.buffer().text(), "world");
+    }
+
+    #[test]
+    fn every_documented_command_is_executable() {
+        // The catalog↔executor half of the profile guard: no command Oracle documents may fall
+        // through `Editor::execute` to the "unbound command" arm.
+        for name in oracle::command_names() {
+            let mut editor = Editor::with_buffer(Buffer::from_text("alpha\nbeta"));
+            editor.execute(name);
+            assert!(
+                !editor.status().starts_with("unbound command"),
+                "documented command `{name}` is not handled by Editor::execute"
+            );
+        }
     }
 }

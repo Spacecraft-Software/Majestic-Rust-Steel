@@ -124,6 +124,10 @@ pub const COMMANDS: &[CommandDoc] = &[
         summary: "Cut the selection to the clipboard.",
     },
     CommandDoc {
+        name: "kill-line",
+        summary: "Kill from the cursor to the end of the line (Emacs C-k).",
+    },
+    CommandDoc {
         name: "paste",
         summary: "Paste the clipboard at the cursor.",
     },
@@ -262,6 +266,26 @@ pub fn apropos(query: &str) -> String {
     format!("Commands matching `{query}`:\n{}", matches.join("\n"))
 }
 
+/// The profile↔catalog guard: command names bound in `keymap` that are absent from [`COMMANDS`].
+///
+/// Every keybinding profile must bind only documented commands, so a built-in profile and the
+/// catalog can never drift (and a name typo in a profile is caught at test time rather than
+/// surfacing as a silent "unbound command" at runtime). An empty result means the profile is
+/// compliant. Names are returned sorted and de-duplicated.
+#[must_use]
+pub fn commands_missing_docs(keymap: &Keymap) -> Vec<String> {
+    let mut missing: Vec<String> = keymap
+        .bindings()
+        .iter()
+        .map(|(_, command)| command.name())
+        .filter(|name| command_doc(name).is_none())
+        .map(str::to_owned)
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
+}
+
 /// The CI docstring lint: command names whose docstring is empty (PRD §5.2.2). Empty means a
 /// command was registered without documentation — a build failure.
 #[must_use]
@@ -323,10 +347,10 @@ fn format_key(key: KeyPress) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apropos, command_names, describe_bindings, describe_function, describe_key,
-        describe_variable, undocumented_commands, COMMANDS,
+        apropos, command_names, commands_missing_docs, describe_bindings, describe_function,
+        describe_key, describe_variable, undocumented_commands, COMMANDS,
     };
-    use keymaker::{cua, KeyPress};
+    use keymaker::{cua, emacs, KeyPress};
 
     #[test]
     fn every_command_is_documented() {
@@ -390,5 +414,13 @@ mod tests {
     #[test]
     fn catalog_is_non_empty() {
         assert!(COMMANDS.len() >= 20);
+    }
+
+    #[test]
+    fn built_in_profiles_bind_only_documented_commands() {
+        // The profile↔catalog guard: every command a built-in profile binds must be documented,
+        // so help is complete and a profile name typo can never become a silent runtime miss.
+        assert_eq!(commands_missing_docs(&cua()), Vec::<String>::new());
+        assert_eq!(commands_missing_docs(&emacs()), Vec::<String>::new());
     }
 }
