@@ -627,6 +627,12 @@ impl SessionHost {
     pub(crate) fn to_session(&self) -> Session {
         self.app.workspace().to_session()
     }
+
+    /// Whether the integrated terminal is streaming output — the daemon ticks faster while it is,
+    /// so a shell's output keeps painting for an attached client (matches `run`'s cadence).
+    pub(crate) fn terminal_running(&self) -> bool {
+        self.app.terminal_running()
+    }
 }
 
 /// Runs the editor + terminal interactive loop until a quit command is issued.
