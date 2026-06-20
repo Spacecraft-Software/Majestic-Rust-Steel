@@ -566,13 +566,15 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
 
 /// A headless editor session the daemon drives over a socket.
 ///
-/// It owns the full [`App`] and an off-screen [`Screen`], so [`SessionHost::render`] produces the
-/// exact terminal byte stream `run` would have written locally — an attached client just paints
-/// those bytes. The whole editor UI (sidebar, panels, overlays) is reused without touching a real
-/// terminal; only input and output are redirected to the wire.
+/// It owns the full [`App`] and renders into an off-screen [`Buffer`] — the exact frame `run` would
+/// have drawn locally. The daemon mirrors that frame to every attached client, diffing it against
+/// each client's own front buffer, so a late joiner gets a full repaint while the others get only
+/// the delta (see [`SessionHost::render_frame`]). The whole editor UI (sidebar, panels, overlays)
+/// is reused without touching a real terminal; only input and output go to the wire.
 pub(crate) struct SessionHost {
     app: App,
-    screen: Screen,
+    /// The latest rendered frame, mirrored to every attached client.
+    frame: Buffer,
     theme: Theme,
     cols: u16,
     rows: u16,
@@ -583,22 +585,28 @@ impl SessionHost {
     pub(crate) fn new(workspace: Workspace, cols: u16, rows: u16) -> Self {
         let theme = Theme::steelbore();
         let (cols, rows) = (cols.max(1), rows.max(1));
-        let screen = Screen::new(cols, rows, theme.base_style());
+        let frame = Buffer::new(cols, rows, theme.base_style());
         Self {
             app: App::new(workspace),
-            screen,
+            frame,
             theme,
             cols,
             rows,
         }
     }
 
-    /// Resizes the off-screen surface to a (new) client terminal size; the next render repaints.
+    /// Resizes the off-screen surface to a (new) mirrored size (the smallest attached terminal).
+    ///
+    /// A no-op when the size is unchanged, so redundant renegotiation does not resize the frame and
+    /// thereby force a needless full repaint on clients whose own size did not change.
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(1), rows.max(1));
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
         self.cols = cols;
         self.rows = rows;
-        self.screen.resize(cols, rows, self.theme.base_style());
+        self.frame.resize(cols, rows, self.theme.base_style());
     }
 
     /// Feeds one key; returns whether the editor asked to quit.
@@ -610,17 +618,14 @@ impl SessionHost {
         Ok(self.app.should_quit())
     }
 
-    /// Renders the current state, returning the terminal bytes to send to clients (the diff since
-    /// the previous render — a full repaint on the first call or after a resize).
-    ///
-    /// # Errors
-    /// Propagates a write error from the framebuffer presenter.
-    pub(crate) fn render(&mut self) -> io::Result<Vec<u8>> {
+    /// Renders the current state into the shared frame and returns it. The daemon diffs this against
+    /// each client's front buffer (via [`penumbra::render`]) to produce that client's byte stream —
+    /// a full repaint for a freshly attached client (its front buffer is empty), a minimal delta for
+    /// the rest.
+    pub(crate) fn render_frame(&mut self) -> &Buffer {
         self.app.reap_dead_terminal();
-        self.app.render(self.screen.back_mut(), &self.theme);
-        let mut bytes = Vec::new();
-        self.screen.present(&mut bytes)?;
-        Ok(bytes)
+        self.app.render(&mut self.frame, &self.theme);
+        &self.frame
     }
 
     /// Snapshots the current layout/open-files/cursors into a [`Session`] (persisted on detach).
