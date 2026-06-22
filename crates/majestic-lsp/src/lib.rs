@@ -19,8 +19,8 @@ mod manager;
 
 pub use client::{file_uri, LanguageServer};
 pub use codec::{read_message, write_message};
-pub use connection::{Connection, Incoming, Response};
-pub use manager::{LspManager, ServerConfig};
+pub use connection::{Connection, Incoming, Requester, Response};
+pub use manager::{LspManager, LspOutcome, ServerConfig};
 
 /// Re-export of `lsp-types` so consumers use exactly the version this client speaks.
 pub use lsp_types;

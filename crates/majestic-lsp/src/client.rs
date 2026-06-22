@@ -19,17 +19,20 @@
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 
 use lsp_types::{
-    ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
-    InitializeResult, InitializedParams, PublishDiagnosticsParams, TextDocumentContentChangeEvent,
-    TextDocumentItem, Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, HoverClientCapabilities,
+    InitializeParams, InitializeResult, InitializedParams, MarkupKind, PublishDiagnosticsParams,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
+    VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::connection::{Connection, Incoming};
+use crate::connection::{Connection, Incoming, Requester};
 
 /// A typed LSP client driving one language server.
 #[derive(Debug)]
@@ -73,6 +76,14 @@ impl LanguageServer {
         })
     }
 
+    /// A shared handle to the connection's send side, for issuing a request off the editor thread
+    /// (the manager hands this to a worker thread for completion/hover). The `!Sync` incoming-bus
+    /// stays on the [`Connection`], which the editor keeps draining.
+    #[must_use]
+    pub fn requester(&self) -> Arc<Requester> {
+        self.connection.requester()
+    }
+
     /// Performs the `initialize` handshake for workspace `root` and sends `initialized`.
     ///
     /// # Errors
@@ -85,7 +96,7 @@ impl LanguageServer {
                 uri: root,
                 name: "root".to_owned(),
             }]),
-            capabilities: ClientCapabilities::default(),
+            capabilities: client_capabilities(),
             ..Default::default()
         };
         let result = self.request("initialize", params)?;
@@ -175,6 +186,30 @@ impl Drop for LanguageServer {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// The capabilities advertised in the `initialize` handshake: completion and hover, plus the
+/// implicit defaults. Completion is requested without snippet support (we insert plain text, not
+/// `$0`-style snippet placeholders); hover accepts both Markdown and plain-text content so a server
+/// may send whichever it prefers (the editor renders it as text either way).
+fn client_capabilities() -> ClientCapabilities {
+    ClientCapabilities {
+        text_document: Some(TextDocumentClientCapabilities {
+            completion: Some(CompletionClientCapabilities {
+                completion_item: Some(CompletionItemCapability {
+                    snippet_support: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            hover: Some(HoverClientCapabilities {
+                content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 

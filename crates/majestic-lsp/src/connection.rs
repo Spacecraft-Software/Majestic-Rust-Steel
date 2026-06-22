@@ -16,6 +16,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use morpheus::{Emitter, EventBus};
 use serde_json::{Map, Value};
@@ -68,41 +69,26 @@ impl Response {
 
 type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Response>>>>;
 
-/// A JSON-RPC connection to a language server.
-pub struct Connection {
+/// The request-sending half of a connection: the writer, the pending-response map, and the id
+/// counter — everything needed to issue a request and correlate its reply, and nothing that is
+/// `!Sync`. It is `Send + Sync`, so a [`Connection::requester`] handle can be shared with a worker
+/// thread to run an interactive request (completion/hover) without freezing the editor. The
+/// `!Sync` incoming-message receiver lives on [`Connection`] instead, off this shared path.
+pub struct Requester {
     writer: Mutex<Box<dyn Write + Send>>,
     pending: Pending,
-    incoming: EventBus<Incoming>,
     next_id: AtomicI64,
 }
 
-impl fmt::Debug for Connection {
+impl fmt::Debug for Requester {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Connection")
+        f.debug_struct("Requester")
             .field("next_id", &self.next_id)
             .finish_non_exhaustive()
     }
 }
 
-impl Connection {
-    /// Starts a connection over `reader`/`writer` (a language server's stdout/stdin, or a socket
-    /// pair in tests). Spawns the reader thread; it exits when the server closes the stream.
-    #[must_use]
-    pub fn new(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static) -> Self {
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let incoming = EventBus::new();
-        let emitter = incoming.emitter();
-        let reader_pending = Arc::clone(&pending);
-        // Detached: the reader runs for the life of the stream and exits on EOF (server gone).
-        thread::spawn(move || reader_loop(reader, &reader_pending, &emitter));
-        Self {
-            writer: Mutex::new(Box::new(writer)),
-            pending,
-            incoming,
-            next_id: AtomicI64::new(1),
-        }
-    }
-
+impl Requester {
     /// Sends a request and blocks until the server's matching response arrives.
     ///
     /// # Errors
@@ -121,6 +107,34 @@ impl Connection {
         })
     }
 
+    /// Sends a request and blocks until the response arrives or `timeout` elapses.
+    ///
+    /// Used for interactive requests (completion, hover) that run on a worker thread: a slow or
+    /// stuck server must not pin the thread forever, so on timeout the pending entry is evicted and
+    /// `TimedOut` is returned (a late response is then dropped harmlessly by [`route`]).
+    ///
+    /// # Errors
+    /// Returns an I/O error if the write fails, or `TimedOut` if no response arrives in `timeout`.
+    pub fn request_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> io::Result<Response> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        lock(&self.pending).insert(id, sender);
+        self.send(&envelope(Some(id), method, params))?;
+        let Ok(response) = receiver.recv_timeout(timeout) else {
+            lock(&self.pending).remove(&id);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "language server did not respond in time",
+            ));
+        };
+        Ok(response)
+    }
+
     /// Sends a fire-and-forget notification (no reply expected).
     ///
     /// # Errors
@@ -129,16 +143,70 @@ impl Connection {
         self.send(&envelope(None, method, params))
     }
 
+    fn send(&self, message: &Value) -> io::Result<()> {
+        let mut writer = lock(&self.writer);
+        write_message(&mut *writer, message)
+    }
+}
+
+/// A JSON-RPC connection to a language server: a shared [`Requester`] (the send side) plus the bus
+/// of server-initiated messages (the receive side).
+#[derive(Debug)]
+pub struct Connection {
+    requester: Arc<Requester>,
+    incoming: EventBus<Incoming>,
+}
+
+impl Connection {
+    /// Starts a connection over `reader`/`writer` (a language server's stdout/stdin, or a socket
+    /// pair in tests). Spawns the reader thread; it exits when the server closes the stream.
+    #[must_use]
+    pub fn new(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static) -> Self {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let incoming = EventBus::new();
+        let emitter = incoming.emitter();
+        let reader_pending = Arc::clone(&pending);
+        // Detached: the reader runs for the life of the stream and exits on EOF (server gone).
+        thread::spawn(move || reader_loop(reader, &reader_pending, &emitter));
+        Self {
+            requester: Arc::new(Requester {
+                writer: Mutex::new(Box::new(writer)),
+                pending,
+                next_id: AtomicI64::new(1),
+            }),
+            incoming,
+        }
+    }
+
+    /// A shared handle to the send side, for issuing a request from a worker thread (the manager
+    /// hands this to the completion/hover worker; the editor keeps draining [`Self::drain_incoming`]).
+    #[must_use]
+    pub fn requester(&self) -> Arc<Requester> {
+        Arc::clone(&self.requester)
+    }
+
+    /// Sends a request and blocks until the server's matching response arrives.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the write fails, or `BrokenPipe` if the server closes before
+    /// answering.
+    pub fn request(&self, method: &str, params: Value) -> io::Result<Response> {
+        self.requester.request(method, params)
+    }
+
+    /// Sends a fire-and-forget notification (no reply expected).
+    ///
+    /// # Errors
+    /// Returns an I/O error if the write fails.
+    pub fn notify(&self, method: &str, params: Value) -> io::Result<()> {
+        self.requester.notify(method, params)
+    }
+
     /// Takes the server-initiated messages received since the last drain (the editor drains these
     /// each frame to surface diagnostics and the like).
     #[must_use]
     pub fn drain_incoming(&self) -> Vec<Incoming> {
         self.incoming.drain()
-    }
-
-    fn send(&self, message: &Value) -> io::Result<()> {
-        let mut writer = lock(&self.writer);
-        write_message(&mut *writer, message)
     }
 }
 
@@ -253,6 +321,27 @@ mod tests {
             Incoming::Notification { method, .. } if method == "window/logMessage"
         )));
 
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn request_timeout_gives_up_when_the_server_stays_silent() {
+        use std::time::Duration;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        // The server holds the connection open but never answers, so only the timeout can fire.
+        let mock = thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let _request = read_message(&mut reader).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            drop(server);
+        });
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        let error = connection
+            .requester()
+            .request_timeout("initialize", json!({}), Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         mock.join().unwrap();
     }
 
