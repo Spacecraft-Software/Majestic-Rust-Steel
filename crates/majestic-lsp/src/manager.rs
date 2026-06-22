@@ -12,12 +12,19 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, PublishDiagnosticsParams, Uri};
-use majestic_core::{Diagnostic, Severity};
+use lsp_types::{
+    CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
+    DiagnosticSeverity, PartialResultParams, Position, PublishDiagnosticsParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+};
+use majestic_core::{CompletionItem, Diagnostic, Severity};
 
 use crate::client::{file_uri, LanguageServer};
+use crate::connection::Requester;
 
 /// How to launch a language server for a file extension.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,8 +73,23 @@ enum ServerSlot {
     Failed,
 }
 
+/// The result of an interactive LSP request, delivered back to the editor once a worker thread has
+/// the server's reply. Drained each frame by [`LspManager::poll_outcomes`] (the request itself runs
+/// off-thread so a slow server never blocks the render loop). Extensible — hover lands as a second
+/// variant on the same channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LspOutcome {
+    /// Completion candidates for the document at `path`, ready to show in the popup.
+    Completion {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The candidates, already converted to editor-facing items.
+        items: Vec<CompletionItem>,
+    },
+}
+
 /// Manages language servers and open-document sync.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LspManager {
     /// Server launch config keyed by file extension (without the dot), e.g. `rs`.
     configs: HashMap<String, ServerConfig>,
@@ -75,6 +97,23 @@ pub struct LspManager {
     servers: HashMap<String, ServerSlot>,
     /// Open documents keyed by path.
     docs: HashMap<PathBuf, DocState>,
+    /// Sends interactive-request results from worker threads back to the editor frame.
+    outcomes_tx: mpsc::Sender<LspOutcome>,
+    /// The editor end of the outcome channel, drained by [`Self::poll_outcomes`].
+    outcomes_rx: mpsc::Receiver<LspOutcome>,
+}
+
+impl Default for LspManager {
+    fn default() -> Self {
+        let (outcomes_tx, outcomes_rx) = mpsc::channel();
+        Self {
+            configs: HashMap::new(),
+            servers: HashMap::new(),
+            docs: HashMap::new(),
+            outcomes_tx,
+            outcomes_rx,
+        }
+    }
 }
 
 impl LspManager {
@@ -176,6 +215,36 @@ impl LspManager {
             }
         }
         updates
+    }
+
+    /// Requests completion candidates for the cursor `byte` in `path`, off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. The request and
+    /// its (bounded) wait run on a worker thread holding a shared [`Requester`]; the result arrives
+    /// via [`Self::poll_outcomes`]. Issuing it never blocks the render loop.
+    pub fn request_completion(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let items = fetch_completion(&requester, uri, position);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::Completion { path, items });
+        });
+    }
+
+    /// Drains the interactive-request results (completion, …) that have arrived since the last call.
+    /// The host calls this each frame and applies each outcome (e.g. opens the completion popup).
+    pub fn poll_outcomes(&mut self) -> Vec<LspOutcome> {
+        self.outcomes_rx.try_iter().collect()
     }
 
     /// Promotes any background startup that has finished to [`ServerSlot::Ready`] (or `Failed`),
@@ -305,6 +374,82 @@ fn position_to_byte(text: &str, line: u32, character: u32) -> usize {
     text.len()
 }
 
+/// Converts a byte offset in `text` to an LSP `(line, character)` position — the inverse of
+/// [`position_to_byte`]. `character` is a Unicode-scalar offset within the line (exact for
+/// BMP/ASCII). A byte on a line's trailing newline, or past the end of the document, clamps to the
+/// end of that line's content / the final line.
+fn byte_to_position(text: &str, byte: usize) -> Position {
+    let mut offset = 0usize;
+    for (index, line_text) in text.split_inclusive('\n').enumerate() {
+        let content = line_text.trim_end_matches('\n');
+        let content_len = content.len();
+        let line = u32::try_from(index).unwrap_or(u32::MAX);
+        if byte <= offset + content_len {
+            // Within this line's content (or exactly at its end): count chars up to `byte`.
+            let within = byte - offset;
+            let character = u32::try_from(content[..within].chars().count()).unwrap_or(u32::MAX);
+            return Position::new(line, character);
+        }
+        if byte < offset + line_text.len() {
+            // On the trailing newline: clamp to the end of this line's content.
+            let character = u32::try_from(content.chars().count()).unwrap_or(u32::MAX);
+            return Position::new(line, character);
+        }
+        offset += line_text.len();
+    }
+    // Past the end (e.g. an empty final line after a trailing newline): clamp to the last line.
+    let last_line = u32::try_from(text.split('\n').count().saturating_sub(1)).unwrap_or(u32::MAX);
+    let last_chars = text.rsplit('\n').next().unwrap_or("").chars().count();
+    Position::new(last_line, u32::try_from(last_chars).unwrap_or(u32::MAX))
+}
+
+/// Issues `textDocument/completion` over a shared [`Requester`] (on a worker thread) and converts
+/// the reply to editor-facing [`CompletionItem`]s. A timeout, transport error, server error, or
+/// `null` result all yield an empty list (the popup simply does not open).
+fn fetch_completion(requester: &Requester, uri: Uri, position: Position) -> Vec<CompletionItem> {
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/completion", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (no completions) deserializes to `None`.
+    let parsed: Option<CompletionResponse> = serde_json::from_value(result).unwrap_or(None);
+    let items = match parsed {
+        Some(
+            CompletionResponse::Array(items)
+            | CompletionResponse::List(CompletionList { items, .. }),
+        ) => items,
+        None => Vec::new(),
+    };
+    items
+        .into_iter()
+        .map(|item| {
+            let label = item.label;
+            let insert_text = item.insert_text.unwrap_or_else(|| label.clone());
+            CompletionItem {
+                label,
+                insert_text,
+                detail: item.detail,
+            }
+        })
+        .collect()
+}
+
 /// The project root the language server should be pointed at: the nearest ancestor of `path`
 /// containing a `Cargo.toml`, falling back to `path`'s directory.
 fn project_root(path: &Path) -> PathBuf {
@@ -329,9 +474,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{position_to_byte, LspManager, ServerConfig};
+    use super::{byte_to_position, position_to_byte, LspManager, LspOutcome, ServerConfig};
     use crate::client::LanguageServer;
-    use crate::codec::write_message;
+    use crate::codec::{read_message, write_message};
     use crate::connection::Connection;
 
     #[test]
@@ -342,6 +487,89 @@ mod tests {
         assert_eq!(position_to_byte(text, 1, 0), 14); // start of "foo"
         assert_eq!(position_to_byte(text, 1, 3), 17); // end of "foo"
         assert_eq!(position_to_byte(text, 9, 0), text.len()); // past the end clamps
+    }
+
+    #[test]
+    fn byte_to_position_is_the_inverse_of_position_to_byte() {
+        for text in ["let x = oops;\nfoo", "abc", "a\n", "α = 1\nβ"] {
+            // Every char-boundary byte must round-trip through (line, character) back to itself.
+            for byte in 0..=text.len() {
+                if !text.is_char_boundary(byte) {
+                    continue;
+                }
+                let position = byte_to_position(text, byte);
+                assert_eq!(
+                    position_to_byte(text, position.line, position.character),
+                    byte,
+                    "byte {byte} of {text:?} round-tripped via {position:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_request_yields_mapped_items_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one `textDocument/completion` with two items, then idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            // `open` sends `didOpen` to the (already-ready) server first; skip notifications until
+            // the completion request arrives.
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/completion" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {"label": "println!", "insertText": "println!", "detail": "macro"},
+                        {"label": "print!"}
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-c.rs");
+        manager.open(path, "let _ = pri").unwrap();
+        manager.request_completion(path, "let _ = pri".len());
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::Completion { path: got, items } = &outcomes[0];
+        assert_eq!(got, path);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "println!");
+        assert_eq!(items[0].insert_text, "println!");
+        assert_eq!(items[0].detail.as_deref(), Some("macro"));
+        // A missing `insertText` falls back to the label.
+        assert_eq!(items[1].label, "print!");
+        assert_eq!(items[1].insert_text, "print!");
+        assert_eq!(items[1].detail, None);
+
+        mock.join().unwrap();
     }
 
     #[test]

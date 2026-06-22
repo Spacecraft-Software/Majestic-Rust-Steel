@@ -345,6 +345,16 @@ impl Buffer {
         self.insert(ch.encode_utf8(&mut buf));
     }
 
+    /// Replaces the byte range `range` with `text`, leaving the cursor after the inserted text.
+    /// Used to apply an LSP completion over the identifier prefix already typed. The range is
+    /// clamped to the document so a stale range (the buffer shrank meanwhile) can never panic.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) {
+        self.clamp();
+        let start = self.clamped(range.start);
+        let end = self.clamped(range.end).max(start);
+        self.apply_edit(start..end, text);
+    }
+
     /// Deletes the selection, or the character before the cursor (Backspace).
     pub fn backspace(&mut self) {
         self.clamp();

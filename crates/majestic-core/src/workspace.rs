@@ -14,6 +14,7 @@
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
+use std::ops::Range;
 use std::path::Path;
 
 use crate::buffer::Buffer;
@@ -458,6 +459,24 @@ impl Workspace {
     pub fn insert_text(&mut self, text: &str) {
         self.active_mut().buffer_mut().insert(text); // one edit (clean undo + sibling propagation)
         self.propagate_edits();
+    }
+
+    /// Replaces `range` in the focused buffer with `text` (applying an LSP completion over the
+    /// identifier prefix already typed), propagating the edit to the buffer's other views.
+    pub fn replace_active(&mut self, range: Range<usize>, text: &str) {
+        self.active_mut().buffer_mut().replace_range(range, text);
+        self.propagate_edits();
+    }
+
+    /// The screen position of the focused pane's cursor, given the same `area` the editor was last
+    /// rendered into. Anchors completion/hover popups at the cursor; `None` when it is off-screen.
+    #[must_use]
+    pub fn active_cursor_screen(&self, area: Rect) -> Option<(u16, u16)> {
+        let mut panes = Vec::new();
+        let mut dividers = Vec::new();
+        self.root.layout(area, &mut panes, &mut dividers);
+        let (editor_index, rect) = panes.get(self.focused).copied()?;
+        self.editors[editor_index].cursor_screen_position(rect)
     }
 
     /// Runs editor command `command` on the focused pane, propagating any resulting edit to the

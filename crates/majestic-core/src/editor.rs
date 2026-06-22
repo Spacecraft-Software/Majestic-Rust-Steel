@@ -603,24 +603,34 @@ impl Editor {
         }
     }
 
-    fn draw_cursor(&self, surface: &mut Surface, theme: &Theme, area: Rect) {
+    /// The cursor's absolute screen position within `area`, or `None` when it is scrolled out of
+    /// view. Used both to draw the cursor and to anchor popups (completion, hover) at the cursor.
+    #[must_use]
+    pub fn cursor_screen_position(&self, area: Rect) -> Option<(u16, u16)> {
         let row = self.buffer.cursor_point().row;
         if row < self.viewport_top {
-            return;
+            return None;
         }
         let screen_row = row - self.viewport_top;
         let column = self.cursor_display_column();
         if column < self.viewport_left {
-            return; // cursor scrolled off the left edge
+            return None; // cursor scrolled off the left edge
         }
         let screen_col = column - self.viewport_left;
-        let (Ok(cx), Ok(cy)) = (u16::try_from(screen_col), u16::try_from(screen_row)) else {
+        let (cx, cy) = (
+            u16::try_from(screen_col).ok()?,
+            u16::try_from(screen_row).ok()?,
+        );
+        if cy >= area.height || cx >= area.width {
+            return None;
+        }
+        Some((area.x + cx, area.y + cy))
+    }
+
+    fn draw_cursor(&self, surface: &mut Surface, theme: &Theme, area: Rect) {
+        let Some((x, y)) = self.cursor_screen_position(area) else {
             return;
         };
-        if cy >= area.height || cx >= area.width {
-            return;
-        }
-        let (x, y) = (area.x + cx, area.y + cy);
         let (symbol, mut style) = surface
             .cell(x, y)
             .map_or((' ', theme.base_style()), |cell| (cell.symbol, cell.style));

@@ -28,9 +28,10 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
-    Action, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector, Session, Workspace,
+    Action, Completion, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector,
+    Session, Workspace,
 };
-use majestic_lsp::LspManager;
+use majestic_lsp::{LspManager, LspOutcome};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -94,6 +95,9 @@ const FILE_FINDER: KeyPress = KeyPress::ctrl('p');
 /// The `F1` key opens (and closes) the Oracle key-bindings help overlay.
 const HELP_KEY: KeyPress = KeyPress::key(KeyCode::Function(1));
 
+/// The `Ctrl+Space` key requests LSP completion at the cursor (the editor convention).
+const COMPLETION_KEY: KeyPress = KeyPress::ctrl(' ');
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -106,6 +110,11 @@ struct App {
     info: Option<InfoReader>,
     /// The first-run profile picker; `Some` until the user chooses (modal while open).
     selector: Option<ProfileSelector>,
+    /// The LSP completion popup; `Some` while candidates are shown over the editor.
+    completion: Option<Completion>,
+    /// The byte offset where the in-progress identifier (the prefix being completed) starts; an
+    /// accepted candidate replaces `completion_anchor..cursor`.
+    completion_anchor: usize,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -125,6 +134,8 @@ impl App {
             help: None,
             info: None,
             selector: None,
+            completion: None,
+            completion_anchor: 0,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             focus: Focus::Editor,
@@ -158,6 +169,15 @@ impl App {
         }
         for (path, diagnostics) in self.lsp.poll() {
             self.workspace.apply_diagnostics(&path, &diagnostics);
+        }
+        // Interactive-request results (completion candidates) arrive asynchronously; open the popup
+        // when a result matches the buffer that still has focus and actually has candidates.
+        for outcome in self.lsp.poll_outcomes() {
+            let LspOutcome::Completion { path, items } = outcome;
+            let active_path = self.workspace.active().buffer().path();
+            if self.focus == Focus::Editor && active_path.as_deref() == Some(path.as_path()) {
+                self.completion = (!items.is_empty()).then(|| Completion::new(items));
+            }
         }
     }
 
@@ -195,6 +215,10 @@ impl App {
         let (body, status) = surface.area().split_bottom(1);
         let main = self.render_sidebar(surface, body, theme);
 
+        // The region the editor was actually drawn into (none while the Info reader is showing),
+        // used to anchor the completion popup at the cursor.
+        let mut editor_rect: Option<Rect> = None;
+
         if let Some(info) = self.info.as_mut() {
             // The Info reader takes over the editor region (the sidebar + status bar remain).
             info.render(surface, main, theme);
@@ -217,6 +241,7 @@ impl App {
 
             self.workspace
                 .render(surface, editor_area, theme, self.focus == Focus::Editor);
+            editor_rect = Some(editor_area);
             draw_panel_tab(surface, divider, theme, self.focus == Focus::Terminal);
             if let Some(term) = self.terminal.as_ref() {
                 term.render_in(surface, panel_area, theme, self.focus == Focus::Terminal);
@@ -224,6 +249,7 @@ impl App {
         } else {
             self.workspace
                 .render(surface, main, theme, self.focus == Focus::Editor);
+            editor_rect = Some(main);
         }
 
         self.draw_status_bar(surface, status.y, theme);
@@ -251,6 +277,13 @@ impl App {
         }
         if let Some(selector) = self.selector.as_ref() {
             selector.render(surface, area, theme);
+        }
+
+        // The completion popup is anchored at the cursor within the editor region, above all else.
+        if let (Some(completion), Some(rect)) = (self.completion.as_ref(), editor_rect) {
+            if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
+                completion.render(surface, rect, cursor, theme);
+            }
         }
     }
 
@@ -322,6 +355,33 @@ impl App {
             self.info_key(key);
             return Ok(());
         }
+        // The completion popup is a light modal: it captures navigation/accept/dismiss keys, but any
+        // other key dismisses it and falls through to normal editing (so typing keeps going).
+        if self.completion.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(completion) = self.completion.as_mut() {
+                        completion.select_up();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(completion) = self.completion.as_mut() {
+                        completion.select_down();
+                    }
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.accept_completion();
+                    return Ok(());
+                }
+                KeyCode::Escape => {
+                    self.completion = None;
+                    return Ok(());
+                }
+                _ => self.completion = None,
+            }
+        }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
                 "Key Bindings (Esc to close)",
@@ -336,6 +396,10 @@ impl App {
         if key == FILE_FINDER {
             let root = self.project_root();
             self.finder = Some(Finder::files(&root));
+            return Ok(());
+        }
+        if key == COMPLETION_KEY {
+            self.trigger_completion();
             return Ok(());
         }
         if key.code == TERMINAL_TOGGLE {
@@ -358,6 +422,41 @@ impl App {
             Focus::Editor => self.workspace.handle_key(key),
         }
         Ok(())
+    }
+
+    /// Requests LSP completion at the cursor: records where the in-progress identifier starts (so an
+    /// accepted candidate replaces it, not the whole word), then asks the manager to fetch
+    /// candidates off-thread. A no-op unless the editor is focused and a server handles the buffer;
+    /// the popup opens later, in `sync_lsp`, once the result arrives.
+    fn trigger_completion(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        let text = editor.buffer().text();
+        self.completion_anchor = identifier_start(&text, cursor);
+        self.lsp.request_completion(&path, cursor);
+    }
+
+    /// Inserts the selected candidate over the typed identifier prefix and closes the popup.
+    fn accept_completion(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = completion.selected() else {
+            return;
+        };
+        let cursor = self.workspace.active().buffer().cursor();
+        let start = self.completion_anchor.min(cursor);
+        self.workspace
+            .replace_active(start..cursor, &item.insert_text);
     }
 
     /// Routes a key to the explorer: arrow navigation, `Enter` to open/expand, `Esc` to leave.
@@ -752,6 +851,19 @@ pub(crate) fn run(
         let _ = app.workspace.to_session().save();
     }
     Ok(())
+}
+
+/// The byte offset where the identifier ending at `cursor` begins: `cursor` minus the trailing run
+/// of identifier characters (alphanumeric or `_`). A completion replaces `start..cursor`, so an
+/// empty run (cursor not after an identifier) yields `cursor` itself — the candidate is inserted.
+fn identifier_start(text: &str, cursor: usize) -> usize {
+    let end = cursor.min(text.len());
+    text[..end]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+        .last()
+        .map_or(end, |(index, _)| index)
 }
 
 /// Whether `key` is `Ctrl+Shift+P` (the command palette), tolerant of the terminal reporting
