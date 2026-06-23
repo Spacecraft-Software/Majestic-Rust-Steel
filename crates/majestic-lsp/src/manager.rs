@@ -20,6 +20,7 @@ use std::time::Duration;
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
     DiagnosticSeverity, DocumentChangeOperation, DocumentChanges, DocumentFormattingParams,
+    DocumentHighlight as LspDocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams,
     Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel, PartialResultParams,
@@ -29,7 +30,7 @@ use lsp_types::{
     WorkspaceEdit,
 };
 use majestic_core::{
-    CompletionItem, Diagnostic, Reference, RenameEdit, Severity, SignatureHelp, Symbol,
+    CompletionItem, Diagnostic, Occurrence, Reference, RenameEdit, Severity, SignatureHelp, Symbol,
 };
 
 use crate::client::{file_uri, LanguageServer};
@@ -125,6 +126,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The use sites, each with a destination file/position and a source-line preview.
         references: Vec<Reference>,
+    },
+    /// Occurrences of the symbol under the cursor *within* the document at `path` (LSP
+    /// `documentHighlight`), as byte ranges to tint. Empty when the cursor is not on a symbol.
+    DocumentHighlight {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The occurrences (byte ranges + read/write), tinted in the buffer by the host.
+        occurrences: Vec<Occurrence>,
     },
     /// The outline of every definition in the document at `path` (functions, types, members, …),
     /// flattened in document order with nesting depth, ready to show in the symbols picker. Empty
@@ -405,6 +414,34 @@ impl LspManager {
             let references = fetch_references(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::References { path, references });
+        });
+    }
+
+    /// Requests the occurrences of the symbol at the cursor `byte` in `path` (LSP
+    /// `documentHighlight`), off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. The worker
+    /// converts the server's positions to byte offsets against the document snapshot captured here
+    /// (the same text the server is reasoning about), and the result arrives via
+    /// [`Self::poll_outcomes`] as [`LspOutcome::DocumentHighlight`]. The host auto-issues this as the
+    /// cursor moves, so it is deliberately lightweight.
+    pub fn request_document_highlight(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let snapshot = doc.text.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let occurrences = fetch_document_highlight(&requester, uri, position, &snapshot);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::DocumentHighlight { path, occurrences });
         });
     }
 
@@ -778,6 +815,64 @@ fn read_capped(path: &Path) -> Option<String> {
         return None;
     }
     std::fs::read_to_string(path).ok()
+}
+
+/// Issues `textDocument/documentHighlight` over a shared [`Requester`] (on a worker thread) and
+/// converts the returned ranges to editor-facing [`Occurrence`]s — byte ranges into `snapshot` (the
+/// document text the server is reasoning about), with `write` set for a `Write` occurrence. A short
+/// (2 s) timeout, since the host issues this frequently as the cursor moves. A timeout, transport
+/// error, server error, `null`, or empty result all yield an empty list (the tint clears).
+fn fetch_document_highlight(
+    requester: &Requester,
+    uri: Uri,
+    position: Position,
+    snapshot: &str,
+) -> Vec<Occurrence> {
+    let params = DocumentHighlightParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) = requester.request_timeout(
+        "textDocument/documentHighlight",
+        value,
+        Duration::from_secs(2),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (cursor not on a symbol) deserializes to `None`.
+    let highlights: Option<Vec<LspDocumentHighlight>> =
+        serde_json::from_value(result).unwrap_or(None);
+    let Some(highlights) = highlights else {
+        return Vec::new();
+    };
+    highlights
+        .into_iter()
+        .map(|highlight| {
+            let start = position_to_byte(
+                snapshot,
+                highlight.range.start.line,
+                highlight.range.start.character,
+            );
+            let end = position_to_byte(
+                snapshot,
+                highlight.range.end.line,
+                highlight.range.end.character,
+            )
+            .max(start);
+            let write = highlight.kind == Some(DocumentHighlightKind::WRITE);
+            Occurrence::new(start..end, write)
+        })
+        .collect()
 }
 
 /// Issues `textDocument/documentSymbol` over a shared [`Requester`] (on a worker thread) and
@@ -2319,5 +2414,129 @@ mod tests {
         );
         assert!(edits.iter().all(|edit| edit.path == main_rs));
         assert!(edits.iter().all(|edit| edit.new_text == "renamed"));
+    }
+
+    #[test]
+    fn document_highlight_request_yields_byte_range_occurrences_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server answering one textDocument/documentHighlight with three ranges for `foo`:
+        // the write/definition on line 0 and two reads on line 1. Kinds: 2 = Read, 3 = Write.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/documentHighlight" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {"range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 7}}, "kind": 3},
+                        {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}}, "kind": 2},
+                        {"range": {"start": {"line": 1, "character": 6}, "end": {"line": 1, "character": 9}}, "kind": 2}
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-dh.rs");
+        // The snapshot the positions are converted against (line 0 is 13 bytes incl. the newline).
+        manager.open(path, "let foo = 1;\nfoo + foo\n").unwrap();
+        manager.request_document_highlight(path, 4);
+
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::DocumentHighlight {
+            path: got,
+            occurrences,
+        } = &outcomes[0]
+        else {
+            panic!(
+                "expected a document-highlight outcome, got {:?}",
+                outcomes[0]
+            );
+        };
+        assert_eq!(got, path);
+        assert_eq!(occurrences.len(), 3);
+        // Positions map to byte ranges against the snapshot; kind 3 is the write/definition.
+        assert_eq!(occurrences[0].range, 4..7);
+        assert!(occurrences[0].write);
+        assert_eq!(occurrences[1].range, 13..16);
+        assert!(!occurrences[1].write);
+        assert_eq!(occurrences[2].range, 19..22);
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_highlights_occurrences() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("majestic-ra-dh-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source = "fn main() {\n    let total = 1;\n    let _ = total + total;\n}\n";
+        fs::write(&main_rs, source).unwrap();
+        // The cursor on the `total` binding.
+        let byte = source.find("total").unwrap() + 1;
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        let mut occurrences = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup
+            manager.request_document_highlight(&main_rs, byte);
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::DocumentHighlight {
+                    occurrences: found, ..
+                } = outcome
+                {
+                    if !found.is_empty() {
+                        occurrences = found;
+                    }
+                }
+            }
+            if !occurrences.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        // The binding plus its two uses → at least three occurrences, all inside the source.
+        assert!(
+            occurrences.len() >= 3,
+            "rust-analyzer should highlight `total` and its uses: {occurrences:?}"
+        );
+        assert!(occurrences.iter().all(|occ| occ.range.end <= source.len()));
     }
 }

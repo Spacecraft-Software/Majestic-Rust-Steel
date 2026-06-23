@@ -147,6 +147,9 @@ struct App {
     /// The document + cursor byte a pending rename was triggered at, recorded when the prompt opens
     /// and used to issue the request once the new name is confirmed.
     rename_target: Option<(PathBuf, usize)>,
+    /// The `(path, identifier byte-span)` the document-highlight tint currently tracks, so the host
+    /// re-requests occurrences only when the cursor moves to a different identifier.
+    highlight_anchor: Option<(PathBuf, std::ops::Range<usize>)>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -178,6 +181,7 @@ impl App {
             signature: None,
             prompt: None,
             rename_target: None,
+            highlight_anchor: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -214,6 +218,40 @@ impl App {
             self.workspace.apply_diagnostics(&path, &diagnostics);
         }
         self.apply_lsp_outcomes();
+        self.refresh_document_highlight();
+    }
+
+    /// Re-requests the symbol occurrences to tint (LSP `documentHighlight`) when the cursor has moved
+    /// to a different identifier since the last request, and clears the tint when it leaves one. Cheap
+    /// each frame: it only issues a request (off-thread) on an actual identifier change, so holding an
+    /// arrow key does not flood the server.
+    fn refresh_document_highlight(&mut self) {
+        // The (path, identifier byte-span) the cursor is on, when on a symbol in an LSP buffer.
+        let target = if self.focus == Focus::Editor {
+            let editor = self.workspace.active();
+            editor.buffer().path().and_then(|path| {
+                if !self.lsp.handles(&path) {
+                    return None;
+                }
+                let cursor = editor.buffer().cursor();
+                let text = editor.buffer().text();
+                let span = identifier_start(&text, cursor)..identifier_end(&text, cursor);
+                (span.start < span.end).then_some((path, span))
+            })
+        } else {
+            None
+        };
+
+        if self.highlight_anchor == target {
+            return; // same identifier (or still nothing) — leave the current tint as is
+        }
+        // The cursor moved to a different identifier (or off one): drop the old tint, then request
+        // fresh occurrences when it is on a symbol.
+        self.workspace.clear_active_occurrences();
+        self.highlight_anchor.clone_from(&target);
+        if let Some((path, span)) = target {
+            self.lsp.request_document_highlight(&path, span.start);
+        }
     }
 
     /// Drains the interactive-request results (completion, hover, goto-definition, references,
@@ -226,7 +264,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::DocumentHighlight { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -305,6 +343,13 @@ impl App {
                 }
                 LspOutcome::Rename { edits, .. } => {
                     self.apply_rename(edits);
+                }
+                LspOutcome::DocumentHighlight { occurrences, .. } => {
+                    // Tint the occurrences — but only while the cursor is still on an identifier (a
+                    // result arriving after it left one is dropped, so no stale tint lingers).
+                    if self.highlight_anchor.is_some() {
+                        self.workspace.set_active_occurrences(occurrences);
+                    }
                 }
                 LspOutcome::Formatting { path, formatted } => {
                     self.apply_formatting(&path, formatted);

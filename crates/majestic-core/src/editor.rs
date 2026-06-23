@@ -21,6 +21,7 @@ use stratum::{Point, SpanLayer};
 
 use crate::buffer::Buffer;
 use crate::diagnostic::{Diagnostic, Severity};
+use crate::occurrence::Occurrence;
 use crate::syntax::{HighlightKind, HighlightWorker};
 
 /// The editing mode that governs key dispatch and whether printable keys self-insert.
@@ -85,6 +86,9 @@ pub struct Editor {
     tab_width: usize,
     /// Language-server diagnostics for this buffer (byte ranges), underlined when rendered.
     diagnostics: Vec<Diagnostic>,
+    /// Occurrences of the symbol under the cursor (LSP `documentHighlight`), tinted when rendered.
+    /// Transient: refreshed by the host as the cursor moves, cleared when it leaves an identifier.
+    occurrences: Vec<Occurrence>,
 }
 
 /// Default indent width in columns (CUA convention; overridden by `majestic-config`).
@@ -138,6 +142,7 @@ impl Editor {
             requested_revision: None,
             tab_width: DEFAULT_TAB_WIDTH,
             diagnostics: Vec::new(),
+            occurrences: Vec::new(),
         }
     }
 
@@ -151,6 +156,18 @@ impl Editor {
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// Replaces the symbol occurrences tinted in this buffer (LSP `documentHighlight`). The host
+    /// refreshes these as the cursor moves to a new identifier; an empty vec clears the tint.
+    pub fn set_occurrences(&mut self, occurrences: Vec<Occurrence>) {
+        self.occurrences = occurrences;
+    }
+
+    /// Whether any occurrences are currently tinted (so the host can avoid a redundant clear).
+    #[must_use]
+    pub fn has_occurrences(&self) -> bool {
+        !self.occurrences.is_empty()
     }
 
     /// A second view of this editor's buffer: a new editor sharing the document (and thus text +
@@ -473,6 +490,7 @@ impl Editor {
                     if let Ok(col) = u16::try_from(screen) {
                         let style = styles.get(byte - start_byte).copied().unwrap_or(base);
                         let style = self.apply_diagnostic(byte, style, theme);
+                        let style = self.apply_occurrence(byte, style, theme);
                         surface.set_char(area.x + col, area.y + row, ch, style);
                     }
                 }
@@ -503,6 +521,24 @@ impl Editor {
         if let Some(severity) = severity {
             style.fg = severity_color(severity, theme);
             style.attrs.underline = true;
+        }
+        style
+    }
+
+    /// If `byte` is covered by a symbol occurrence, tints `style` with the inverted highlight look
+    /// (background-on-accent — the same AA-safe pairing the popups use for a selected row), and
+    /// underlines a write/definition occurrence so it stands out from its reads. Otherwise `style`
+    /// is unchanged. Applied after [`Self::apply_diagnostic`], so a diagnostic underline shows through.
+    fn apply_occurrence(&self, byte: usize, mut style: Style, theme: &Theme) -> Style {
+        if self.occurrences.is_empty() {
+            return style;
+        }
+        if let Some(occurrence) = self.occurrences.iter().find(|occ| occ.covers(byte)) {
+            style.fg = theme.background;
+            style.bg = theme.accent;
+            if occurrence.write {
+                style.attrs.underline = true;
+            }
         }
         style
     }

@@ -40,6 +40,7 @@ mod fuzzy;
 mod git;
 mod hover;
 mod info;
+mod occurrence;
 mod prompt;
 mod references;
 mod rename;
@@ -69,6 +70,8 @@ pub use finder::{Action, Finder, HelpOverlay};
 pub use hover::Hover;
 #[doc(inline)]
 pub use info::{InfoDocument, InfoReader};
+#[doc(inline)]
+pub use occurrence::Occurrence;
 #[doc(inline)]
 pub use prompt::Prompt;
 #[doc(inline)]
