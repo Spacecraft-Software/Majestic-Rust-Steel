@@ -29,7 +29,8 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
     Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
-    ProfileSelector, Prompt, References, RenameEdit, Session, SignatureHelp, Symbols, Workspace,
+    Occurrence, ProfileSelector, Prompt, References, RenameEdit, Search, Session, SignatureHelp,
+    Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome, ServerHealth};
 use majestic_term::PtyTerminal;
@@ -179,6 +180,9 @@ struct App {
     code_actions: Option<CodeActions>,
     /// The modal rename input; `Some` while the user is typing the new name (captures every key).
     prompt: Option<Prompt>,
+    /// The incremental in-buffer search (`find`); `Some` while the search line captures keys. It
+    /// tints all matches and parks the cursor on the active one.
+    search: Option<Search>,
     /// The document + cursor byte a pending rename was triggered at, recorded when the prompt opens
     /// and used to issue the request once the new name is confirmed.
     rename_target: Option<(PathBuf, usize)>,
@@ -219,6 +223,7 @@ impl App {
             signature: None,
             code_actions: None,
             prompt: None,
+            search: None,
             rename_target: None,
             highlight_anchor: None,
             pending_lsp: None,
@@ -267,6 +272,10 @@ impl App {
     /// each frame: it only issues a request (off-thread) on an actual identifier change, so holding an
     /// arrow key does not flood the server.
     fn refresh_document_highlight(&mut self) {
+        // While searching, the buffer tint belongs to the search matches — don't fight over it.
+        if self.search.is_some() {
+            return;
+        }
         // The (path, identifier byte-span) the cursor is on, when on a symbol in an LSP buffer.
         let target = if self.focus == Focus::Editor {
             let editor = self.workspace.active();
@@ -426,8 +435,9 @@ impl App {
                 }
                 LspOutcome::DocumentHighlight { occurrences, .. } => {
                     // Tint the occurrences — but only while the cursor is still on an identifier (a
-                    // result arriving after it left one is dropped, so no stale tint lingers).
-                    if self.highlight_anchor.is_some() {
+                    // result arriving after it left one is dropped, so no stale tint lingers) and no
+                    // search owns the buffer tint.
+                    if self.highlight_anchor.is_some() && self.search.is_none() {
                         self.workspace.set_active_occurrences(occurrences);
                     }
                 }
@@ -603,7 +613,11 @@ impl App {
         for x in 0..surface.width() {
             surface.set_char(x, row, ' ', style);
         }
-        surface.set_str(0, row, &self.workspace.status_line(), style);
+        // While searching, the search line replaces the normal status line on the left.
+        let left = self
+            .search_status_line()
+            .unwrap_or_else(|| self.workspace.status_line());
+        surface.set_str(0, row, &left, style);
 
         let hint = if self.terminal.is_some() {
             if self.focus == Focus::Terminal {
@@ -638,6 +652,22 @@ impl App {
             ServerHealth::Failed => '✗',
         };
         Some(format!("{name} {glyph}"))
+    }
+
+    /// The search line shown in the status bar while a search is open: `search: <query> [i/N]` (or
+    /// `(no matches)`), or `None` when no search is active.
+    fn search_status_line(&self) -> Option<String> {
+        let search = self.search.as_ref()?;
+        let query = search.query();
+        let line = if query.is_empty() {
+            "search: ".to_owned()
+        } else {
+            match search.match_count() {
+                0 => format!("search: {query}  (no matches)"),
+                n => format!("search: {query}  [{}/{n}]", search.active_index()),
+            }
+        };
+        Some(line)
     }
 
     /// Dispatches the editor feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
@@ -717,6 +747,11 @@ impl App {
         if self.code_actions.is_some() && self.code_actions_popup_key(key) {
             return Ok(());
         }
+        // The incremental search line captures keys while open (printable chars extend the query);
+        // a non-search key exits it and falls through.
+        if self.search.is_some() && self.search_key(key) {
+            return Ok(());
+        }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
                 "Key Bindings (Esc to close)",
@@ -764,6 +799,10 @@ impl App {
             Focus::Explorer => self.explorer_key(key),
             Focus::Editor => {
                 self.workspace.handle_key(key);
+                // The `find` command (Ctrl+F / Ctrl+S / `<leader> f f`) opens the search line.
+                if self.workspace.take_search_request() {
+                    self.open_search();
+                }
                 // Auto-trigger signature help after a typed `(` or `,` (refresh on each argument),
                 // and after `)` (which makes the server report no call, closing the popup). The
                 // request runs off-thread and is a no-op when no server handles the buffer.
@@ -1102,6 +1141,96 @@ impl App {
         };
         if let Some(byte) = target {
             self.workspace.set_active_cursor(byte);
+        }
+    }
+
+    /// Opens the incremental in-buffer search, anchored at the current cursor (restored on cancel).
+    /// Triggered by the `find` command (Ctrl+F / Ctrl+S / `<leader> f f`, per profile).
+    fn open_search(&mut self) {
+        let cursor = self.workspace.active().buffer().cursor();
+        self.search = Some(Search::new(cursor));
+        self.apply_search();
+    }
+
+    /// Routes a key to the open search line: printable chars extend the query (jumping to the first
+    /// match as you type), `Backspace` trims it, `Down`/`Up` step to the next/previous match, `Enter`
+    /// accepts (exits at the current match), `Esc` cancels (restoring the cursor to where the search
+    /// began). Any other key accepts and falls through to normal editing. Returns `true` when the key
+    /// was consumed.
+    fn search_key(&mut self, key: KeyPress) -> bool {
+        if self.search.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Escape => self.close_search(true),
+            KeyCode::Enter => self.close_search(false),
+            KeyCode::Down => self.search_step(Direction::Next),
+            KeyCode::Up => self.search_step(Direction::Prev),
+            KeyCode::Backspace => self.search_edit(None),
+            KeyCode::Char(c) if !key.mods.contains(Mods::CTRL) && !key.mods.contains(Mods::ALT) => {
+                self.search_edit(Some(c));
+            }
+            _ => {
+                // A non-search key accepts at the current spot and is then handled normally.
+                self.close_search(false);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Extends (`Some(c)`) or trims (`None`) the query, recomputing matches from the search origin
+    /// and re-applying the tint + cursor jump.
+    fn search_edit(&mut self, ch: Option<char>) {
+        let text = self.workspace.active().buffer().text();
+        if let Some(search) = self.search.as_mut() {
+            let from = search.origin();
+            match ch {
+                Some(c) => search.push(c, &text, from),
+                None => search.backspace(&text, from),
+            }
+        }
+        self.apply_search();
+    }
+
+    /// Moves to the next/previous match and re-applies the tint + cursor jump.
+    fn search_step(&mut self, direction: Direction) {
+        if let Some(search) = self.search.as_mut() {
+            match direction {
+                Direction::Next => search.next(),
+                Direction::Prev => search.prev(),
+            }
+        }
+        self.apply_search();
+    }
+
+    /// Tints every match and parks the cursor on the active one (after each query/selection change).
+    fn apply_search(&mut self) {
+        let Some((occurrences, target)) = self.search.as_ref().map(|search| {
+            let occurrences: Vec<Occurrence> = search
+                .matches()
+                .iter()
+                .cloned()
+                .map(|range| Occurrence::new(range, false))
+                .collect();
+            (occurrences, search.active_match().map(|m| m.start))
+        }) else {
+            return;
+        };
+        self.workspace.set_active_occurrences(occurrences);
+        if let Some(byte) = target {
+            self.workspace.set_active_cursor(byte);
+        }
+    }
+
+    /// Closes the search, clearing the match tint. When `cancel` is set (Esc), the cursor returns to
+    /// where the search started; otherwise it stays on the current match.
+    fn close_search(&mut self, cancel: bool) {
+        if let Some(search) = self.search.take() {
+            self.workspace.clear_active_occurrences();
+            if cancel {
+                self.workspace.set_active_cursor(search.origin());
+            }
         }
     }
 
@@ -1514,6 +1643,10 @@ impl App {
                 self.goto_diagnostic(Direction::Prev);
             }
             Action::RunCommand(name) => self.workspace.execute(&name),
+        }
+        // A command may have requested the search line (e.g. `find` chosen from the palette).
+        if self.workspace.take_search_request() {
+            self.open_search();
         }
     }
 

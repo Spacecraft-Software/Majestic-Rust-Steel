@@ -488,6 +488,12 @@ impl Workspace {
         self.propagate_edits();
     }
 
+    /// Takes the focused pane's pending `find` request (set when the `find` command runs), clearing
+    /// it — so the host can open its search UI. See [`Editor::take_search_requested`].
+    pub fn take_search_request(&mut self) -> bool {
+        self.active_mut().take_search_requested()
+    }
+
     /// Opens `editor` as a new buffer and shows it in the focused pane (its previous buffer stays
     /// open as a background tab). Used by the explorer and the fuzzy file finder.
     pub fn open(&mut self, mut editor: Editor) {

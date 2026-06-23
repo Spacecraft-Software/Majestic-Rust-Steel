@@ -45,6 +45,7 @@ mod occurrence;
 mod prompt;
 mod references;
 mod rename;
+mod search;
 mod selector;
 mod session;
 mod signature;
@@ -81,6 +82,8 @@ pub use prompt::Prompt;
 pub use references::{Reference, References};
 #[doc(inline)]
 pub use rename::RenameEdit;
+#[doc(inline)]
+pub use search::Search;
 #[doc(inline)]
 pub use selector::ProfileSelector;
 #[doc(inline)]

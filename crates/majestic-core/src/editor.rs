@@ -79,6 +79,9 @@ pub struct Editor {
     page_rows: usize,
     status: String,
     quit: bool,
+    /// Set by the `find` command and consumed by the host ([`Self::take_search_requested`]): the
+    /// search UI lives in the host (it needs a modal query input), so the editor just signals it.
+    search_requested: bool,
     highlighter: Option<HighlightWorker>,
     highlights: SpanLayer<HighlightKind>,
     highlighted_revision: Option<u64>,
@@ -136,6 +139,7 @@ impl Editor {
             page_rows: 1,
             status: String::new(),
             quit: false,
+            search_requested: false,
             highlighter,
             highlights: SpanLayer::new(),
             highlighted_revision: None,
@@ -329,6 +333,12 @@ impl Editor {
         self.quit
     }
 
+    /// Takes the pending `find` request (set when the user invokes the `find` command), clearing it.
+    /// The host opens its search UI when this returns `true`.
+    pub fn take_search_requested(&mut self) -> bool {
+        std::mem::take(&mut self.search_requested)
+    }
+
     /// The current status-line message.
     #[must_use]
     pub fn status(&self) -> &str {
@@ -428,7 +438,7 @@ impl Editor {
             "profile-emacs" => self.set_profile(Profile::Emacs),
             "profile-vim" => self.set_profile(Profile::Vim),
             "save" => self.save(),
-            "find" => "find: not yet implemented (M1)".clone_into(&mut self.status),
+            "find" => self.search_requested = true,
             "quit" | "close-buffer" => self.quit = true,
             other => self.status = format!("unbound command: {other}"),
         }
