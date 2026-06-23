@@ -14,6 +14,7 @@
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use penumbra::{Buffer as Surface, Rect, Style, Theme};
 
+use std::io;
 use std::ops::Range;
 use std::path::Path;
 
@@ -494,6 +495,34 @@ impl Workspace {
         self.editors.push(editor);
         let index = self.editors.len() - 1;
         self.root.set_nth_editor(self.focused, index);
+    }
+
+    /// Shows the file at `path` in the focused pane, **reusing an already-open editor** when one
+    /// exists — so a goto-definition jump never opens a second, divergent [`Document`] for a file
+    /// that is already open, and a same-file jump simply refocuses the active editor. Opens the
+    /// file only when it is not yet open anywhere.
+    ///
+    /// [`Document`]: crate::Buffer
+    ///
+    /// # Errors
+    /// Returns an I/O error only when the file must be opened from disk and cannot be read.
+    pub fn reveal_path(&mut self, path: &Path) -> io::Result<()> {
+        if let Some(index) = self
+            .editors
+            .iter()
+            .position(|editor| editor.buffer().path().as_deref() == Some(path))
+        {
+            self.root.set_nth_editor(self.focused, index);
+            return Ok(());
+        }
+        self.open(Editor::with_buffer(Buffer::open(path)?));
+        Ok(())
+    }
+
+    /// Moves the focused pane's cursor to byte `offset` (clamped to a char boundary). Used to land
+    /// on a goto-definition target once its destination file has been revealed.
+    pub fn set_active_cursor(&mut self, offset: usize) {
+        self.active_mut().buffer_mut().set_cursor(offset);
     }
 
     /// Feeds a key: runs a window command, or forwards it to the focused editor.

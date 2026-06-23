@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, HoverClientCapabilities,
-    InitializeParams, InitializeResult, InitializedParams, MarkupKind, PublishDiagnosticsParams,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
-    VersionedTextDocumentIdentifier, WorkspaceFolder,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, GotoCapability,
+    HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams, MarkupKind,
+    PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentItem, Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -206,6 +206,10 @@ fn client_capabilities() -> ClientCapabilities {
             hover: Some(HoverClientCapabilities {
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 ..Default::default()
+            }),
+            definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(false),
             }),
             ..Default::default()
         }),

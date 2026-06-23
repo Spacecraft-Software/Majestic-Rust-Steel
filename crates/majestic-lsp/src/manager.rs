@@ -18,9 +18,10 @@ use std::time::Duration;
 
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
-    DiagnosticSeverity, Hover as LspHover, HoverContents, HoverParams, MarkedString, MarkupContent,
-    MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+    DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover,
+    HoverContents, HoverParams, MarkedString, MarkupContent, MarkupKind, PartialResultParams,
+    Position, PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    WorkDoneProgressParams,
 };
 use majestic_core::{CompletionItem, Diagnostic, Severity};
 
@@ -93,6 +94,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The hover content reduced to plain text, or `None` when there is nothing to show.
         text: Option<String>,
+    },
+    /// The definition site for the cursor in the document at `path`. `target` is the destination
+    /// file and LSP position, or `None` when the server found no definition (nothing happens).
+    GotoDefinition {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The destination file + position, or `None` when there is nothing to jump to.
+        target: Option<(PathBuf, Position)>,
     },
 }
 
@@ -273,6 +282,31 @@ impl LspManager {
         });
     }
 
+    /// Requests the definition site for the cursor `byte` in `path`, off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Like
+    /// [`Self::request_hover`], the request and its bounded wait run on a worker thread holding a
+    /// shared [`Requester`]; the result arrives via [`Self::poll_outcomes`] as
+    /// [`LspOutcome::GotoDefinition`].
+    pub fn request_goto_definition(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let target = fetch_goto_definition(&requester, uri, position);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::GotoDefinition { path, target });
+        });
+    }
+
     /// Drains the interactive-request results (completion, …) that have arrived since the last call.
     /// The host calls this each frame and applies each outcome (e.g. opens the completion popup).
     pub fn poll_outcomes(&mut self) -> Vec<LspOutcome> {
@@ -390,7 +424,11 @@ fn severity_of(severity: Option<DiagnosticSeverity>) -> Severity {
 /// `character` is treated as a Unicode-scalar offset — exact for the BMP/ASCII; astral-plane
 /// columns (which LSP counts as two UTF-16 units) are refined in a later pass. A line or column
 /// past the end clamps to the end of the line / document.
-fn position_to_byte(text: &str, line: u32, character: u32) -> usize {
+///
+/// Exposed so the host can map a server-reported position (e.g. a goto-definition target, or a
+/// formatting edit's range) to a byte offset against the relevant document's text.
+#[must_use]
+pub fn position_to_byte(text: &str, line: u32, character: u32) -> usize {
     let mut offset = 0usize;
     for (index, line_text) in text.split_inclusive('\n').enumerate() {
         if u32::try_from(index).unwrap_or(u32::MAX) == line {
@@ -433,6 +471,49 @@ fn byte_to_position(text: &str, byte: usize) -> Position {
     let last_line = u32::try_from(text.split('\n').count().saturating_sub(1)).unwrap_or(u32::MAX);
     let last_chars = text.rsplit('\n').next().unwrap_or("").chars().count();
     Position::new(last_line, u32::try_from(last_chars).unwrap_or(u32::MAX))
+}
+
+/// Issues `textDocument/definition` over a shared [`Requester`] (on a worker thread) and reduces
+/// the reply to a destination `(path, position)`. Handles all three response shapes (a single
+/// `Location`, an array of them, or `LocationLink`s), taking the first. A timeout, transport
+/// error, server error, `null`, or empty result all yield `None` (nothing happens).
+fn fetch_goto_definition(
+    requester: &Requester,
+    uri: Uri,
+    position: Position,
+) -> Option<(PathBuf, Position)> {
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let value = serde_json::to_value(params).ok()?;
+    let response = requester
+        .request_timeout("textDocument/definition", value, Duration::from_secs(3))
+        .ok()?;
+    let result = response.into_result().ok()?;
+    // A `null` result (no definition) deserializes to `None`.
+    let parsed: Option<GotoDefinitionResponse> = serde_json::from_value(result).unwrap_or(None);
+    let (target_uri, target_position) = match parsed? {
+        GotoDefinitionResponse::Scalar(location) => (location.uri, location.range.start),
+        GotoDefinitionResponse::Array(locations) => {
+            let first = locations.into_iter().next()?;
+            (first.uri, first.range.start)
+        }
+        GotoDefinitionResponse::Link(links) => {
+            let first = links.into_iter().next()?;
+            (first.target_uri, first.target_selection_range.start)
+        }
+    };
+    Some((uri_to_path(&target_uri)?, target_position))
+}
+
+/// Best-effort `file://` URI → filesystem path (v1 assumes no percent-encoding).
+fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    uri.as_str().strip_prefix("file://").map(PathBuf::from)
 }
 
 /// Issues `textDocument/completion` over a shared [`Requester`] (on a worker thread) and converts
@@ -851,5 +932,122 @@ mod tests {
                 .any(|d| d.range.start < d.range.end && d.range.end <= source.len()),
             "a diagnostic should cover a non-empty span inside the document: {found:?}"
         );
+    }
+
+    #[test]
+    fn goto_definition_request_yields_target_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one `textDocument/definition` with a single Location, idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            // `open` sends `didOpen` first; skip notifications until the definition request arrives.
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/definition" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "uri": "file:///tmp/does-not-exist-target.rs",
+                        "range": {
+                            "start": {"line": 2, "character": 4},
+                            "end": {"line": 2, "character": 10}
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-g.rs");
+        manager.open(path, "let _ = foo").unwrap();
+        manager.request_goto_definition(path, "let _ = foo".len());
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::GotoDefinition { path: got, target } = &outcomes[0] else {
+            panic!("expected a goto-definition outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        let (target_path, position) = target.as_ref().expect("a definition target");
+        assert_eq!(
+            target_path,
+            std::path::Path::new("/tmp/does-not-exist-target.rs")
+        );
+        assert_eq!((position.line, position.character), (2, 4));
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_jumps_to_a_definition() {
+        use std::fs;
+
+        // A throwaway cargo project where `main` calls a local function `target`.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-gd-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source = "fn target() -> i32 {\n    42\n}\nfn main() {\n    let _ = target();\n}\n";
+        fs::write(&main_rs, source).unwrap();
+        // The cursor on the `target()` call (the last occurrence of the identifier).
+        let call_byte = source.rfind("target").unwrap() + 1;
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        // Drive startup (`poll`) and keep issuing the request until the (async-started) server is
+        // ready and replies. Goto-definition should resolve the call back to `fn target` on line 0.
+        let mut target = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup (ignore diagnostics)
+            manager.request_goto_definition(&main_rs, call_byte); // a no-op until ready
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::GotoDefinition {
+                    target: Some(found),
+                    ..
+                } = outcome
+                {
+                    target = Some(found);
+                }
+            }
+            if target.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        let (target_path, position) = target.expect("rust-analyzer should resolve the definition");
+        assert_eq!(target_path, main_rs, "definition is in the same file");
+        assert_eq!(position.line, 0, "`fn target` is on line 0");
     }
 }
