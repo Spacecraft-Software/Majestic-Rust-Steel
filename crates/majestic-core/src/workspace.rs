@@ -21,6 +21,7 @@ use std::path::Path;
 use crate::buffer::Buffer;
 use crate::diagnostic::Diagnostic;
 use crate::editor::Editor;
+use crate::fold::FoldRange;
 use crate::inlay::InlayHint;
 use crate::occurrence::Occurrence;
 use crate::session::{LayoutNode, PaneState, Session};
@@ -293,6 +294,21 @@ impl Workspace {
                 editor.set_inlay_hints(hints.to_vec());
             }
         }
+    }
+
+    /// Applies foldable `folds` to every pane showing the file at `path` (the ranges are per-file;
+    /// each pane keeps its own collapsed state). From the server's `textDocument/foldingRange` reply.
+    pub fn apply_folds(&mut self, path: &Path, folds: &[FoldRange]) {
+        for editor in &mut self.editors {
+            if editor.buffer().path().as_deref() == Some(path) {
+                editor.set_folds(folds.to_vec());
+            }
+        }
+    }
+
+    /// Toggles the fold under the cursor in the focused pane (the `toggle-fold` command).
+    pub fn toggle_active_fold(&mut self) {
+        self.active_mut().toggle_fold();
     }
 
     /// Captures the layout, open files, and cursor/viewport of every pane into a [`Session`] for

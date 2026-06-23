@@ -26,10 +26,10 @@ use lsp_types::{
     CodeActionLiteralSupport, CompletionClientCapabilities, CompletionItemCapability,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingClientCapabilities,
     DocumentHighlightClientCapabilities, DocumentSymbolClientCapabilities,
-    ExecuteCommandClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
-    InitializeResult, InitializedParams, InlayHintClientCapabilities, MarkupKind,
-    PublishDiagnosticsParams, ReferenceClientCapabilities, RenameClientCapabilities,
-    SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+    ExecuteCommandClientCapabilities, FoldingRangeClientCapabilities, GotoCapability,
+    HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams,
+    InlayHintClientCapabilities, MarkupKind, PublishDiagnosticsParams, ReferenceClientCapabilities,
+    RenameClientCapabilities, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
     WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceSymbolClientCapabilities,
 };
@@ -277,6 +277,7 @@ fn client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(false),
             }),
             inlay_hint: Some(InlayHintClientCapabilities::default()),
+            folding_range: Some(FoldingRangeClientCapabilities::default()),
             ..Default::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {

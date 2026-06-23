@@ -9,6 +9,7 @@
 //! the visible lines, a reverse-video cursor cell, and a status line into a Penumbra buffer.
 //! The interactive `crossterm` loop and the `mj FILE` binary wire this up in M0 step 7.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use keymaker::{
@@ -21,6 +22,7 @@ use stratum::{Point, SpanLayer};
 
 use crate::buffer::Buffer;
 use crate::diagnostic::{Diagnostic, Severity};
+use crate::fold::FoldRange;
 use crate::inlay::InlayHint;
 use crate::occurrence::Occurrence;
 use crate::syntax::{HighlightKind, HighlightWorker};
@@ -96,6 +98,10 @@ pub struct Editor {
     /// Inlay hints (LSP `textDocument/inlayHint`), sorted by byte, drawn as inline virtual text.
     /// Transient: re-requested by the host as the buffer changes.
     inlay_hints: Vec<InlayHint>,
+    /// Foldable ranges (LSP `textDocument/foldingRange`), sorted by start line.
+    folds: Vec<FoldRange>,
+    /// The header lines of the folds currently collapsed — their interiors are hidden from render.
+    folded: BTreeSet<usize>,
 }
 
 /// Default indent width in columns (CUA convention; overridden by `majestic-config`).
@@ -152,6 +158,8 @@ impl Editor {
             diagnostics: Vec::new(),
             occurrences: Vec::new(),
             inlay_hints: Vec::new(),
+            folds: Vec::new(),
+            folded: BTreeSet::new(),
         }
     }
 
@@ -230,6 +238,83 @@ impl Editor {
             .flat_map(|hint| hint.text.chars())
             .map(|ch| usize::from(char_width(ch)))
             .sum()
+    }
+
+    /// Replaces the foldable ranges (set by the host from `textDocument/foldingRange`): keeps only
+    /// the genuinely multi-line ones, sorted by start line. A collapsed fold whose header no longer
+    /// begins a range is forgotten (the structure shifted under it).
+    pub fn set_folds(&mut self, mut folds: Vec<FoldRange>) {
+        folds.retain(FoldRange::is_foldable);
+        folds.sort_by_key(|fold| fold.start);
+        self.folded
+            .retain(|start| folds.iter().any(|fold| fold.start == *start));
+        self.folds = folds;
+    }
+
+    /// Toggles the innermost fold covering the cursor's line — collapses it, or expands it if already
+    /// collapsed. Collapsing pulls the cursor back to the fold header if it sat in the hidden
+    /// interior, so the cursor never lands on a hidden line. A no-op when no fold covers the cursor.
+    pub fn toggle_fold(&mut self) {
+        let line = self.buffer.cursor_point().row;
+        let Some(fold) = self
+            .folds
+            .iter()
+            .filter(|fold| fold.start <= line && line <= fold.end)
+            .max_by_key(|fold| fold.start)
+            .copied()
+        else {
+            return;
+        };
+        if self.folded.contains(&fold.start) {
+            self.folded.remove(&fold.start);
+        } else {
+            self.folded.insert(fold.start);
+            if fold.hides(line) {
+                let byte = self.buffer.rope().point_to_byte(Point::new(fold.start, 0));
+                self.buffer.set_cursor(byte);
+            }
+        }
+    }
+
+    /// Whether `line` is hidden inside some collapsed fold (skipped by the render and cursor walks).
+    /// Cheap (`false`) when nothing is folded.
+    fn is_line_hidden(&self, line: usize) -> bool {
+        if self.folded.is_empty() {
+            return false;
+        }
+        self.folds
+            .iter()
+            .any(|fold| self.folded.contains(&fold.start) && fold.hides(line))
+    }
+
+    /// Whether `line` is the header of a currently-collapsed fold (drawn with a `⋯` marker).
+    fn is_folded_header(&self, line: usize) -> bool {
+        self.folded.contains(&line)
+    }
+
+    /// The next visible line after `line`, skipping any collapsed fold's hidden interior. May reach
+    /// `len_lines` (past the end). Equal to `line + 1` when nothing is folded.
+    fn next_visible_line(&self, line: usize) -> usize {
+        let mut next = line + 1;
+        while self.is_line_hidden(next) {
+            next += 1;
+        }
+        next
+    }
+
+    /// The count of visible lines in `[viewport_top, line)` — the cursor's screen row when `line` is
+    /// the cursor's (always-visible) line. `line - viewport_top` when nothing is folded.
+    fn visible_rows_to(&self, line: usize) -> usize {
+        if self.folded.is_empty() {
+            return line.saturating_sub(self.viewport_top);
+        }
+        let mut count = 0;
+        let mut current = self.viewport_top;
+        while current < line {
+            count += 1;
+            current = self.next_visible_line(current);
+        }
+        count
     }
 
     /// A second view of this editor's buffer: a new editor sharing the document (and thus text +
@@ -542,12 +627,24 @@ impl Editor {
         let base = theme.base_style();
         let gutter_style = Style::new(theme.accent, theme.background); // Steel Blue (structural)
         let current_style = Style::new(theme.foreground, theme.background); // brighter on the cursor row
-        let hint_style = Style::new(theme.info, theme.background); // Liquid Coolant (muted, virtual)
         let cursor_row = self.buffer.cursor_point().row;
         let rope = self.buffer.rope();
         let first_line = self.viewport_top;
         let start_byte = rope.point_to_byte(Point::new(first_line, 0));
-        let last_line = (first_line + usize::from(area.height)).min(rope.len_lines());
+        // The last line whose bytes the style range must cover. With folds, the visible rows reach
+        // further than `height` source lines, so walk visible lines to find the extent.
+        let last_line = if self.folded.is_empty() {
+            (first_line + usize::from(area.height)).min(rope.len_lines())
+        } else {
+            let mut line = first_line;
+            for _ in 0..area.height {
+                if line >= rope.len_lines() {
+                    break;
+                }
+                line = self.next_visible_line(line);
+            }
+            line.min(rope.len_lines())
+        };
         let end_byte = if last_line >= rope.len_lines() {
             rope.len_bytes()
         } else {
@@ -555,8 +652,8 @@ impl Editor {
         };
         let styles = self.visible_styles(start_byte, end_byte, base, theme);
 
+        let mut line_index = first_line;
         for row in 0..area.height {
-            let line_index = first_line + usize::from(row);
             if line_index >= rope.len_lines() {
                 break;
             }
@@ -576,58 +673,88 @@ impl Editor {
                     surface.set_char(area.x + col, area.y + row, ch, style);
                 }
             }
-            let mut byte = rope.point_to_byte(Point::new(line_index, 0));
-            let mut display = 0usize; // absolute display column within the line
-            let line_text = rope.line(line_index);
-            let mut chars = line_text.chars();
-            'line: loop {
-                // Inlay hints render as virtual text just before the character at `byte` (and at the
-                // line end, when `chars` is exhausted) — they exist only on screen, not in the buffer.
-                if !self.inlay_hints.is_empty() {
-                    for hint in self.inlay_hints.iter().filter(|hint| hint.byte == byte) {
-                        for hc in hint.text.chars() {
-                            if display >= self.viewport_left {
-                                let screen = display - self.viewport_left;
-                                if screen >= usize::from(text_area.width) {
-                                    break 'line;
-                                }
-                                if let Ok(col) = u16::try_from(screen) {
-                                    surface.set_char(
-                                        text_area.x + col,
-                                        area.y + row,
-                                        hc,
-                                        hint_style,
-                                    );
-                                }
-                            }
-                            display += usize::from(char_width(hc));
-                        }
-                    }
-                }
-                let Some(ch) = chars.next() else {
-                    break;
-                };
-                if display >= self.viewport_left {
-                    let screen = display - self.viewport_left;
-                    if screen >= usize::from(text_area.width) {
-                        break; // the rest of the line is off the right edge
-                    }
-                    if let Ok(col) = u16::try_from(screen) {
-                        let style = styles.get(byte - start_byte).copied().unwrap_or(base);
-                        let style = self.apply_diagnostic(byte, style, theme);
-                        let style = self.apply_occurrence(byte, style, theme);
-                        surface.set_char(text_area.x + col, area.y + row, ch, style);
-                    }
-                }
-                // Glyphs left of the viewport (or a wide glyph straddling its left edge) are
-                // skipped — only their width is accounted for.
-                display += usize::from(char_width(ch));
-                byte += ch.len_utf8();
-            }
+            self.render_line_text(surface, text_area, area.y + row, line_index, &styles, theme);
+            line_index = self.next_visible_line(line_index);
         }
 
         if focused {
             self.draw_cursor(surface, theme, area);
+        }
+    }
+
+    /// Renders one buffer line's content into `text_area` at screen row `y`: real glyphs styled by
+    /// syntax / diagnostics / occurrences, with inlay hints interleaved at their byte positions and a
+    /// `⋯` marker appended when the line is a collapsed fold header. Honors the horizontal scroll.
+    fn render_line_text(
+        &self,
+        surface: &mut Surface,
+        text_area: Rect,
+        y: u16,
+        line_index: usize,
+        styles: &[Style],
+        theme: &Theme,
+    ) {
+        let base = theme.base_style();
+        let hint_style = Style::new(theme.info, theme.background);
+        let rope = self.buffer.rope();
+        // The style slice is indexed from the first visible line's start byte (see `render_in`).
+        let start_byte = rope.point_to_byte(Point::new(self.viewport_top, 0));
+        let mut byte = rope.point_to_byte(Point::new(line_index, 0));
+        let mut display = 0usize; // absolute display column within the line
+        let line_text = rope.line(line_index);
+        let mut chars = line_text.chars();
+        'line: loop {
+            // Inlay hints render as virtual text just before the character at `byte` (and at the line
+            // end, when `chars` is exhausted) — they exist only on screen, not in the buffer.
+            if !self.inlay_hints.is_empty() {
+                for hint in self.inlay_hints.iter().filter(|hint| hint.byte == byte) {
+                    for hc in hint.text.chars() {
+                        if display >= self.viewport_left {
+                            let screen = display - self.viewport_left;
+                            if screen >= usize::from(text_area.width) {
+                                break 'line;
+                            }
+                            if let Ok(col) = u16::try_from(screen) {
+                                surface.set_char(text_area.x + col, y, hc, hint_style);
+                            }
+                        }
+                        display += usize::from(char_width(hc));
+                    }
+                }
+            }
+            let Some(ch) = chars.next() else {
+                break;
+            };
+            if display >= self.viewport_left {
+                let screen = display - self.viewport_left;
+                if screen >= usize::from(text_area.width) {
+                    break; // the rest of the line is off the right edge
+                }
+                if let Ok(col) = u16::try_from(screen) {
+                    let style = styles.get(byte - start_byte).copied().unwrap_or(base);
+                    let style = self.apply_diagnostic(byte, style, theme);
+                    let style = self.apply_occurrence(byte, style, theme);
+                    surface.set_char(text_area.x + col, y, ch, style);
+                }
+            }
+            // Glyphs left of the viewport (or a wide glyph straddling its left edge) are skipped —
+            // only their width is accounted for.
+            display += usize::from(char_width(ch));
+            byte += ch.len_utf8();
+        }
+        // A collapsed fold's header gets a `⋯` marker after its text (the hidden interior).
+        if self.is_folded_header(line_index) {
+            for marker in " ⋯".chars() {
+                if display >= self.viewport_left {
+                    let screen = display - self.viewport_left;
+                    if screen < usize::from(text_area.width) {
+                        if let Ok(col) = u16::try_from(screen) {
+                            surface.set_char(text_area.x + col, y, marker, hint_style);
+                        }
+                    }
+                }
+                display += usize::from(char_width(marker));
+            }
         }
     }
 
@@ -757,8 +884,16 @@ impl Editor {
             let row = self.buffer.cursor_point().row;
             if row < self.viewport_top {
                 self.viewport_top = row;
-            } else if row >= self.viewport_top + rows {
-                self.viewport_top = row + 1 - rows;
+            } else if self.folded.is_empty() {
+                if row >= self.viewport_top + rows {
+                    self.viewport_top = row + 1 - rows;
+                }
+            } else {
+                // Visible-line aware: scroll down one visible line at a time until the cursor's
+                // visible row fits within the viewport.
+                while self.visible_rows_to(row) >= rows {
+                    self.viewport_top = self.next_visible_line(self.viewport_top);
+                }
             }
         }
         let cols = usize::from(area.width);
@@ -788,7 +923,7 @@ impl Editor {
         if row < self.viewport_top {
             return None;
         }
-        let screen_row = row - self.viewport_top;
+        let screen_row = self.visible_rows_to(row);
         let column = self.cursor_display_column();
         if column < self.viewport_left {
             return None; // cursor scrolled off the left edge
@@ -1201,6 +1336,48 @@ mod tests {
         assert!(
             surface.cell(17, 0).unwrap().style.attrs.reverse,
             "cursor shifted right by the inlay hint"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_fold_hides_its_interior_and_remaps_the_rows() {
+        use crate::fold::FoldRange;
+        fn row_text(surface: &Surface, y: u16) -> String {
+            (0..surface.width())
+                .filter_map(|x| surface.cell(x, y).map(|cell| cell.symbol))
+                .collect()
+        }
+
+        let theme = Theme::steelbore();
+        // 6 lines; fold the header (0) over its body (1..=2).
+        let mut editor = Editor::with_buffer(Buffer::from_text("fn f\n  a\n  b\nx\ny\nz"));
+        editor.set_folds(vec![FoldRange::new(0, 2)]);
+        editor.toggle_fold(); // cursor starts on line 0 (the header) → collapse
+
+        let mut surface = Surface::new(30, 8, theme.base_style());
+        editor.render(&mut surface, &theme);
+        // Row 0: the header line with a fold marker.
+        let row0 = row_text(&surface, 0);
+        assert!(row0.contains("fn f"));
+        assert!(row0.contains('⋯'), "folded header shows a marker: {row0:?}");
+        // Row 1 skips the hidden body (lines 1-2) to line 3 (`x`), whose 1-based gutter number is 4.
+        let row1 = row_text(&surface, 1);
+        assert!(
+            row1.contains('x'),
+            "first row after the fold is line 3: {row1:?}"
+        );
+        assert!(
+            row1.contains('4'),
+            "its gutter shows line number 4: {row1:?}"
+        );
+
+        // Expanding restores the hidden lines.
+        editor.toggle_fold();
+        editor.render(&mut surface, &theme);
+        let restored = row_text(&surface, 1);
+        assert!(
+            restored.contains('a'),
+            "line 1 is visible again once expanded: {restored:?}"
         );
     }
 
