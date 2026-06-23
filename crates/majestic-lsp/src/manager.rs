@@ -433,6 +433,24 @@ impl LspManager {
     /// shared [`Requester`]; the result arrives via [`Self::poll_outcomes`] as
     /// [`LspOutcome::GotoDefinition`].
     pub fn request_goto_definition(&self, path: &Path, byte: usize) {
+        self.request_goto(path, byte, "textDocument/definition");
+    }
+
+    /// Requests the *type* definition site for the cursor `byte` in `path` (the declaration of the
+    /// type of the symbol), off the editor thread. Shares the goto-definition machinery + outcome.
+    pub fn request_type_definition(&self, path: &Path, byte: usize) {
+        self.request_goto(path, byte, "textDocument/typeDefinition");
+    }
+
+    /// Requests the implementation site for the cursor `byte` in `path` (e.g. the `impl` of a trait
+    /// method), off the editor thread. Shares the goto-definition machinery + outcome.
+    pub fn request_implementation(&self, path: &Path, byte: usize) {
+        self.request_goto(path, byte, "textDocument/implementation");
+    }
+
+    /// Shared worker setup for the goto-style requests (definition / type-definition / implementation
+    /// — all share request/response shape and resolve to a single jump target).
+    fn request_goto(&self, path: &Path, byte: usize, method: &'static str) {
         let Some(doc) = self.docs.get(path) else {
             return;
         };
@@ -445,7 +463,7 @@ impl LspManager {
         let path = path.to_owned();
         let tx = self.outcomes_tx.clone();
         thread::spawn(move || {
-            let target = fetch_goto_definition(&requester, uri, position);
+            let target = fetch_goto(&requester, uri, position, method);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::GotoDefinition { path, target });
         });
@@ -768,14 +786,16 @@ fn byte_to_position(text: &str, byte: usize) -> Position {
     Position::new(last_line, u32::try_from(last_chars).unwrap_or(u32::MAX))
 }
 
-/// Issues `textDocument/definition` over a shared [`Requester`] (on a worker thread) and reduces
-/// the reply to a destination `(path, position)`. Handles all three response shapes (a single
-/// `Location`, an array of them, or `LocationLink`s), taking the first. A timeout, transport
-/// error, server error, `null`, or empty result all yield `None` (nothing happens).
-fn fetch_goto_definition(
+/// Issues a goto-style request (`textDocument/definition`, `…/typeDefinition`, or
+/// `…/implementation` — all share the same request/response shape) over a shared [`Requester`] (on a
+/// worker thread) and reduces the reply to a destination `(path, position)`. Handles all three
+/// response shapes (a single `Location`, an array of them, or `LocationLink`s), taking the first. A
+/// timeout, transport error, server error, `null`, or empty result all yield `None` (nothing happens).
+fn fetch_goto(
     requester: &Requester,
     uri: Uri,
     position: Position,
+    method: &str,
 ) -> Option<(PathBuf, Position)> {
     let params = GotoDefinitionParams {
         text_document_position_params: TextDocumentPositionParams {
@@ -787,7 +807,7 @@ fn fetch_goto_definition(
     };
     let value = serde_json::to_value(params).ok()?;
     let response = requester
-        .request_timeout("textDocument/definition", value, Duration::from_secs(3))
+        .request_timeout(method, value, Duration::from_secs(3))
         .ok()?;
     let result = response.into_result().ok()?;
     // A `null` result (no definition) deserializes to `None`.
@@ -1797,6 +1817,68 @@ mod tests {
             std::path::Path::new("/tmp/does-not-exist-target.rs")
         );
         assert_eq!((position.line, position.character), (2, 4));
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn implementation_request_uses_its_method_and_yields_a_target() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // The mock answers only `textDocument/implementation` — proving the new request routes to
+        // that method (and reuses the GotoDefinition outcome + jump).
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/implementation" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "uri": "file:///tmp/does-not-exist-impl.rs",
+                        "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 4}}
+                    }
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-i.rs");
+        manager.open(path, "let _ = foo").unwrap();
+        manager.request_implementation(path, "let _ = foo".len());
+
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::GotoDefinition { target, .. } = &outcomes[0] else {
+            panic!("expected a goto-definition outcome, got {:?}", outcomes[0]);
+        };
+        let (target_path, position) = target.as_ref().expect("an implementation target");
+        assert_eq!(
+            target_path,
+            std::path::Path::new("/tmp/does-not-exist-impl.rs")
+        );
+        assert_eq!(position.line, 5);
 
         mock.join().unwrap();
     }

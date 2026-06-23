@@ -710,9 +710,13 @@ impl App {
             return Ok(());
         }
         if is_command_palette(key) {
-            // The editor commands (from Oracle) plus the host-level `reload-config` command.
+            // The editor commands (from Oracle) plus the host-level commands the App handles itself.
             let mut commands = oracle::command_names();
-            commands.push("reload-config");
+            commands.extend([
+                "reload-config",
+                "goto-type-definition",
+                "goto-implementation",
+            ]);
             self.finder = Some(Finder::commands(&commands));
             return Ok(());
         }
@@ -1062,6 +1066,44 @@ impl App {
         }
         let cursor = editor.buffer().cursor();
         self.lsp.request_goto_definition(&path, cursor);
+    }
+
+    /// Requests LSP goto-type-definition at the cursor (jump to the declaration of the symbol's
+    /// type), off-thread; the jump reuses the goto-definition path in `sync_lsp`. Invoked by the
+    /// `goto-type-definition` palette command. A no-op unless the editor is focused and a server
+    /// handles the buffer.
+    fn trigger_type_definition(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_type_definition(&path, cursor);
+    }
+
+    /// Requests LSP goto-implementation at the cursor (jump to a trait method's `impl`, etc.),
+    /// off-thread; the jump reuses the goto-definition path in `sync_lsp`. Invoked by the
+    /// `goto-implementation` palette command. A no-op unless the editor is focused and a server
+    /// handles the buffer.
+    fn trigger_implementation(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_implementation(&path, cursor);
     }
 
     /// Requests LSP find-references at the cursor, off-thread; the popup opens later, in `sync_lsp`,
@@ -1422,6 +1464,12 @@ impl App {
         match action {
             Action::OpenFile(path) => self.open_path(&path),
             Action::RunCommand(name) if name == "reload-config" => self.reload_config(),
+            Action::RunCommand(name) if name == "goto-type-definition" => {
+                self.trigger_type_definition();
+            }
+            Action::RunCommand(name) if name == "goto-implementation" => {
+                self.trigger_implementation();
+            }
             Action::RunCommand(name) => self.workspace.execute(&name),
         }
     }
