@@ -23,15 +23,15 @@ use lsp_types::{
     DocumentChanges, DocumentFormattingParams, DocumentHighlight as LspDocumentHighlight,
     DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
     DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover as LspHover, HoverContents, HoverParams, Location, MarkedString, MarkupContent,
-    MarkupKind, OneOf, ParameterLabel, PartialResultParams, Position, PublishDiagnosticsParams,
-    Range as LspRange, ReferenceContext, ReferenceParams, RenameParams,
-    SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentEdit,
-    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
-    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    Hover as LspHover, HoverContents, HoverParams, InlayHint as LspInlayHint, InlayHintLabel,
+    InlayHintParams, Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel,
+    PartialResultParams, Position, PublishDiagnosticsParams, Range as LspRange, ReferenceContext,
+    ReferenceParams, RenameParams, SignatureHelp as LspSignatureHelp, SignatureHelpParams,
+    SymbolKind, TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit,
+    Uri, WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use majestic_core::{
-    CodeAction, CompletionItem, Diagnostic, Occurrence, Reference, RenameEdit, Severity,
+    CodeAction, CompletionItem, Diagnostic, InlayHint, Occurrence, Reference, RenameEdit, Severity,
     SignatureHelp, Symbol,
 };
 
@@ -159,6 +159,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The occurrences (byte ranges + read/write), tinted in the buffer by the host.
         occurrences: Vec<Occurrence>,
+    },
+    /// Inlay hints (type/parameter annotations) for the document at `path`, as byte-positioned
+    /// virtual text the host draws inline. Empty when the server has none.
+    InlayHints {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The hints (byte position + display text), applied to the buffer's views by the host.
+        hints: Vec<InlayHint>,
     },
     /// The code actions (quick-fixes / refactors) the server offers at the cursor in the document at
     /// `path`, ready to show in the menu. Empty when the server offers none (the menu does not open).
@@ -550,6 +558,28 @@ impl LspManager {
             let occurrences = fetch_document_highlight(&requester, uri, position, &snapshot);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::DocumentHighlight { path, occurrences });
+        });
+    }
+
+    /// Requests inlay hints for the whole document at `path` (LSP `textDocument/inlayHint`), off the
+    /// editor thread. A no-op unless the document is open and its server is [`ServerSlot::Ready`]; the
+    /// result arrives via [`Self::poll_outcomes`] as [`LspOutcome::InlayHints`].
+    pub fn request_inlay_hints(&self, path: &Path) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let uri = doc.uri.clone();
+        let snapshot = doc.text.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let hints = fetch_inlay_hints(&requester, uri, &snapshot);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::InlayHints { path, hints });
         });
     }
 
@@ -1042,6 +1072,60 @@ fn fetch_document_highlight(
             .max(start);
             let write = highlight.kind == Some(DocumentHighlightKind::WRITE);
             Occurrence::new(start..end, write)
+        })
+        .collect()
+}
+
+/// Issues `textDocument/inlayHint` for the whole `snapshot` over a shared [`Requester`] (on a worker
+/// thread) and converts the reply to editor-facing [`InlayHint`]s: the byte position the hint renders
+/// before, plus its display text (label parts concatenated, with the server's requested left/right
+/// padding folded in). A timeout, transport error, server error, `null`, or empty result all yield an
+/// empty list.
+fn fetch_inlay_hints(requester: &Requester, uri: Uri, snapshot: &str) -> Vec<InlayHint> {
+    let params = InlayHintParams {
+        text_document: TextDocumentIdentifier { uri },
+        // Cover the entire document.
+        range: LspRange::new(
+            Position::new(0, 0),
+            byte_to_position(snapshot, snapshot.len()),
+        ),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/inlayHint", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (no hints) deserializes to `None`.
+    let hints: Option<Vec<LspInlayHint>> = serde_json::from_value(result).unwrap_or(None);
+    let Some(hints) = hints else {
+        return Vec::new();
+    };
+    hints
+        .into_iter()
+        .map(|hint| {
+            let byte = position_to_byte(snapshot, hint.position.line, hint.position.character);
+            let label = match hint.label {
+                InlayHintLabel::String(text) => text,
+                InlayHintLabel::LabelParts(parts) => {
+                    parts.into_iter().map(|part| part.value).collect()
+                }
+            };
+            let mut text = String::new();
+            if hint.padding_left == Some(true) {
+                text.push(' ');
+            }
+            text.push_str(&label);
+            if hint.padding_right == Some(true) {
+                text.push(' ');
+            }
+            InlayHint::new(byte, text)
         })
         .collect()
 }
@@ -3034,6 +3118,67 @@ mod tests {
             "preview names the symbol: {:?}",
             symbols[0].preview
         );
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn inlay_hint_request_converts_position_and_padding_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock answering one `textDocument/inlayHint` with a type hint that asks for left padding.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/inlayHint" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {
+                            "position": {"line": 0, "character": 5},
+                            "label": ": i32",
+                            "paddingLeft": true
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-inlay.rs");
+        manager.open(path, "let x = 1").unwrap();
+        manager.request_inlay_hints(path);
+
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::InlayHints { hints, .. } = &outcomes[0] else {
+            panic!("expected an inlay-hints outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].byte, 5); // position (0,5) → byte 5
+        assert_eq!(hints[0].text, " : i32"); // leading padding folded into the text
 
         mock.join().unwrap();
     }

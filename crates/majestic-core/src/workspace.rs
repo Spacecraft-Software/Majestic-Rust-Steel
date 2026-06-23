@@ -21,6 +21,7 @@ use std::path::Path;
 use crate::buffer::Buffer;
 use crate::diagnostic::Diagnostic;
 use crate::editor::Editor;
+use crate::inlay::InlayHint;
 use crate::occurrence::Occurrence;
 use crate::session::{LayoutNode, PaneState, Session};
 use crate::whichkey::WhichKey;
@@ -280,6 +281,16 @@ impl Workspace {
         for editor in &mut self.editors {
             if editor.buffer().path().as_deref() == Some(path) {
                 editor.set_diagnostics(diagnostics.to_vec());
+            }
+        }
+    }
+
+    /// Applies inlay `hints` to every pane showing the file at `path` (so both views update
+    /// together). Called from the host with the language server's `textDocument/inlayHint` reply.
+    pub fn apply_inlay_hints(&mut self, path: &Path, hints: &[InlayHint]) {
+        for editor in &mut self.editors {
+            if editor.buffer().path().as_deref() == Some(path) {
+                editor.set_inlay_hints(hints.to_vec());
             }
         }
     }

@@ -206,6 +206,9 @@ struct App {
     /// A debounced auto-issued LSP request (document highlight / signature help) waiting for the
     /// cursor or typing to settle; superseded by a newer one, fired once its deadline passes.
     pending_lsp: Option<PendingLsp>,
+    /// A debounced whole-document inlay-hint request (`path`, deadline), scheduled when the buffer
+    /// changes. Separate from `pending_lsp` since inlay hints are edit-driven, not cursor-driven.
+    pending_inlay: Option<(PathBuf, Instant)>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -241,6 +244,7 @@ impl App {
             prompt_action: None,
             highlight_anchor: None,
             pending_lsp: None,
+            pending_inlay: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -269,7 +273,10 @@ impl App {
                     self.lsp.change(&path, &text)
                 };
                 if result.is_ok() {
-                    self.lsp_synced.insert(path, revision);
+                    self.lsp_synced.insert(path.clone(), revision);
+                    // The buffer (re)synced — refresh its inlay hints, debounced against a burst of
+                    // edits.
+                    self.pending_inlay = Some((path, Instant::now() + LSP_DEBOUNCE));
                 }
             }
         }
@@ -340,33 +347,47 @@ impl App {
 
     /// Issues a debounced LSP request whose deadline has passed (called each frame from `sync_lsp`).
     fn fire_due_lsp(&mut self) {
-        let due = self
+        let now = Instant::now();
+        if self
             .pending_lsp
             .as_ref()
-            .is_some_and(|pending| Instant::now() >= pending.at);
-        if !due {
-            return;
+            .is_some_and(|pending| now >= pending.at)
+        {
+            if let Some(pending) = self.pending_lsp.take() {
+                match pending.kind {
+                    PendingKind::DocumentHighlight => self
+                        .lsp
+                        .request_document_highlight(&pending.path, pending.byte),
+                    PendingKind::SignatureHelp => {
+                        self.lsp.request_signature_help(&pending.path, pending.byte);
+                    }
+                }
+            }
         }
-        let Some(pending) = self.pending_lsp.take() else {
-            return;
-        };
-        match pending.kind {
-            PendingKind::DocumentHighlight => self
-                .lsp
-                .request_document_highlight(&pending.path, pending.byte),
-            PendingKind::SignatureHelp => {
-                self.lsp.request_signature_help(&pending.path, pending.byte);
+        // The separate, edit-driven inlay-hint debounce.
+        if self
+            .pending_inlay
+            .as_ref()
+            .is_some_and(|(_, at)| now >= *at)
+        {
+            if let Some((path, _)) = self.pending_inlay.take() {
+                self.lsp.request_inlay_hints(&path);
             }
         }
     }
 
-    /// How long until the next debounced LSP request is due, for capping the event-loop poll timeout
-    /// so the loop wakes to fire it rather than waiting out a full idle tick. `None` when nothing is
-    /// pending.
+    /// How long until the next debounced LSP request (cursor-driven or inlay) is due, for capping the
+    /// event-loop poll timeout so the loop wakes to fire it rather than waiting out a full idle tick.
+    /// `None` when nothing is pending.
     fn lsp_debounce_timeout(&self) -> Option<Duration> {
-        self.pending_lsp
-            .as_ref()
-            .map(|pending| pending.at.saturating_duration_since(Instant::now()))
+        let now = Instant::now();
+        let cursor = self.pending_lsp.as_ref().map(|pending| pending.at);
+        let inlay = self.pending_inlay.as_ref().map(|(_, at)| *at);
+        [cursor, inlay]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|at| at.saturating_duration_since(now))
     }
 
     /// Drains the interactive-request results (completion, hover, goto-definition, references,
@@ -376,6 +397,12 @@ impl App {
     fn apply_lsp_outcomes(&mut self) {
         // Open the matching popup when a result is for the buffer that still has focus.
         for outcome in self.lsp.poll_outcomes() {
+            // Inlay hints apply to the buffer by path, regardless of focus (like diagnostics), so
+            // they are not subject to the focused-pane gate below.
+            if let LspOutcome::InlayHints { path, hints } = &outcome {
+                self.workspace.apply_inlay_hints(path, hints);
+                continue;
+            }
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
@@ -466,6 +493,8 @@ impl App {
                 LspOutcome::Formatting { path, formatted } => {
                     self.apply_formatting(&path, formatted);
                 }
+                // Applied (by path, ungated by focus) before the focus check above.
+                LspOutcome::InlayHints { .. } => {}
             }
         }
     }
