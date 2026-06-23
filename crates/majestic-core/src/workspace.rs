@@ -21,6 +21,7 @@ use std::path::Path;
 use crate::buffer::Buffer;
 use crate::diagnostic::Diagnostic;
 use crate::editor::Editor;
+use crate::occurrence::Occurrence;
 use crate::session::{LayoutNode, PaneState, Session};
 use crate::whichkey::WhichKey;
 
@@ -523,6 +524,20 @@ impl Workspace {
     /// on a goto-definition target once its destination file has been revealed.
     pub fn set_active_cursor(&mut self, offset: usize) {
         self.active_mut().buffer_mut().set_cursor(offset);
+    }
+
+    /// Tints the given symbol occurrences in the focused pane (LSP `documentHighlight`); the host
+    /// refreshes these as the cursor moves to a new identifier.
+    pub fn set_active_occurrences(&mut self, occurrences: Vec<Occurrence>) {
+        self.active_mut().set_occurrences(occurrences);
+    }
+
+    /// Clears the focused pane's occurrence tint (when the cursor leaves an identifier). A no-op when
+    /// nothing is tinted, so it is cheap to call every frame.
+    pub fn clear_active_occurrences(&mut self) {
+        if self.active_mut().has_occurrences() {
+            self.active_mut().set_occurrences(Vec::new());
+        }
     }
 
     /// Feeds a key: runs a window command, or forwards it to the focused editor.
