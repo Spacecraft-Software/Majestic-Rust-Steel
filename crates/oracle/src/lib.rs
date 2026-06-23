@@ -161,7 +161,8 @@ pub const COMMANDS: &[CommandDoc] = &[
     },
     CommandDoc {
         name: "find",
-        summary: "Search within the buffer (not yet implemented).",
+        summary:
+            "Incremental search within the buffer (type to match, ↑/↓ to step, Enter accepts).",
     },
     CommandDoc {
         name: "quit",
