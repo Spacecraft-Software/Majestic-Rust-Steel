@@ -158,6 +158,8 @@ enum PromptAction {
     ReplaceSearch,
     /// Search-and-replace, stage 2: the typed text replaces every `search` occurrence in the buffer.
     ReplaceWith { search: String },
+    /// Go to a line: the typed (1-based) line number moves the cursor to that line.
+    GotoLine,
 }
 
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
@@ -779,6 +781,7 @@ impl App {
                 "next-diagnostic",
                 "prev-diagnostic",
                 "replace",
+                "goto-line",
             ]);
             self.finder = Some(Finder::commands(&commands));
             return Ok(());
@@ -1405,6 +1408,7 @@ impl App {
                 }
             }
             PromptAction::ReplaceWith { search } => self.replace_all(&search, &input),
+            PromptAction::GotoLine => self.goto_line(&input),
         }
     }
 
@@ -1441,6 +1445,36 @@ impl App {
         }
         self.prompt = Some(Prompt::new("Search for", ""));
         self.prompt_action = Some(PromptAction::ReplaceSearch);
+    }
+
+    /// Starts go-to-line: opens the "Go to line" prompt. Invoked by the `goto-line` palette command.
+    /// A no-op unless the editor is focused.
+    fn trigger_goto_line(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        self.prompt = Some(Prompt::new("Go to line", ""));
+        self.prompt_action = Some(PromptAction::GotoLine);
+    }
+
+    /// Moves the cursor to the start of (1-based) line `input`, clamped to the buffer's last line. A
+    /// non-numeric entry reports an error and does nothing.
+    fn goto_line(&mut self, input: &str) {
+        let Ok(line) = input.trim().parse::<usize>() else {
+            self.workspace.set_status(format!(
+                "Go to line: `{}` is not a line number",
+                input.trim()
+            ));
+            return;
+        };
+        if line == 0 {
+            return;
+        }
+        let text = self.workspace.active().buffer().text();
+        let line_count = text.lines().count().max(1);
+        let zero_based = u32::try_from(line.min(line_count) - 1).unwrap_or(u32::MAX);
+        let byte = majestic_lsp::position_to_byte(&text, zero_based, 0);
+        self.workspace.set_active_cursor(byte);
     }
 
     /// Applies a server-provided `WorkspaceEdit` (already reduced to positional `RenameEdit`s): groups
@@ -1701,6 +1735,7 @@ impl App {
                 self.goto_diagnostic(Direction::Prev);
             }
             Action::RunCommand(name) if name == "replace" => self.trigger_replace(),
+            Action::RunCommand(name) if name == "goto-line" => self.trigger_goto_line(),
             Action::RunCommand(name) => self.workspace.execute(&name),
         }
         // A command may have requested the search line (e.g. `find` chosen from the palette).
@@ -2305,5 +2340,25 @@ mod tests {
 
         assert_eq!(app.workspace.active().buffer().text(), "baz bar baz");
         assert!(app.prompt.is_none(), "the prompt closes after replacing");
+    }
+
+    #[test]
+    fn goto_line_jumps_to_the_line_start_and_clamps() {
+        // Lines start at bytes 0 ("one"), 4 ("two"), 8 ("three"), 14 ("four").
+        let editor = Editor::with_buffer(majestic_core::Buffer::from_text("one\ntwo\nthree\nfour"));
+        let mut app = App::new(Workspace::new(editor));
+
+        app.trigger_goto_line();
+        app.prompt_key(KeyPress::char('3'));
+        app.prompt_key(KeyPress::key(KeyCode::Enter));
+        assert_eq!(app.workspace.active().buffer().cursor(), 8); // start of "three"
+
+        // A line past the end clamps to the last line.
+        app.trigger_goto_line();
+        for c in "999".chars() {
+            app.prompt_key(KeyPress::char(c));
+        }
+        app.prompt_key(KeyPress::key(KeyCode::Enter));
+        assert_eq!(app.workspace.active().buffer().cursor(), 14); // start of "four"
     }
 }
