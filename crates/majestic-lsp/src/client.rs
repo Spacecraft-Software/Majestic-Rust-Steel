@@ -194,8 +194,8 @@ impl Drop for LanguageServer {
 }
 
 /// The capabilities advertised in the `initialize` handshake: completion, hover, signature help,
-/// goto-definition, find-references, document highlight, document symbols, code actions, rename, and
-/// document formatting, plus the implicit defaults.
+/// goto-definition (+ type-definition, implementation), find-references, document highlight, document
+/// symbols, code actions, rename, and document formatting, plus the implicit defaults.
 /// Completion is requested without snippet support (we insert plain text, not `$0`-style snippet
 /// placeholders); hover accepts both Markdown and plain-text content so a server may send whichever
 /// it prefers (the editor renders it as text either way); document symbols request the hierarchical
@@ -216,6 +216,14 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             signature_help: Some(SignatureHelpClientCapabilities::default()),
             definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(false),
+            }),
+            type_definition: Some(GotoCapability {
+                dynamic_registration: Some(false),
+                link_support: Some(false),
+            }),
+            implementation: Some(GotoCapability {
                 dynamic_registration: Some(false),
                 link_support: Some(false),
             }),
