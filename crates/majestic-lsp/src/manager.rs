@@ -20,11 +20,12 @@ use std::time::Duration;
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
     DiagnosticSeverity, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams, MarkedString,
+    GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams, Location, MarkedString,
     MarkupContent, MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams,
-    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
+    ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentPositionParams,
+    TextEdit, Uri, WorkDoneProgressParams,
 };
-use majestic_core::{CompletionItem, Diagnostic, Severity};
+use majestic_core::{CompletionItem, Diagnostic, Reference, Severity};
 
 use crate::client::{file_uri, LanguageServer};
 use crate::connection::Requester;
@@ -103,6 +104,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The destination file + position, or `None` when there is nothing to jump to.
         target: Option<(PathBuf, Position)>,
+    },
+    /// Every use site of the symbol under the cursor in the document at `path`, ready to show in the
+    /// references popup. Empty when the server found none (the popup does not open).
+    References {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The use sites, each with a destination file/position and a source-line preview.
+        references: Vec<Reference>,
     },
     /// A whole-document reformat for the document at `path`, computed off-thread by applying the
     /// server's edits to the text that was sent. `formatted` is the new document text, or `None`
@@ -315,6 +324,32 @@ impl LspManager {
             let target = fetch_goto_definition(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::GotoDefinition { path, target });
+        });
+    }
+
+    /// Requests every use site of the symbol at the cursor `byte` in `path`, off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Like
+    /// [`Self::request_goto_definition`], the request and its bounded wait run on a worker thread
+    /// holding a shared [`Requester`]; the result arrives via [`Self::poll_outcomes`] as
+    /// [`LspOutcome::References`]. The worker also reads each hit's source line (off-thread) to build
+    /// the list preview.
+    pub fn request_references(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let references = fetch_references(&requester, uri, position);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::References { path, references });
         });
     }
 
@@ -554,6 +589,91 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     uri.as_str().strip_prefix("file://").map(PathBuf::from)
 }
 
+/// Largest file the preview reader will open. A reference into a generated/vendored file can point
+/// at a multi-megabyte source; capping the read keeps one slow `open` from stalling the worker.
+const MAX_PREVIEW_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB — ample for hand-written source.
+
+/// Issues `textDocument/references` over a shared [`Requester`] (on a worker thread) and converts the
+/// returned [`Location`]s to editor-facing [`Reference`]s, including the declaration itself. Each
+/// hit's source line is read from disk (off-thread) for the list preview, reading any one file at
+/// most once. A timeout, transport error, server error, `null`, or empty result all yield an empty
+/// list (the popup does not open). The preview is best-effort: it reflects the file on disk, so a hit
+/// in a buffer with unsaved edits may show a slightly stale line — the navigation target is always
+/// exact, since the jump re-resolves the position against the destination buffer's current text.
+fn fetch_references(requester: &Requester, uri: Uri, position: Position) -> Vec<Reference> {
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        // Include the declaration so the list shows the definition alongside the uses.
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/references", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (no references) deserializes to `None`.
+    let locations: Option<Vec<Location>> = serde_json::from_value(result).unwrap_or(None);
+    let Some(locations) = locations else {
+        return Vec::new();
+    };
+    // Cache each file's contents so a symbol used many times in one file is read once.
+    let mut cache: HashMap<PathBuf, Option<String>> = HashMap::new();
+    locations
+        .into_iter()
+        .filter_map(|location| {
+            let path = uri_to_path(&location.uri)?;
+            let line = location.range.start.line;
+            let preview = preview_line(&mut cache, &path, line);
+            Some(Reference {
+                path,
+                line,
+                character: location.range.start.character,
+                preview,
+            })
+        })
+        .collect()
+}
+
+/// The trimmed text of `line` (zero-based) in `path`, for a reference's list preview. Reads `path`
+/// at most once via `cache`. Returns an empty string when the file is unreadable, too large, or has
+/// no such line — the reference still navigates correctly.
+fn preview_line(cache: &mut HashMap<PathBuf, Option<String>>, path: &Path, line: u32) -> String {
+    let contents = cache
+        .entry(path.to_owned())
+        .or_insert_with(|| read_capped(path));
+    let Some(text) = contents.as_deref() else {
+        return String::new();
+    };
+    let index = usize::try_from(line).unwrap_or(usize::MAX);
+    text.lines()
+        .nth(index)
+        .map(|line| line.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Reads `path` to a string, but only when it is a regular file no larger than
+/// [`MAX_PREVIEW_FILE_BYTES`]. `None` when it is not a file, is too big, or cannot be read.
+fn read_capped(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_PREVIEW_FILE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Issues `textDocument/formatting` over a shared [`Requester`] (on a worker thread) and applies the
 /// returned edits to `snapshot` (the exact text last sent to the server), yielding the reformatted
 /// document. A timeout, transport error, server error, a `null`/empty edit list, or a result
@@ -737,8 +857,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply_text_edits, byte_to_position, markup_text, position_to_byte, LspManager, LspOutcome,
-        ServerConfig,
+        apply_text_edits, byte_to_position, markup_text, position_to_byte, read_capped, LspManager,
+        LspOutcome, ServerConfig,
     };
     use crate::client::LanguageServer;
     use crate::codec::{read_message, write_message};
@@ -1278,5 +1398,148 @@ mod tests {
             "rustfmt should space the signature: {formatted:?}"
         );
         assert_ne!(formatted, source, "formatting should change the source");
+    }
+
+    #[test]
+    fn references_request_yields_use_sites_with_previews_via_poll_outcomes() {
+        use std::fs;
+
+        // A real on-disk file the references point into, so the worker's preview reader has content
+        // to extract (and both hits share it, exercising the per-file read cache).
+        let target = std::env::temp_dir().join(format!("majestic-refs-{}.rs", std::process::id()));
+        fs::write(&target, "fn parse(s: &str) {}\nlet _ = parse(raw);\n").unwrap();
+        let response_uri = format!("file://{}", target.display());
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            // `open` sends `didOpen` first; skip notifications until the references request arrives.
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/references" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {"uri": response_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}},
+                        {"uri": response_uri, "range": {"start": {"line": 1, "character": 8}, "end": {"line": 1, "character": 13}}}
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-r.rs");
+        manager.open(path, "let _ = parse").unwrap();
+        manager.request_references(path, "let _ = parse".len());
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let _ = fs::remove_file(&target);
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::References {
+            path: got,
+            references,
+        } = &outcomes[0]
+        else {
+            panic!("expected a references outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        assert_eq!(references.len(), 2);
+        // Locations map to (path, line, character); previews are the trimmed source lines.
+        assert_eq!(references[0].path, target);
+        assert_eq!((references[0].line, references[0].character), (0, 3));
+        assert_eq!(references[0].preview, "fn parse(s: &str) {}");
+        assert_eq!((references[1].line, references[1].character), (1, 8));
+        assert_eq!(references[1].preview, "let _ = parse(raw);");
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn read_capped_returns_none_for_a_missing_file() {
+        let missing =
+            std::env::temp_dir().join(format!("majestic-no-such-{}.rs", std::process::id()));
+        assert!(read_capped(&missing).is_none());
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_finds_references() {
+        use std::fs;
+
+        // A throwaway cargo project where `target` is declared once and called twice.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-refs-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source =
+            "fn target() -> i32 {\n    42\n}\nfn main() {\n    let _ = target();\n    let _ = target();\n}\n";
+        fs::write(&main_rs, source).unwrap();
+        // The cursor on the `fn target` declaration (the first occurrence of the identifier).
+        let decl_byte = source.find("target").unwrap() + 1;
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        // Drive startup (`poll`) and keep issuing the request until the (async-started) server is
+        // ready and replies with the use sites.
+        let mut references = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup (ignore diagnostics)
+            manager.request_references(&main_rs, decl_byte); // a no-op until ready
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::References {
+                    references: found, ..
+                } = outcome
+                {
+                    if !found.is_empty() {
+                        references = found;
+                    }
+                }
+            }
+            if !references.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        // At least the two calls must be reported (the declaration may be included too).
+        assert!(
+            references.len() >= 2,
+            "rust-analyzer should report the uses of `target`: {references:?}"
+        );
+        assert!(
+            references.iter().all(|reference| reference.path == main_rs),
+            "all references are in the same file"
+        );
     }
 }
