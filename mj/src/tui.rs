@@ -129,6 +129,10 @@ struct App {
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
     /// is not re-synced each frame).
     lsp_synced: HashMap<PathBuf, u64>,
+    /// The path + buffer revision of an in-flight format request, recorded when `Shift+Alt+F` is
+    /// pressed. A returned reformat is applied only while the buffer is still on this revision, so an
+    /// edit made while the request was in flight is never clobbered by stale output.
+    format_request: Option<(PathBuf, u64)>,
     focus: Focus,
 }
 
@@ -148,6 +152,7 @@ impl App {
             hover: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
+            format_request: None,
             focus: Focus::Editor,
         }
     }
@@ -187,7 +192,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -223,6 +228,9 @@ impl App {
                             self.hover = None;
                         }
                     }
+                }
+                LspOutcome::Formatting { path, formatted } => {
+                    self.apply_formatting(&path, formatted);
                 }
             }
         }
@@ -444,6 +452,10 @@ impl App {
             self.trigger_goto_definition();
             return Ok(());
         }
+        if is_format_key(key) {
+            self.trigger_formatting();
+            return Ok(());
+        }
         if key.code == TERMINAL_TOGGLE {
             self.toggle_terminal(columns, lines);
             return Ok(());
@@ -580,6 +592,59 @@ impl App {
         }
         let cursor = editor.buffer().cursor();
         self.lsp.request_goto_definition(&path, cursor);
+    }
+
+    /// Requests a whole-document LSP reformat, off-thread; the result is applied later, in
+    /// `sync_lsp`, once the reply arrives — but only if the buffer is still on the revision recorded
+    /// here, so an edit made while formatting was in flight is never clobbered by stale output. A
+    /// no-op unless the editor is focused and a server handles the buffer.
+    fn trigger_formatting(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        self.format_request = Some((path.clone(), editor.buffer().revision()));
+        self.lsp.request_formatting(&path);
+    }
+
+    /// Applies a completed reformat to the focused buffer — but only if `formatted` is `Some` and the
+    /// buffer is still the one, and on the revision, that was formatted (otherwise the result is
+    /// stale and dropped, never overwriting newer edits). The whole document is replaced as one
+    /// undoable edit and the cursor is re-seated at its old byte offset (clamped to the new text),
+    /// since formatting usually only adjusts surrounding whitespace.
+    fn apply_formatting(&mut self, path: &Path, formatted: Option<String>) {
+        let Some((requested_path, revision)) = self.format_request.take() else {
+            return;
+        };
+        let Some(formatted) = formatted else {
+            return;
+        };
+        let (current_path, current_revision, cursor, len) = {
+            let buffer = self.workspace.active().buffer();
+            (
+                buffer.path(),
+                buffer.revision(),
+                buffer.cursor(),
+                buffer.text().len(),
+            )
+        };
+        if requested_path.as_path() != path
+            || current_path.as_deref() != Some(path)
+            || current_revision != revision
+        {
+            return;
+        }
+        self.workspace.replace_active(0..len, &formatted);
+        self.workspace
+            .set_active_cursor(cursor.min(formatted.len()));
+        self.completion = None;
+        self.hover = None;
     }
 
     /// Inserts the selected candidate over the typed identifier prefix and closes the popup.
@@ -1009,6 +1074,21 @@ fn is_command_palette(key: KeyPress) -> bool {
     key.mods.contains(Mods::CTRL)
         && key.mods.contains(Mods::SHIFT)
         && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p'))
+}
+
+/// Whether `key` is `Shift+Alt+F` (reformat the document — the universal "Format Document"
+/// shortcut). Tolerant of how terminals report the chord: some send the `Shift` modifier, others
+/// just upper-case the letter. The `Shift` requirement is deliberate, so this never shadows `Alt+f`
+/// (the Emacs "forward-word" editing key); `Ctrl` must be absent for the same reason.
+fn is_format_key(key: KeyPress) -> bool {
+    key.mods.contains(Mods::ALT)
+        && !key.mods.contains(Mods::CTRL)
+        && matches!(
+            key.code,
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'f')
+                    && (key.mods.contains(Mods::SHIFT) || c.is_ascii_uppercase())
+        )
 }
 
 /// Translates a crossterm key event into a Keymaker [`KeyPress`], if it maps to one.

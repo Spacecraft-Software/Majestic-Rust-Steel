@@ -23,10 +23,11 @@ use std::sync::Arc;
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, GotoCapability,
-    HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams, MarkupKind,
-    PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentItem, Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingClientCapabilities,
+    GotoCapability, HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams,
+    MarkupKind, PublishDiagnosticsParams, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+    WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -189,10 +190,11 @@ impl Drop for LanguageServer {
     }
 }
 
-/// The capabilities advertised in the `initialize` handshake: completion and hover, plus the
-/// implicit defaults. Completion is requested without snippet support (we insert plain text, not
-/// `$0`-style snippet placeholders); hover accepts both Markdown and plain-text content so a server
-/// may send whichever it prefers (the editor renders it as text either way).
+/// The capabilities advertised in the `initialize` handshake: completion, hover, goto-definition,
+/// and document formatting, plus the implicit defaults. Completion is requested without snippet
+/// support (we insert plain text, not `$0`-style snippet placeholders); hover accepts both Markdown
+/// and plain-text content so a server may send whichever it prefers (the editor renders it as text
+/// either way).
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
@@ -210,6 +212,9 @@ fn client_capabilities() -> ClientCapabilities {
             definition: Some(GotoCapability {
                 dynamic_registration: Some(false),
                 link_support: Some(false),
+            }),
+            formatting: Some(DocumentFormattingClientCapabilities {
+                dynamic_registration: Some(false),
             }),
             ..Default::default()
         }),

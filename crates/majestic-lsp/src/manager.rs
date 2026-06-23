@@ -9,6 +9,7 @@
 //! [`LspManager::poll`] each frame to collect diagnostics — converting the server's
 //! line/character positions to byte offsets against the document's current text.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,10 +19,10 @@ use std::time::Duration;
 
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
-    DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover,
-    HoverContents, HoverParams, MarkedString, MarkupContent, MarkupKind, PartialResultParams,
-    Position, PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
-    WorkDoneProgressParams,
+    DiagnosticSeverity, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams, MarkedString,
+    MarkupContent, MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
 };
 use majestic_core::{CompletionItem, Diagnostic, Severity};
 
@@ -102,6 +103,16 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The destination file + position, or `None` when there is nothing to jump to.
         target: Option<(PathBuf, Position)>,
+    },
+    /// A whole-document reformat for the document at `path`, computed off-thread by applying the
+    /// server's edits to the text that was sent. `formatted` is the new document text, or `None`
+    /// when there is nothing to change (the server returned no edits, errored, or the result is
+    /// identical to the text formatted).
+    Formatting {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The reformatted document text, or `None` when there is nothing to apply.
+        formatted: Option<String>,
     },
 }
 
@@ -304,6 +315,33 @@ impl LspManager {
             let target = fetch_goto_definition(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::GotoDefinition { path, target });
+        });
+    }
+
+    /// Requests a whole-document reformat of `path`, off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Mirrors
+    /// [`Self::request_goto_definition`]: the request and its bounded wait run on a worker thread
+    /// holding a shared [`Requester`]; the result arrives via [`Self::poll_outcomes`] as
+    /// [`LspOutcome::Formatting`]. The server's edits are applied off-thread to the exact text last
+    /// sent to it (the document snapshot), so the host can replace the buffer wholesale as long as it
+    /// is still on that revision.
+    pub fn request_formatting(&self, path: &Path) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let uri = doc.uri.clone();
+        let snapshot = doc.text.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let formatted = fetch_formatting(&requester, uri, &snapshot);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::Formatting { path, formatted });
         });
     }
 
@@ -516,6 +554,58 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     uri.as_str().strip_prefix("file://").map(PathBuf::from)
 }
 
+/// Issues `textDocument/formatting` over a shared [`Requester`] (on a worker thread) and applies the
+/// returned edits to `snapshot` (the exact text last sent to the server), yielding the reformatted
+/// document. A timeout, transport error, server error, a `null`/empty edit list, or a result
+/// identical to `snapshot` all yield `None` (there is nothing to apply).
+fn fetch_formatting(requester: &Requester, uri: Uri, snapshot: &str) -> Option<String> {
+    let params = DocumentFormattingParams {
+        text_document: TextDocumentIdentifier { uri },
+        // Servers that honor these (rather than their own `rustfmt.toml`/`.editorconfig`) get the
+        // LSP-required defaults; `tab_size`/`insert_spaces` have no `Default`, so they are explicit.
+        options: FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+            ..Default::default()
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let value = serde_json::to_value(params).ok()?;
+    let response = requester
+        .request_timeout("textDocument/formatting", value, Duration::from_secs(3))
+        .ok()?;
+    let result = response.into_result().ok()?;
+    // A `null` result (nothing to format) deserializes to `None`.
+    let edits: Option<Vec<TextEdit>> = serde_json::from_value(result).unwrap_or(None);
+    let edits = edits.filter(|edits| !edits.is_empty())?;
+    let formatted = apply_text_edits(snapshot, edits);
+    (formatted != snapshot).then_some(formatted)
+}
+
+/// Applies LSP [`TextEdit`]s to `text`, returning the new string. Each edit's range is mapped to byte
+/// offsets via [`position_to_byte`] (so it lands on `char` boundaries), then the edits are spliced in
+/// from the end of the document backwards (sorted by start offset, descending) so each splice leaves
+/// the offsets of the not-yet-applied edits valid — the LSP spec guarantees the ranges do not
+/// overlap.
+fn apply_text_edits(text: &str, edits: Vec<TextEdit>) -> String {
+    let mut spans: Vec<(usize, usize, String)> = edits
+        .into_iter()
+        .map(|edit| {
+            let start = position_to_byte(text, edit.range.start.line, edit.range.start.character);
+            let end =
+                position_to_byte(text, edit.range.end.line, edit.range.end.character).max(start);
+            (start, end, edit.new_text)
+        })
+        .collect();
+    // Apply back-to-front: a later splice must not shift the offsets of an earlier (lower) one.
+    spans.sort_by_key(|span| Reverse(span.0));
+    let mut result = text.to_owned();
+    for (start, end, new_text) in spans {
+        result.replace_range(start..end, &new_text);
+    }
+    result
+}
+
 /// Issues `textDocument/completion` over a shared [`Requester`] (on a worker thread) and converts
 /// the reply to editor-facing [`CompletionItem`]s. A timeout, transport error, server error, or
 /// `null` result all yield an empty list (the popup simply does not open).
@@ -647,7 +737,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        byte_to_position, markup_text, position_to_byte, LspManager, LspOutcome, ServerConfig,
+        apply_text_edits, byte_to_position, markup_text, position_to_byte, LspManager, LspOutcome,
+        ServerConfig,
     };
     use crate::client::LanguageServer;
     use crate::codec::{read_message, write_message};
@@ -1049,5 +1140,143 @@ mod tests {
         let (target_path, position) = target.expect("rust-analyzer should resolve the definition");
         assert_eq!(target_path, main_rs, "definition is in the same file");
         assert_eq!(position.line, 0, "`fn target` is on line 0");
+    }
+
+    #[test]
+    fn apply_text_edits_splices_in_reverse_offset_order() {
+        use lsp_types::{Position, Range, TextEdit};
+
+        // Two disjoint edits given in document order; applying the later (line 1) one first must
+        // leave the earlier (line 0) one's offsets valid.
+        let text = "foo = 1\nbar=2\n";
+        let edits = vec![
+            TextEdit {
+                range: Range::new(Position::new(1, 3), Position::new(1, 4)), // the "=" in "bar=2"
+                new_text: " = ".to_owned(),
+            },
+            TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 3)), // "foo"
+                new_text: "FOO".to_owned(),
+            },
+        ];
+        assert_eq!(apply_text_edits(text, edits), "FOO = 1\nbar = 2\n");
+    }
+
+    #[test]
+    fn formatting_request_yields_formatted_text_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one `textDocument/formatting` with a single edit, then idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            // `open` sends `didOpen` first; skip notifications until the formatting request arrives.
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/formatting" {
+                    break message["id"].clone();
+                }
+            };
+            // Replace the whole (8-char) line "let  x=1" with the normalized "let x = 1".
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 8}
+                        },
+                        "newText": "let x = 1"
+                    }]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-fmt.rs");
+        manager.open(path, "let  x=1").unwrap();
+        manager.request_formatting(path);
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::Formatting {
+            path: got,
+            formatted,
+        } = &outcomes[0]
+        else {
+            panic!("expected a formatting outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        assert_eq!(formatted.as_deref(), Some("let x = 1"));
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_formats_a_document() {
+        use std::fs;
+
+        // A throwaway cargo project whose `main.rs` is deliberately badly formatted.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-fmt-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source = "fn main(){let _x=1;}\n";
+        fs::write(&main_rs, source).unwrap();
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        // Drive startup (`poll`) and keep requesting until the (async-started) server is ready and
+        // returns a reformat.
+        let mut formatted = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup (ignore diagnostics)
+            manager.request_formatting(&main_rs); // a no-op until ready
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::Formatting {
+                    formatted: Some(text),
+                    ..
+                } = outcome
+                {
+                    formatted = Some(text);
+                }
+            }
+            if formatted.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        let formatted = formatted.expect("rust-analyzer should return a reformatted document");
+        assert!(
+            formatted.contains("fn main() {"),
+            "rustfmt should space the signature: {formatted:?}"
+        );
+        assert_ne!(formatted, source, "formatting should change the source");
     }
 }
