@@ -40,7 +40,9 @@ mod fuzzy;
 mod git;
 mod hover;
 mod info;
+mod prompt;
 mod references;
+mod rename;
 mod selector;
 mod session;
 mod signature;
@@ -68,7 +70,11 @@ pub use hover::Hover;
 #[doc(inline)]
 pub use info::{InfoDocument, InfoReader};
 #[doc(inline)]
+pub use prompt::Prompt;
+#[doc(inline)]
 pub use references::{Reference, References};
+#[doc(inline)]
+pub use rename::RenameEdit;
 #[doc(inline)]
 pub use selector::ProfileSelector;
 #[doc(inline)]
