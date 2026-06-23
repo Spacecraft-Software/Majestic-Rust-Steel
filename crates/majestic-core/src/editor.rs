@@ -21,6 +21,7 @@ use stratum::{Point, SpanLayer};
 
 use crate::buffer::Buffer;
 use crate::diagnostic::{Diagnostic, Severity};
+use crate::inlay::InlayHint;
 use crate::occurrence::Occurrence;
 use crate::syntax::{HighlightKind, HighlightWorker};
 
@@ -92,6 +93,9 @@ pub struct Editor {
     /// Occurrences of the symbol under the cursor (LSP `documentHighlight`), tinted when rendered.
     /// Transient: refreshed by the host as the cursor moves, cleared when it leaves an identifier.
     occurrences: Vec<Occurrence>,
+    /// Inlay hints (LSP `textDocument/inlayHint`), sorted by byte, drawn as inline virtual text.
+    /// Transient: re-requested by the host as the buffer changes.
+    inlay_hints: Vec<InlayHint>,
 }
 
 /// Default indent width in columns (CUA convention; overridden by `majestic-config`).
@@ -147,6 +151,7 @@ impl Editor {
             tab_width: DEFAULT_TAB_WIDTH,
             diagnostics: Vec::new(),
             occurrences: Vec::new(),
+            inlay_hints: Vec::new(),
         }
     }
 
@@ -203,6 +208,28 @@ impl Editor {
     #[must_use]
     pub fn has_occurrences(&self) -> bool {
         !self.occurrences.is_empty()
+    }
+
+    /// Replaces this buffer's inlay hints (set by the host from `textDocument/inlayHint`), keeping
+    /// them sorted by byte so the renderer and the cursor-column math walk them in document order.
+    pub fn set_inlay_hints(&mut self, mut hints: Vec<InlayHint>) {
+        hints.sort_by_key(|hint| hint.byte);
+        self.inlay_hints = hints;
+    }
+
+    /// The total display width of the inlay hints that render at/before `byte` on the line starting
+    /// at `line_start` — the amount they shift everything after them (including the cursor) right.
+    /// Zero (cheaply) when there are no hints.
+    fn inlay_width_before(&self, line_start: usize, byte: usize) -> usize {
+        if self.inlay_hints.is_empty() {
+            return 0;
+        }
+        self.inlay_hints
+            .iter()
+            .filter(|hint| hint.byte >= line_start && hint.byte <= byte)
+            .flat_map(|hint| hint.text.chars())
+            .map(|ch| usize::from(char_width(ch)))
+            .sum()
     }
 
     /// A second view of this editor's buffer: a new editor sharing the document (and thus text +
@@ -515,6 +542,7 @@ impl Editor {
         let base = theme.base_style();
         let gutter_style = Style::new(theme.accent, theme.background); // Steel Blue (structural)
         let current_style = Style::new(theme.foreground, theme.background); // brighter on the cursor row
+        let hint_style = Style::new(theme.info, theme.background); // Liquid Coolant (muted, virtual)
         let cursor_row = self.buffer.cursor_point().row;
         let rope = self.buffer.rope();
         let first_line = self.viewport_top;
@@ -550,7 +578,35 @@ impl Editor {
             }
             let mut byte = rope.point_to_byte(Point::new(line_index, 0));
             let mut display = 0usize; // absolute display column within the line
-            for ch in rope.line(line_index).chars() {
+            let line_text = rope.line(line_index);
+            let mut chars = line_text.chars();
+            'line: loop {
+                // Inlay hints render as virtual text just before the character at `byte` (and at the
+                // line end, when `chars` is exhausted) — they exist only on screen, not in the buffer.
+                if !self.inlay_hints.is_empty() {
+                    for hint in self.inlay_hints.iter().filter(|hint| hint.byte == byte) {
+                        for hc in hint.text.chars() {
+                            if display >= self.viewport_left {
+                                let screen = display - self.viewport_left;
+                                if screen >= usize::from(text_area.width) {
+                                    break 'line;
+                                }
+                                if let Ok(col) = u16::try_from(screen) {
+                                    surface.set_char(
+                                        text_area.x + col,
+                                        area.y + row,
+                                        hc,
+                                        hint_style,
+                                    );
+                                }
+                            }
+                            display += usize::from(char_width(hc));
+                        }
+                    }
+                }
+                let Some(ch) = chars.next() else {
+                    break;
+                };
                 if display >= self.viewport_left {
                     let screen = display - self.viewport_left;
                     if screen >= usize::from(text_area.width) {
@@ -759,18 +815,25 @@ impl Editor {
         surface.set(x, y, Cell::new(symbol, style));
     }
 
-    /// The cursor's display column: the sum of glyph widths before it on its line, so the cursor
-    /// lands under the right cell when the line contains double-width glyphs.
+    /// The cursor's display column: the sum of glyph widths before it on its line (so the cursor
+    /// lands under the right cell with double-width glyphs), plus the width of any inlay hints that
+    /// render before it on the line (which shift it right too).
     fn cursor_display_column(&self) -> usize {
         let point = self.buffer.cursor_point();
         let chars_before = self.buffer.cursor_column();
-        self.buffer
+        let real: usize = self
+            .buffer
             .rope()
             .line(point.row)
             .chars()
             .take(chars_before)
             .map(|ch| usize::from(char_width(ch)))
-            .sum()
+            .sum();
+        if self.inlay_hints.is_empty() {
+            return real;
+        }
+        let line_start = self.buffer.rope().point_to_byte(Point::new(point.row, 0));
+        real + self.inlay_width_before(line_start, self.buffer.cursor())
     }
 
     /// The status-line text: file name, dirty marker, cursor position, and last status message.
@@ -1116,6 +1179,29 @@ mod tests {
         // Line 1 right-aligned in the 3-digit field ("  1"); text begins at column 4.
         assert_eq!(surface.cell(2, 0).unwrap().symbol, '1');
         assert_eq!(surface.cell(4, 0).unwrap().symbol, 'x');
+    }
+
+    #[test]
+    fn inlay_hints_render_inline_and_shift_the_cursor() {
+        use crate::inlay::InlayHint;
+        let theme = Theme::steelbore();
+        let mut editor = Editor::with_buffer(Buffer::from_text("let x = 1"));
+        // A type hint ": i32" rendered just before byte 5 (the space after `x`).
+        editor.set_inlay_hints(vec![InlayHint::new(5, ": i32")]);
+        editor.handle_key(KeyPress::key(KeyCode::End)); // cursor to end of line (byte 9)
+        let mut surface = Surface::new(40, 2, theme.base_style());
+        editor.render(&mut surface, &theme);
+
+        // 1-line buffer → 3-column gutter. `let x` fills cols 3-7; the hint ": i32" then starts at
+        // col 8 (virtual, in the info color), pushing ` = 1` right.
+        assert_eq!(surface.cell(8, 0).unwrap().symbol, ':');
+        assert_eq!(surface.cell(8, 0).unwrap().style.fg, theme.info);
+        assert_eq!(surface.cell(10, 0).unwrap().symbol, 'i');
+        // The cursor sits at display column 9 (chars) + 5 (hint before it) + 3 (gutter) = 17.
+        assert!(
+            surface.cell(17, 0).unwrap().style.attrs.reverse,
+            "cursor shifted right by the inlay hint"
+        );
     }
 
     #[test]
