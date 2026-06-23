@@ -29,7 +29,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
     Action, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader, ProfileSelector,
-    References, Session, Symbols, Workspace,
+    References, Session, SignatureHelp, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome};
 use majestic_term::PtyTerminal;
@@ -134,6 +134,9 @@ struct App {
     references: Option<References>,
     /// The LSP document-symbols picker; `Some` while the file's outline is shown over the editor.
     symbols: Option<Symbols>,
+    /// The LSP signature-help popup; `Some` while the active call's signature is shown over the
+    /// editor. Passive: it does not capture keys (you keep typing arguments under it).
+    signature: Option<SignatureHelp>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -162,6 +165,7 @@ impl App {
             hover: None,
             references: None,
             symbols: None,
+            signature: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -197,14 +201,20 @@ impl App {
         for (path, diagnostics) in self.lsp.poll() {
             self.workspace.apply_diagnostics(&path, &diagnostics);
         }
-        // Interactive-request results (completion candidates, hover docs, references) arrive
-        // asynchronously; open the matching popup when a result is for the buffer that still has
-        // focus. The three cursor popups are mutually exclusive, so opening one closes the others.
+        self.apply_lsp_outcomes();
+    }
+
+    /// Drains the interactive-request results (completion, hover, goto-definition, references,
+    /// symbols, signature help) and opens/updates the matching cursor popup when the result is for
+    /// the still-focused buffer. The cursor popups are mutually exclusive, so opening one closes the
+    /// others. Split out of `sync_lsp` to keep each method within the line budget.
+    fn apply_lsp_outcomes(&mut self) {
+        // Open the matching popup when a result is for the buffer that still has focus.
         for outcome in self.lsp.poll_outcomes() {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -216,6 +226,7 @@ impl App {
                         self.hover = None;
                         self.references = None;
                         self.symbols = None;
+                        self.signature = None;
                     }
                 }
                 LspOutcome::Hover { text, .. } => {
@@ -226,6 +237,7 @@ impl App {
                         self.completion = None;
                         self.references = None;
                         self.symbols = None;
+                        self.signature = None;
                     }
                 }
                 LspOutcome::GotoDefinition { target, .. } => {
@@ -244,6 +256,7 @@ impl App {
                             self.hover = None;
                             self.references = None;
                             self.symbols = None;
+                            self.signature = None;
                         }
                     }
                 }
@@ -254,6 +267,7 @@ impl App {
                         self.completion = None;
                         self.hover = None;
                         self.symbols = None;
+                        self.signature = None;
                     }
                 }
                 LspOutcome::DocumentSymbols { symbols, .. } => {
@@ -263,7 +277,19 @@ impl App {
                         self.completion = None;
                         self.hover = None;
                         self.references = None;
+                        self.signature = None;
                     }
+                }
+                LspOutcome::SignatureHelp { signature, .. } => {
+                    // Passive popup: `Some` opens/updates it (closing the interactive popups), `None`
+                    // (cursor left the call) closes it.
+                    if signature.is_some() {
+                        self.completion = None;
+                        self.hover = None;
+                        self.references = None;
+                        self.symbols = None;
+                    }
+                    self.signature = signature;
                 }
                 LspOutcome::Formatting { path, formatted } => {
                     self.apply_formatting(&path, formatted);
@@ -370,8 +396,8 @@ impl App {
             selector.render(surface, area, theme);
         }
 
-        // The completion, hover, references, and symbols popups are anchored at the cursor within the
-        // editor region, above all else (they are mutually exclusive, so at most one shows).
+        // The completion, hover, references, symbols, and signature popups are anchored at the cursor
+        // within the editor region, above all else (they are mutually exclusive, so at most one shows).
         if let (Some(completion), Some(rect)) = (self.completion.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 completion.render(surface, rect, cursor, theme);
@@ -390,6 +416,11 @@ impl App {
         if let (Some(symbols), Some(rect)) = (self.symbols.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 symbols.render(surface, rect, cursor, theme);
+            }
+        }
+        if let (Some(signature), Some(rect)) = (self.signature.as_ref(), editor_rect) {
+            if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
+                signature.render(surface, rect, cursor, theme);
             }
         }
     }
@@ -476,6 +507,9 @@ impl App {
         if self.symbols.is_some() && self.symbols_popup_key(key) {
             return Ok(());
         }
+        if self.signature.is_some() && self.signature_popup_key(key) {
+            return Ok(());
+        }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
                 "Key Bindings (Esc to close)",
@@ -533,7 +567,17 @@ impl App {
                 }
             }
             Focus::Explorer => self.explorer_key(key),
-            Focus::Editor => self.workspace.handle_key(key),
+            Focus::Editor => {
+                self.workspace.handle_key(key);
+                // Auto-trigger signature help after a typed `(` or `,` (refresh on each argument),
+                // and after `)` (which makes the server report no call, closing the popup). The
+                // request runs off-thread and is a no-op when no server handles the buffer.
+                if let KeyCode::Char('(' | ',' | ')') = key.code {
+                    if !key.mods.contains(Mods::CTRL) && !key.mods.contains(Mods::ALT) {
+                        self.trigger_signature_help();
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -693,6 +737,36 @@ impl App {
         let text = self.workspace.active().buffer().text();
         let byte = majestic_lsp::position_to_byte(&text, line, character);
         self.workspace.set_active_cursor(byte);
+    }
+
+    /// Routes a key to the open (passive) signature popup. It captures only `Esc` (to dismiss it);
+    /// every other key falls through, so the user keeps typing arguments under the popup — which
+    /// refreshes on the next `,` and closes on `)`. Returns `true` only when `Esc` was consumed.
+    fn signature_popup_key(&mut self, key: KeyPress) -> bool {
+        if key.code == KeyCode::Escape {
+            self.signature = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Requests LSP signature help at the cursor, off-thread; the popup opens/updates (or closes) in
+    /// `sync_lsp` once the reply arrives. Auto-invoked after typing `(`/`,`/`)`. A no-op unless the
+    /// editor is focused and a server handles the buffer.
+    fn trigger_signature_help(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_signature_help(&path, cursor);
     }
 
     /// Requests LSP completion at the cursor: records where the in-progress identifier starts (so an
