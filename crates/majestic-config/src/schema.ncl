@@ -16,4 +16,13 @@
 
   # Indent width in columns. Clamped to a sane range when applied by the editor.
   tab_width | Number | default = 4,
+
+  # Manifest-pinned extensions (PRD #1 §5.5 / §6.7): a dictionary keyed by extension name,
+  # each pinned to an exact `version` (Doom/straight.el-style reproducibility). `enabled`
+  # defaults true; `source` optionally overrides where the Steel file is found (otherwise
+  # `<config-dir>/extensions/<name>.scm`). The loader runs each enabled extension's Steel
+  # file and verifies it declares the pinned version via `(majestic-provides! …)`.
+  extensions
+    | { _ : { version | String, enabled | Bool | default = true, source | String | optional } }
+    | default = {},
 }

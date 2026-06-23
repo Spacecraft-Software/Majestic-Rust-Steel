@@ -16,6 +16,7 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,9 @@ pub struct Settings {
     pub keymap: Option<String>,
     /// Messages emitted by `(majestic-log msg)`, in order.
     pub logs: Vec<String>,
+    /// Versions declared by loaded extensions via `(majestic-provides! name version)`, keyed by
+    /// extension name. The host checks each against the manifest's pin.
+    pub provided: BTreeMap<String, String>,
 }
 
 /// An embedded Steel VM with the `(majestic …)` configuration API registered.
@@ -87,6 +91,35 @@ impl Runtime {
     #[must_use]
     pub fn settings(&self) -> Settings {
         lock(&self.settings).clone()
+    }
+
+    /// Loads a manifest-pinned extension: runs the Steel file at `path` on this runtime, then
+    /// verifies the version it declared via `(majestic-provides! name version)` equals
+    /// `pinned_version`. Extensions share the runtime (so their registrations are visible to
+    /// `config.scm` and to one another), and are fault-isolated like any script.
+    ///
+    /// # Errors
+    /// Returns [`ExtensionError::Script`] if the file cannot be read or fails to evaluate,
+    /// [`ExtensionError::Undeclared`] if it never called `(majestic-provides! name …)`, or
+    /// [`ExtensionError::VersionMismatch`] if the declared version differs from the pin.
+    pub fn load_extension(
+        &mut self,
+        name: &str,
+        pinned_version: &str,
+        path: &Path,
+    ) -> Result<(), ExtensionError> {
+        self.run_file(path).map_err(ExtensionError::Script)?;
+        match lock(&self.settings).provided.get(name) {
+            None => Err(ExtensionError::Undeclared {
+                name: name.to_owned(),
+            }),
+            Some(actual) if actual != pinned_version => Err(ExtensionError::VersionMismatch {
+                name: name.to_owned(),
+                pinned: pinned_version.to_owned(),
+                actual: actual.clone(),
+            }),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Locates the active `config.scm`, or `None` when none exists.
@@ -153,6 +186,15 @@ fn register_api(engine: &mut Engine, settings: &Arc<Mutex<Settings>>) {
         lock(&state).logs.push(message);
     });
 
+    let state = Arc::clone(settings);
+    engine.register_fn(
+        "majestic-provides!",
+        move |name: String, version: String| {
+            // An extension declares its identity + version; the host verifies this against the pin.
+            lock(&state).provided.insert(name, version);
+        },
+    );
+
     engine.register_fn("majestic-version", || VERSION.to_owned());
 }
 
@@ -189,9 +231,73 @@ impl std::error::Error for ScriptError {
     }
 }
 
+/// Why loading a manifest-pinned extension failed.
+#[derive(Debug)]
+pub enum ExtensionError {
+    /// The extension's Steel file could not be read or failed to evaluate.
+    Script(ScriptError),
+    /// The extension ran but never declared itself via `(majestic-provides! name …)`, so its
+    /// version cannot be verified against the pin.
+    Undeclared {
+        /// The extension name (as pinned in the manifest).
+        name: String,
+    },
+    /// The version the extension declared differs from the manifest's pin.
+    VersionMismatch {
+        /// The extension name.
+        name: String,
+        /// The version pinned in the manifest.
+        pinned: String,
+        /// The version the extension actually declared.
+        actual: String,
+    },
+}
+
+impl fmt::Display for ExtensionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Script(error) => write!(f, "{error}"),
+            Self::Undeclared { name } => {
+                write!(
+                    f,
+                    "extension `{name}` did not declare a version via majestic-provides!"
+                )
+            }
+            Self::VersionMismatch {
+                name,
+                pinned,
+                actual,
+            } => write!(
+                f,
+                "extension `{name}` is pinned to {pinned} but declares {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExtensionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Script(error) => Some(error),
+            Self::Undeclared { .. } | Self::VersionMismatch { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Runtime, ScriptError};
+    use super::{ExtensionError, Runtime, ScriptError};
+
+    /// Writes `source` to a uniquely-named temp `.scm` and returns its path (caller removes it).
+    fn temp_scm(tag: &str, source: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "majestic-ext-{}-{tag}-{}.scm",
+            std::process::id(),
+            tag.len()
+        ));
+        std::fs::write(&path, source).unwrap();
+        path
+    }
 
     #[test]
     fn sets_tab_width() {
@@ -247,5 +353,68 @@ mod tests {
         let result = runtime.run_str("(majestic-set-tab-width! 3) (no-such-majestic-fn 1)");
         assert!(matches!(result, Err(ScriptError::Evaluate(_))));
         assert_eq!(runtime.settings().tab_width, None);
+    }
+
+    #[test]
+    fn provides_records_the_declared_version() {
+        let mut runtime = Runtime::new();
+        runtime
+            .run_str(r#"(majestic-provides! "surround" "1.2.0")"#)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .settings()
+                .provided
+                .get("surround")
+                .map(String::as_str),
+            Some("1.2.0")
+        );
+    }
+
+    #[test]
+    fn load_extension_succeeds_on_a_matching_pin() {
+        let path = temp_scm(
+            "ok",
+            r#"(majestic-provides! "surround" "1.2.0") (majestic-set-tab-width! 2)"#,
+        );
+        let mut runtime = Runtime::new();
+        let result = runtime.load_extension("surround", "1.2.0", &path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "matching pin should load: {result:?}");
+        // The extension's settings took effect on the shared runtime.
+        assert_eq!(runtime.settings().tab_width, Some(2));
+    }
+
+    #[test]
+    fn load_extension_rejects_a_version_mismatch() {
+        let path = temp_scm("mismatch", r#"(majestic-provides! "surround" "9.9.9")"#);
+        let mut runtime = Runtime::new();
+        let result = runtime.load_extension("surround", "1.2.0", &path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            result,
+            Err(ExtensionError::VersionMismatch { actual, .. }) if actual == "9.9.9"
+        ));
+    }
+
+    #[test]
+    fn load_extension_rejects_an_undeclared_extension() {
+        // Runs fine but never calls majestic-provides!, so its version cannot be verified.
+        let path = temp_scm("undeclared", "(majestic-set-tab-width! 2)");
+        let mut runtime = Runtime::new();
+        let result = runtime.load_extension("surround", "1.2.0", &path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(ExtensionError::Undeclared { name }) if name == "surround"));
+    }
+
+    #[test]
+    fn load_extension_propagates_a_missing_file() {
+        let mut runtime = Runtime::new();
+        let result =
+            runtime.load_extension("x", "1.0.0", std::path::Path::new("/no/such/ext-xyz.scm"));
+        assert!(matches!(
+            result,
+            Err(ExtensionError::Script(ScriptError::Read(_)))
+        ));
     }
 }
