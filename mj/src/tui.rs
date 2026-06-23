@@ -29,7 +29,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
     Action, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader, ProfileSelector,
-    Session, Workspace,
+    References, Session, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome};
 use majestic_term::PtyTerminal;
@@ -105,6 +105,12 @@ const HOVER_KEY: KeyPress = KeyPress::key(KeyCode::Function(2));
 /// The `F12` key requests LSP goto-definition at the cursor (the universal editor convention).
 const GOTO_DEF_KEY: KeyPress = KeyPress::key(KeyCode::Function(12));
 
+/// The `Shift+F12` key requests LSP find-references at the cursor (the universal "Find All
+/// References" shortcut, the companion to `F12` goto-definition). Matched via [`is_references_key`]
+/// (tolerant of how terminals report the chord), and dispatched before the modifier-agnostic
+/// terminal toggle so `Shift+F12` opens the references popup rather than toggling the panel.
+const REFERENCES_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(12));
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -124,6 +130,8 @@ struct App {
     completion_anchor: usize,
     /// The LSP hover popup; `Some` while documentation is shown over the editor.
     hover: Option<Hover>,
+    /// The LSP find-references popup; `Some` while a symbol's use sites are shown over the editor.
+    references: Option<References>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -150,6 +158,7 @@ impl App {
             completion: None,
             completion_anchor: 0,
             hover: None,
+            references: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -185,14 +194,14 @@ impl App {
         for (path, diagnostics) in self.lsp.poll() {
             self.workspace.apply_diagnostics(&path, &diagnostics);
         }
-        // Interactive-request results (completion candidates, hover docs) arrive asynchronously;
-        // open the matching popup when a result is for the buffer that still has focus. The two
-        // popups are mutually exclusive, so opening one closes the other.
+        // Interactive-request results (completion candidates, hover docs, references) arrive
+        // asynchronously; open the matching popup when a result is for the buffer that still has
+        // focus. The three cursor popups are mutually exclusive, so opening one closes the others.
         for outcome in self.lsp.poll_outcomes() {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -202,6 +211,7 @@ impl App {
                     if !items.is_empty() {
                         self.completion = Some(Completion::new(items));
                         self.hover = None;
+                        self.references = None;
                     }
                 }
                 LspOutcome::Hover { text, .. } => {
@@ -210,6 +220,7 @@ impl App {
                     {
                         self.hover = Some(hover);
                         self.completion = None;
+                        self.references = None;
                     }
                 }
                 LspOutcome::GotoDefinition { target, .. } => {
@@ -226,7 +237,16 @@ impl App {
                             self.workspace.set_active_cursor(byte);
                             self.completion = None;
                             self.hover = None;
+                            self.references = None;
                         }
+                    }
+                }
+                LspOutcome::References { references, .. } => {
+                    let references = References::new(references);
+                    if !references.is_empty() {
+                        self.references = Some(references);
+                        self.completion = None;
+                        self.hover = None;
                     }
                 }
                 LspOutcome::Formatting { path, formatted } => {
@@ -334,8 +354,8 @@ impl App {
             selector.render(surface, area, theme);
         }
 
-        // The completion and hover popups are anchored at the cursor within the editor region,
-        // above all else (they are mutually exclusive, so at most one shows).
+        // The completion, hover, and references popups are anchored at the cursor within the editor
+        // region, above all else (they are mutually exclusive, so at most one shows).
         if let (Some(completion), Some(rect)) = (self.completion.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 completion.render(surface, rect, cursor, theme);
@@ -344,6 +364,11 @@ impl App {
         if let (Some(hover), Some(rect)) = (self.hover.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 hover.render(surface, rect, cursor, theme);
+            }
+        }
+        if let (Some(references), Some(rect)) = (self.references.as_ref(), editor_rect) {
+            if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
+                references.render(surface, rect, cursor, theme);
             }
         }
     }
@@ -424,6 +449,9 @@ impl App {
         if self.hover.is_some() && self.hover_popup_key(key) {
             return Ok(());
         }
+        if self.references.is_some() && self.references_popup_key(key) {
+            return Ok(());
+        }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
                 "Key Bindings (Esc to close)",
@@ -450,6 +478,10 @@ impl App {
         }
         if key == GOTO_DEF_KEY {
             self.trigger_goto_definition();
+            return Ok(());
+        }
+        if is_references_key(key) {
+            self.trigger_references();
             return Ok(());
         }
         if is_format_key(key) {
@@ -537,6 +569,56 @@ impl App {
         }
     }
 
+    /// Routes a key to the open references popup: ↑/↓ move the selection, `Enter` jumps to the
+    /// selected use site, `Esc` closes it, and any other key dismisses it and falls through to
+    /// editing. Returns `true` when the key was consumed, `false` when it should fall through.
+    fn references_popup_key(&mut self, key: KeyPress) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(references) = self.references.as_mut() {
+                    references.select_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(references) = self.references.as_mut() {
+                    references.select_down();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                self.jump_to_selected_reference();
+                true
+            }
+            KeyCode::Escape => {
+                self.references = None;
+                true
+            }
+            _ => {
+                self.references = None;
+                false
+            }
+        }
+    }
+
+    /// Jumps to the selected reference and closes the popup: reveals its file (reusing an open editor
+    /// when possible) and lands the cursor on the use site, converting its LSP position against that
+    /// file's current text — the same jump path as goto-definition.
+    fn jump_to_selected_reference(&mut self) {
+        let Some(references) = self.references.take() else {
+            return;
+        };
+        let Some(reference) = references.selected() else {
+            return;
+        };
+        let (path, line, character) = (reference.path.clone(), reference.line, reference.character);
+        if self.workspace.reveal_path(&path).is_ok() {
+            let text = self.workspace.active().buffer().text();
+            let byte = majestic_lsp::position_to_byte(&text, line, character);
+            self.workspace.set_active_cursor(byte);
+        }
+    }
+
     /// Requests LSP completion at the cursor: records where the in-progress identifier starts (so an
     /// accepted candidate replaces it, not the whole word), then asks the manager to fetch
     /// candidates off-thread. A no-op unless the editor is focused and a server handles the buffer;
@@ -592,6 +674,23 @@ impl App {
         }
         let cursor = editor.buffer().cursor();
         self.lsp.request_goto_definition(&path, cursor);
+    }
+
+    /// Requests LSP find-references at the cursor, off-thread; the popup opens later, in `sync_lsp`,
+    /// once the reply arrives. A no-op unless the editor is focused and a server handles the buffer.
+    fn trigger_references(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_references(&path, cursor);
     }
 
     /// Requests a whole-document LSP reformat, off-thread; the result is applied later, in
@@ -1089,6 +1188,17 @@ fn is_format_key(key: KeyPress) -> bool {
                 if c.eq_ignore_ascii_case(&'f')
                     && (key.mods.contains(Mods::SHIFT) || c.is_ascii_uppercase())
         )
+}
+
+/// Whether `key` is `Shift+F12` (find all references — the companion to `F12` goto-definition).
+/// Requires `Shift` and forbids `Ctrl`/`Alt`, so it is distinct from plain `F12` (goto-definition)
+/// and is dispatched before the modifier-agnostic terminal toggle. Tolerant of terminals that add
+/// other flags to the chord, matching on the `Shift`+function-key shape via [`REFERENCES_KEY`].
+fn is_references_key(key: KeyPress) -> bool {
+    key.mods.contains(Mods::SHIFT)
+        && !key.mods.contains(Mods::CTRL)
+        && !key.mods.contains(Mods::ALT)
+        && key.code == REFERENCES_KEY.code
 }
 
 /// Translates a crossterm key event into a Keymaker [`KeyPress`], if it maps to one.
