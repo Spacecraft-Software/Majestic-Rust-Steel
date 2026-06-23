@@ -16,6 +16,7 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,9 @@ pub struct Config {
     pub keymap: String,
     /// Indent width in columns, as written in the manifest (clamp on use via [`Config::tab_width`]).
     pub tab_width: usize,
+    /// Manifest-pinned extensions, keyed by name. Each declares an exact pinned `version`; the host
+    /// loads the enabled ones (in name order) and verifies the pin. Empty by default.
+    pub extensions: BTreeMap<String, ExtensionSpec>,
 }
 
 impl Default for Config {
@@ -49,6 +53,43 @@ impl Default for Config {
             theme: "steelbore".to_owned(),
             keymap: "cua".to_owned(),
             tab_width: DEFAULT_TAB_WIDTH,
+            extensions: BTreeMap::new(),
+        }
+    }
+}
+
+/// One manifest-pinned extension entry (PRD #1 §5.5 / §6.7).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExtensionSpec {
+    /// The exact pinned version the extension must declare (Doom/`straight.el`-style reproducibility).
+    pub version: String,
+    /// Whether to load this extension (`true` by default; set `false` to keep the pin but skip it).
+    pub enabled: bool,
+    /// An explicit path to the extension's Steel file, overriding the default location. Relative
+    /// paths resolve against the manifest's directory.
+    pub source: Option<String>,
+}
+
+impl Default for ExtensionSpec {
+    fn default() -> Self {
+        Self {
+            version: String::new(),
+            enabled: true,
+            source: None,
+        }
+    }
+}
+
+impl ExtensionSpec {
+    /// The Steel file to load for extension `name`, resolved against `base_dir` (the directory
+    /// holding the manifest): the explicit [`Self::source`] when set (joined onto `base_dir`, so an
+    /// absolute source is used verbatim), otherwise `base_dir/extensions/<name>.scm`.
+    #[must_use]
+    pub fn resolve(&self, name: &str, base_dir: &Path) -> PathBuf {
+        match &self.source {
+            Some(source) => base_dir.join(source),
+            None => base_dir.join("extensions").join(format!("{name}.scm")),
         }
     }
 }
@@ -59,6 +100,14 @@ impl Config {
     #[must_use]
     pub fn tab_width(&self) -> usize {
         self.tab_width.clamp(1, 16)
+    }
+
+    /// The enabled extensions in name order (the host loads them in this deterministic order).
+    pub fn enabled_extensions(&self) -> impl Iterator<Item = (&str, &ExtensionSpec)> {
+        self.extensions
+            .iter()
+            .filter(|(_, spec)| spec.enabled)
+            .map(|(name, spec)| (name.as_str(), spec))
     }
 
     /// Loads and validates the manifest at `path`.
@@ -172,7 +221,9 @@ impl std::error::Error for ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{write_keymap_to, Config, ConfigError};
+    use std::path::Path;
+
+    use super::{write_keymap_to, Config, ConfigError, ExtensionSpec};
 
     #[test]
     fn empty_manifest_yields_defaults() {
@@ -213,6 +264,85 @@ mod tests {
         let config = Config::load_str("{ tab_width = 9000 }").unwrap();
         assert_eq!(config.tab_width, 9000); // stored verbatim
         assert_eq!(config.tab_width(), 16); // clamped on use
+    }
+
+    #[test]
+    fn no_extensions_by_default() {
+        let config = Config::load_str("{}").unwrap();
+        assert!(config.extensions.is_empty());
+        assert_eq!(config.enabled_extensions().count(), 0);
+    }
+
+    #[test]
+    fn extensions_parse_with_pinned_versions_and_defaults() {
+        let config = Config::load_str(
+            r#"{
+                extensions = {
+                    surround = { version = "1.2.0" },
+                    legacy = { version = "0.1.0", enabled = false },
+                    custom = { version = "2.0.0", source = "ext/custom.scm" },
+                },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.extensions.len(), 3);
+        // `enabled` defaults to true; `source` defaults to None.
+        let surround = &config.extensions["surround"];
+        assert_eq!(surround.version, "1.2.0");
+        assert!(surround.enabled);
+        assert_eq!(surround.source, None);
+        assert_eq!(
+            config.extensions["custom"].source.as_deref(),
+            Some("ext/custom.scm")
+        );
+
+        // `enabled_extensions` drops the disabled one and yields name order.
+        let enabled: Vec<&str> = config.enabled_extensions().map(|(name, _)| name).collect();
+        assert_eq!(enabled, vec!["custom", "surround"]); // "legacy" disabled; sorted by name
+    }
+
+    #[test]
+    fn extension_version_is_required_by_the_contract() {
+        // The schema's `version | String` field has no default, so omitting it is a contract error.
+        let error = Config::load_str(r"{ extensions = { x = { enabled = true } } }").unwrap_err();
+        assert!(matches!(error, ConfigError::Evaluate(_)));
+    }
+
+    #[test]
+    fn unknown_extension_field_is_rejected() {
+        let error = Config::load_str(r#"{ extensions = { x = { version = "1", oops = 1 } } }"#)
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::Evaluate(_)));
+    }
+
+    #[test]
+    fn extension_resolves_to_default_location_or_explicit_source() {
+        let base = Path::new("/cfg");
+        // No source → <base>/extensions/<name>.scm.
+        let default_spec = ExtensionSpec {
+            version: "1".to_owned(),
+            enabled: true,
+            source: None,
+        };
+        assert_eq!(
+            default_spec.resolve("surround", base),
+            Path::new("/cfg/extensions/surround.scm")
+        );
+        // Relative source → joined onto base.
+        let relative = ExtensionSpec {
+            source: Some("ext/custom.scm".to_owned()),
+            ..default_spec.clone()
+        };
+        assert_eq!(
+            relative.resolve("custom", base),
+            Path::new("/cfg/ext/custom.scm")
+        );
+        // Absolute source → used verbatim.
+        let absolute = ExtensionSpec {
+            source: Some("/opt/x.scm".to_owned()),
+            ..default_spec
+        };
+        assert_eq!(absolute.resolve("x", base), Path::new("/opt/x.scm"));
     }
 
     #[test]

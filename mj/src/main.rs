@@ -432,13 +432,28 @@ fn apply_config(workspace: &mut Workspace) {
     let mut tab_width: Option<usize> = None;
     let mut keymap_name: Option<String> = None;
     let mut notices: Vec<String> = Vec::new();
+    // The Steel runtime is shared by the manifest's pinned extensions and the user's config.scm, so
+    // an extension's registrations are visible to config.scm. Created lazily — with neither
+    // extensions nor a config.scm, no VM is spun up (keeping cold start cheap).
+    let mut runtime: Option<SteelRuntime> = None;
 
-    // 1. Declarative half — the Nickel manifest.
+    // 1. Declarative half — the Nickel manifest (which also names the pinned extensions).
     if let Some(path) = Config::discover() {
         match Config::load(&path) {
             Ok(config) => {
                 tab_width = Some(config.tab_width());
                 keymap_name = Some(config.keymap.clone());
+                // 2. Manifest-pinned extensions, loaded in name order on the shared runtime. Each
+                // failure (missing file, eval error, version mismatch) is fail-soft: a notice, then
+                // on to the next — a broken extension never blocks the editor from opening.
+                let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                for (name, spec) in config.enabled_extensions() {
+                    let file = spec.resolve(name, base);
+                    let runtime = runtime.get_or_insert_with(SteelRuntime::new);
+                    if let Err(error) = runtime.load_extension(name, &spec.version, &file) {
+                        notices.push(format!("extension `{name}` ({})", one_line(&error)));
+                    }
+                }
             }
             Err(error) => notices.push(format!(
                 "manifest {} invalid ({})",
@@ -448,23 +463,26 @@ fn apply_config(workspace: &mut Workspace) {
         }
     }
 
-    // 2. Imperative half — the Steel config.scm, layered on top.
+    // 3. Imperative half — the Steel config.scm, layered on top (same runtime as the extensions).
     if let Some(path) = SteelRuntime::discover() {
-        let mut runtime = SteelRuntime::new();
-        match runtime.run_file(&path) {
-            Ok(()) => {
-                if let Some(columns) = runtime.settings().tab_width {
-                    tab_width = Some(columns.clamp(1, 16));
-                }
-                if let Some(name) = runtime.settings().keymap.clone() {
-                    keymap_name = Some(name);
-                }
-            }
-            Err(error) => notices.push(format!(
+        let runtime = runtime.get_or_insert_with(SteelRuntime::new);
+        if let Err(error) = runtime.run_file(&path) {
+            notices.push(format!(
                 "config.scm {} failed ({})",
                 path.display(),
                 one_line(&error)
-            )),
+            ));
+        }
+    }
+
+    // 4. Settings accumulated by the extensions + config.scm override the manifest's values.
+    if let Some(runtime) = runtime.as_ref() {
+        let settings = runtime.settings();
+        if let Some(columns) = settings.tab_width {
+            tab_width = Some(columns.clamp(1, 16));
+        }
+        if let Some(name) = settings.keymap {
+            keymap_name = Some(name);
         }
     }
 
