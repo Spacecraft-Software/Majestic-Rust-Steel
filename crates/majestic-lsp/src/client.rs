@@ -30,7 +30,7 @@ use lsp_types::{
     PublishDiagnosticsParams, ReferenceClientCapabilities, RenameClientCapabilities,
     SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
-    WorkspaceFolder,
+    WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceSymbolClientCapabilities,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -260,6 +260,10 @@ fn client_capabilities() -> ClientCapabilities {
             formatting: Some(DocumentFormattingClientCapabilities {
                 dynamic_registration: Some(false),
             }),
+            ..Default::default()
+        }),
+        workspace: Some(WorkspaceClientCapabilities {
+            symbol: Some(WorkspaceSymbolClientCapabilities::default()),
             ..Default::default()
         }),
         ..Default::default()

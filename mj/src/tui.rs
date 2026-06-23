@@ -160,6 +160,8 @@ enum PromptAction {
     ReplaceWith { search: String },
     /// Go to a line: the typed (1-based) line number moves the cursor to that line.
     GotoLine,
+    /// Go to symbol in the project: the typed text queries `workspace/symbol`; matches open the picker.
+    WorkspaceSymbol,
 }
 
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
@@ -377,7 +379,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::DocumentHighlight { path, .. } | LspOutcome::CodeActions { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::WorkspaceSymbols { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::DocumentHighlight { path, .. } | LspOutcome::CodeActions { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -418,6 +420,14 @@ impl App {
                     if !references.is_empty() {
                         self.close_cursor_popups();
                         self.references = Some(references);
+                    }
+                }
+                LspOutcome::WorkspaceSymbols { symbols, .. } => {
+                    // Project-wide symbol matches reuse the references picker (cross-file jump).
+                    let matches = References::new(symbols);
+                    if !matches.is_empty() {
+                        self.close_cursor_popups();
+                        self.references = Some(matches);
                     }
                 }
                 LspOutcome::DocumentSymbols { symbols, .. } => {
@@ -714,6 +724,23 @@ impl App {
         true
     }
 
+    /// Opens the command palette: Oracle's editor commands plus the host-level commands the App
+    /// dispatches itself (config reload, the goto/replace/diagnostic/symbol actions).
+    fn open_command_palette(&mut self) {
+        let mut commands = oracle::command_names();
+        commands.extend([
+            "reload-config",
+            "goto-type-definition",
+            "goto-implementation",
+            "next-diagnostic",
+            "prev-diagnostic",
+            "replace",
+            "goto-line",
+            "workspace-symbols",
+        ]);
+        self.finder = Some(Finder::commands(&commands));
+    }
+
     fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
         // The first-run selector is modal and outranks everything: it captures every key until
         // the user has chosen a keybinding profile.
@@ -772,18 +799,7 @@ impl App {
             return Ok(());
         }
         if is_command_palette(key) {
-            // The editor commands (from Oracle) plus the host-level commands the App handles itself.
-            let mut commands = oracle::command_names();
-            commands.extend([
-                "reload-config",
-                "goto-type-definition",
-                "goto-implementation",
-                "next-diagnostic",
-                "prev-diagnostic",
-                "replace",
-                "goto-line",
-            ]);
-            self.finder = Some(Finder::commands(&commands));
+            self.open_command_palette();
             return Ok(());
         }
         if key == FILE_FINDER {
@@ -1409,6 +1425,11 @@ impl App {
             }
             PromptAction::ReplaceWith { search } => self.replace_all(&search, &input),
             PromptAction::GotoLine => self.goto_line(&input),
+            PromptAction::WorkspaceSymbol => {
+                if let Some(path) = self.workspace.active().buffer().path() {
+                    self.lsp.request_workspace_symbols(&path, input);
+                }
+            }
         }
     }
 
@@ -1455,6 +1476,23 @@ impl App {
         }
         self.prompt = Some(Prompt::new("Go to line", ""));
         self.prompt_action = Some(PromptAction::GotoLine);
+    }
+
+    /// Starts go-to-symbol-in-project: opens the "Go to symbol" prompt, whose entry queries
+    /// `workspace/symbol` and shows the matches in the picker. Invoked by the `workspace-symbols`
+    /// palette command. A no-op unless the editor is focused and a server handles the active buffer.
+    fn trigger_workspace_symbols(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let Some(path) = self.workspace.active().buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        self.prompt = Some(Prompt::new("Go to symbol", ""));
+        self.prompt_action = Some(PromptAction::WorkspaceSymbol);
     }
 
     /// Moves the cursor to the start of (1-based) line `input`, clamped to the buffer's last line. A
@@ -1736,6 +1774,9 @@ impl App {
             }
             Action::RunCommand(name) if name == "replace" => self.trigger_replace(),
             Action::RunCommand(name) if name == "goto-line" => self.trigger_goto_line(),
+            Action::RunCommand(name) if name == "workspace-symbols" => {
+                self.trigger_workspace_symbols();
+            }
             Action::RunCommand(name) => self.workspace.execute(&name),
         }
         // A command may have requested the search line (e.g. `find` chosen from the palette).
