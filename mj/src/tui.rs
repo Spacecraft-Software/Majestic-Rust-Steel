@@ -102,6 +102,9 @@ const COMPLETION_KEY: KeyPress = KeyPress::ctrl(' ');
 /// hover; an F-key, like F1/F12, so it is safe to capture globally without shadowing an editing key).
 const HOVER_KEY: KeyPress = KeyPress::key(KeyCode::Function(2));
 
+/// The `F12` key requests LSP goto-definition at the cursor (the universal editor convention).
+const GOTO_DEF_KEY: KeyPress = KeyPress::key(KeyCode::Function(12));
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -184,7 +187,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -202,6 +205,23 @@ impl App {
                     {
                         self.hover = Some(hover);
                         self.completion = None;
+                    }
+                }
+                LspOutcome::GotoDefinition { target, .. } => {
+                    if let Some((target_path, position)) = target {
+                        // Reveal the destination (reusing an open editor when possible), then land
+                        // the cursor on the target position converted against that file's text.
+                        if self.workspace.reveal_path(&target_path).is_ok() {
+                            let text = self.workspace.active().buffer().text();
+                            let byte = majestic_lsp::position_to_byte(
+                                &text,
+                                position.line,
+                                position.character,
+                            );
+                            self.workspace.set_active_cursor(byte);
+                            self.completion = None;
+                            self.hover = None;
+                        }
                     }
                 }
             }
@@ -420,6 +440,10 @@ impl App {
             self.trigger_hover();
             return Ok(());
         }
+        if key == GOTO_DEF_KEY {
+            self.trigger_goto_definition();
+            return Ok(());
+        }
         if key.code == TERMINAL_TOGGLE {
             self.toggle_terminal(columns, lines);
             return Ok(());
@@ -538,6 +562,24 @@ impl App {
         }
         let cursor = editor.buffer().cursor();
         self.lsp.request_hover(&path, cursor);
+    }
+
+    /// Requests LSP goto-definition at the cursor, off-thread; the jump happens later, in
+    /// `sync_lsp`, once the reply arrives. A no-op unless the editor is focused and a server handles
+    /// the buffer.
+    fn trigger_goto_definition(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_goto_definition(&path, cursor);
     }
 
     /// Inserts the selected candidate over the typed identifier prefix and closes the popup.
