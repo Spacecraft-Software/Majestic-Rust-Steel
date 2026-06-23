@@ -364,7 +364,7 @@ impl App {
                 }
             }
         }
-        // The separate, edit-driven inlay-hint debounce.
+        // The separate, edit-driven debounce for the whole-document refreshes (inlay hints + folds).
         if self
             .pending_inlay
             .as_ref()
@@ -372,6 +372,7 @@ impl App {
         {
             if let Some((path, _)) = self.pending_inlay.take() {
                 self.lsp.request_inlay_hints(&path);
+                self.lsp.request_folding_ranges(&path);
             }
         }
     }
@@ -406,6 +407,11 @@ impl App {
             // A command's edits (workspace/applyEdit) carry their own paths — apply ungated too.
             if let LspOutcome::ApplyEdit { edits } = outcome {
                 self.apply_workspace_edits(edits);
+                continue;
+            }
+            // Foldable ranges apply to the buffer by path, regardless of focus (like inlay hints).
+            if let LspOutcome::FoldingRanges { path, folds } = &outcome {
+                self.workspace.apply_folds(path, folds);
                 continue;
             }
             let active_path = self.workspace.active().buffer().path();
@@ -499,7 +505,9 @@ impl App {
                     self.apply_formatting(&path, formatted);
                 }
                 // Applied (by path, ungated by focus) before the focus check above.
-                LspOutcome::InlayHints { .. } | LspOutcome::ApplyEdit { .. } => {}
+                LspOutcome::InlayHints { .. }
+                | LspOutcome::ApplyEdit { .. }
+                | LspOutcome::FoldingRanges { .. } => {}
             }
         }
     }
@@ -771,6 +779,7 @@ impl App {
             "replace",
             "goto-line",
             "workspace-symbols",
+            "toggle-fold",
         ]);
         self.finder = Some(Finder::commands(&commands));
     }
@@ -1811,6 +1820,9 @@ impl App {
             Action::RunCommand(name) if name == "goto-line" => self.trigger_goto_line(),
             Action::RunCommand(name) if name == "workspace-symbols" => {
                 self.trigger_workspace_symbols();
+            }
+            Action::RunCommand(name) if name == "toggle-fold" => {
+                self.workspace.toggle_active_fold();
             }
             Action::RunCommand(name) => self.workspace.execute(&name),
         }

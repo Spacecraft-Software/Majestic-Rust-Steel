@@ -23,17 +23,18 @@ use lsp_types::{
     DiagnosticSeverity, DocumentChangeOperation, DocumentChanges, DocumentFormattingParams,
     DocumentHighlight as LspDocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandParams,
-    FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover,
-    HoverContents, HoverParams, InlayHint as LspInlayHint, InlayHintLabel, InlayHintParams,
-    Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel, PartialResultParams,
-    Position, PublishDiagnosticsParams, Range as LspRange, ReferenceContext, ReferenceParams,
-    RenameParams, SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind,
-    TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    FoldingRange, FoldingRangeParams, FormattingOptions, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams,
+    InlayHint as LspInlayHint, InlayHintLabel, InlayHintParams, Location, MarkedString,
+    MarkupContent, MarkupKind, OneOf, ParameterLabel, PartialResultParams, Position,
+    PublishDiagnosticsParams, Range as LspRange, ReferenceContext, ReferenceParams, RenameParams,
+    SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentEdit,
+    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use majestic_core::{
-    CodeAction, Command, CompletionItem, Diagnostic, InlayHint, Occurrence, Reference, RenameEdit,
-    Severity, SignatureHelp, Symbol,
+    CodeAction, Command, CompletionItem, Diagnostic, FoldRange, InlayHint, Occurrence, Reference,
+    RenameEdit, Severity, SignatureHelp, Symbol,
 };
 
 use crate::client::{file_uri, LanguageServer};
@@ -168,6 +169,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The hints (byte position + display text), applied to the buffer's views by the host.
         hints: Vec<InlayHint>,
+    },
+    /// The foldable line ranges of the document at `path` (LSP `foldingRange`), applied to the
+    /// buffer's views by the host. Empty when the server reports none.
+    FoldingRanges {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The foldable ranges (header + last line), applied to the buffer's views by the host.
+        folds: Vec<FoldRange>,
     },
     /// The code actions (quick-fixes / refactors) the server offers at the cursor in the document at
     /// `path`, ready to show in the menu. Empty when the server offers none (the menu does not open).
@@ -612,6 +621,28 @@ impl LspManager {
             let hints = fetch_inlay_hints(&requester, uri, &snapshot);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::InlayHints { path, hints });
+        });
+    }
+
+    /// Requests the foldable line ranges of the document at `path` (LSP `textDocument/foldingRange`),
+    /// off the editor thread. A no-op unless the document is open and its server is
+    /// [`ServerSlot::Ready`]; the result arrives via [`Self::poll_outcomes`] as
+    /// [`LspOutcome::FoldingRanges`].
+    pub fn request_folding_ranges(&self, path: &Path) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let folds = fetch_folding_ranges(&requester, uri);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::FoldingRanges { path, folds });
         });
     }
 
@@ -1194,6 +1225,41 @@ fn fetch_inlay_hints(requester: &Requester, uri: Uri, snapshot: &str) -> Vec<Inl
                 text.push(' ');
             }
             InlayHint::new(byte, text)
+        })
+        .collect()
+}
+
+/// Issues `textDocument/foldingRange` over a shared [`Requester`] (on a worker thread) and converts
+/// the reply to editor-facing [`FoldRange`]s (header line → last line). A timeout, transport error,
+/// server error, `null`, or empty result all yield an empty list (nothing foldable).
+fn fetch_folding_ranges(requester: &Requester, uri: Uri) -> Vec<FoldRange> {
+    let params = FoldingRangeParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/foldingRange", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (nothing foldable) deserializes to `None`.
+    let ranges: Option<Vec<FoldingRange>> = serde_json::from_value(result).unwrap_or(None);
+    let Some(ranges) = ranges else {
+        return Vec::new();
+    };
+    ranges
+        .into_iter()
+        .filter_map(|range| {
+            let start = usize::try_from(range.start_line).ok()?;
+            let end = usize::try_from(range.end_line).ok()?;
+            Some(FoldRange::new(start, end))
         })
         .collect()
 }

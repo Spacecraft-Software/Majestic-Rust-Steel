@@ -37,6 +37,7 @@ mod diagnostic;
 mod editor;
 mod files;
 mod finder;
+mod fold;
 mod fuzzy;
 mod git;
 mod hover;
@@ -71,6 +72,8 @@ pub use editor::{EditMode, Editor};
 pub use files::FileTree;
 #[doc(inline)]
 pub use finder::{Action, Finder, HelpOverlay};
+#[doc(inline)]
+pub use fold::FoldRange;
 #[doc(inline)]
 pub use hover::Hover;
 #[doc(inline)]
