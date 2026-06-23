@@ -88,6 +88,17 @@ enum ServerSlot {
     Failed,
 }
 
+/// The lifecycle health of a language server, for a status indicator ([`LspManager::server_health`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerHealth {
+    /// Spawning + running the `initialize` handshake (not yet usable).
+    Starting,
+    /// Initialized and serving requests.
+    Ready,
+    /// Startup failed (e.g. the server program is not installed); not retried.
+    Failed,
+}
+
 /// The result of an interactive LSP request, delivered back to the editor once a worker thread has
 /// the server's reply. Drained each frame by [`LspManager::poll_outcomes`] (the request itself runs
 /// off-thread so a slow server never blocks the render loop).
@@ -237,6 +248,21 @@ impl LspManager {
     #[must_use]
     pub fn handles(&self, path: &Path) -> bool {
         self.config_for(path).is_some()
+    }
+
+    /// The language server for `path`'s language: its command name and current health, for a status
+    /// indicator. `None` when no server is configured for the extension. A configured language whose
+    /// server has not been spawned yet (e.g. before the file is opened) reads as
+    /// [`ServerHealth::Starting`].
+    #[must_use]
+    pub fn server_health(&self, path: &Path) -> Option<(String, ServerHealth)> {
+        let config = self.config_for(path)?;
+        let health = match self.servers.get(&config.language_id) {
+            Some(ServerSlot::Ready(_)) => ServerHealth::Ready,
+            Some(ServerSlot::Failed) => ServerHealth::Failed,
+            Some(ServerSlot::Starting(_)) | None => ServerHealth::Starting,
+        };
+        Some((config.command, health))
     }
 
     /// Opens `path` (content `text`) in its language's server, spawning + initializing the server
@@ -1421,7 +1447,7 @@ mod tests {
 
     use super::{
         apply_text_edits, byte_to_position, markup_text, parameter_byte_range, position_to_byte,
-        read_capped, symbol_kind_glyph, LspManager, LspOutcome, ServerConfig,
+        read_capped, symbol_kind_glyph, LspManager, LspOutcome, ServerConfig, ServerHealth,
     };
     use crate::client::LanguageServer;
     use crate::codec::{read_message, write_message};
@@ -2781,5 +2807,29 @@ mod tests {
             !actions.is_empty(),
             "rust-analyzer should offer at least one assist on a struct: {actions:?}"
         );
+    }
+
+    #[test]
+    fn server_health_reports_the_configured_server_state() {
+        let mut manager = LspManager::new();
+        // An unconfigured extension has no server.
+        assert_eq!(manager.server_health(std::path::Path::new("/x.txt")), None);
+
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let path = std::path::Path::new("/x.rs");
+        // Configured, but no server spawned yet → Starting (with the command name).
+        assert!(matches!(
+            manager.server_health(path),
+            Some((name, ServerHealth::Starting)) if name == "rust-analyzer"
+        ));
+
+        // A registered (ready) server → Ready.
+        let (client, _server) = UnixStream::pair().unwrap();
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+        assert!(matches!(
+            manager.server_health(path),
+            Some((_, ServerHealth::Ready))
+        ));
     }
 }

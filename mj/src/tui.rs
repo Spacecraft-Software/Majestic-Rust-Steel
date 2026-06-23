@@ -31,7 +31,7 @@ use majestic_core::{
     Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
     ProfileSelector, Prompt, References, RenameEdit, Session, SignatureHelp, Symbols, Workspace,
 };
-use majestic_lsp::{LspManager, LspOutcome};
+use majestic_lsp::{LspManager, LspOutcome, ServerHealth};
 use majestic_term::PtyTerminal;
 use penumbra::{Buffer, Rect, Screen, Style, Theme};
 
@@ -603,11 +603,30 @@ impl App {
         } else {
             "[F1 help · F12 terminal · Ctrl+B files]"
         };
-        if let Ok(len) = u16::try_from(hint.chars().count()) {
+        // Right-aligned cluster: the active buffer's LSP server health (when one is configured),
+        // then the key hint.
+        let right = match self.active_lsp_status() {
+            Some(lsp) => format!("{lsp}  {hint}"),
+            None => hint.to_owned(),
+        };
+        if let Ok(len) = u16::try_from(right.chars().count()) {
             if len < surface.width() {
-                surface.set_str(surface.width() - len - 1, row, hint, style);
+                surface.set_str(surface.width() - len - 1, row, &right, style);
             }
         }
+    }
+
+    /// The LSP server status for the active buffer (`"<server> ✓/…/✗"` for ready / starting /
+    /// failed), or `None` when no server is configured for it — shown in the status bar.
+    fn active_lsp_status(&self) -> Option<String> {
+        let path = self.workspace.active().buffer().path()?;
+        let (name, health) = self.lsp.server_health(&path)?;
+        let glyph = match health {
+            ServerHealth::Ready => '✓',
+            ServerHealth::Starting => '…',
+            ServerHealth::Failed => '✗',
+        };
+        Some(format!("{name} {glyph}"))
     }
 
     /// Dispatches the LSP feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
