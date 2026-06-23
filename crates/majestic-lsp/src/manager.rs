@@ -18,25 +18,26 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use lsp_types::{
-    CodeActionContext, CodeActionOrCommand, CodeActionParams, CompletionList, CompletionParams,
-    CompletionResponse, Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentChangeOperation,
-    DocumentChanges, DocumentFormattingParams, DocumentHighlight as LspDocumentHighlight,
-    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover as LspHover, HoverContents, HoverParams, InlayHint as LspInlayHint, InlayHintLabel,
-    InlayHintParams, Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel,
-    PartialResultParams, Position, PublishDiagnosticsParams, Range as LspRange, ReferenceContext,
-    ReferenceParams, RenameParams, SignatureHelp as LspSignatureHelp, SignatureHelpParams,
-    SymbolKind, TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit,
-    Uri, WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ApplyWorkspaceEditParams, CodeActionContext, CodeActionOrCommand, CodeActionParams,
+    CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
+    DiagnosticSeverity, DocumentChangeOperation, DocumentChanges, DocumentFormattingParams,
+    DocumentHighlight as LspDocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandParams,
+    FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover,
+    HoverContents, HoverParams, InlayHint as LspInlayHint, InlayHintLabel, InlayHintParams,
+    Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel, PartialResultParams,
+    Position, PublishDiagnosticsParams, Range as LspRange, ReferenceContext, ReferenceParams,
+    RenameParams, SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind,
+    TextDocumentEdit, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use majestic_core::{
-    CodeAction, CompletionItem, Diagnostic, InlayHint, Occurrence, Reference, RenameEdit, Severity,
-    SignatureHelp, Symbol,
+    CodeAction, Command, CompletionItem, Diagnostic, InlayHint, Occurrence, Reference, RenameEdit,
+    Severity, SignatureHelp, Symbol,
 };
 
 use crate::client::{file_uri, LanguageServer};
-use crate::connection::Requester;
+use crate::connection::{Incoming, Requester};
 
 /// How to launch a language server for a file extension.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +176,13 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The offered actions, each with a title and its already-reduced edits.
         actions: Vec<CodeAction>,
+    },
+    /// Edits the server asked the client to apply (a `workspace/applyEdit` request, produced by a
+    /// `workspace/executeCommand`). The manager has already answered the server; the host applies
+    /// these. Not tied to one document — the edits carry their own paths.
+    ApplyEdit {
+        /// The edits to splice into their files (already reduced from the server's `WorkspaceEdit`).
+        edits: Vec<RenameEdit>,
     },
     /// The outline of every definition in the document at `path` (functions, types, members, …),
     /// flattened in document order with nesting depth, ready to show in the symbols picker. Empty
@@ -337,17 +345,41 @@ impl LspManager {
     /// Non-blocking — joining a startup thread only happens once it has finished.
     pub fn poll(&mut self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
         self.advance_startups();
-        // Drain every ready server's published diagnostics first, releasing the `servers` borrow
+        // Drain every ready server's incoming once, routing diagnostics and the `workspace/applyEdit`
+        // requests a code-action command produces. Collect first to release the `servers` borrow
         // before touching `docs` (which we mutate to retain the raw diagnostics for codeAction).
-        let published: Vec<PublishDiagnosticsParams> = self
-            .servers
-            .values()
-            .filter_map(|slot| match slot {
-                ServerSlot::Ready(server) => Some(server.diagnostics()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+        let mut published: Vec<PublishDiagnosticsParams> = Vec::new();
+        let mut command_edits: Vec<Vec<RenameEdit>> = Vec::new();
+        for slot in self.servers.values() {
+            let ServerSlot::Ready(server) = slot else {
+                continue;
+            };
+            for incoming in server.drain_incoming() {
+                match incoming {
+                    Incoming::Notification { method, params }
+                        if method == "textDocument/publishDiagnostics" =>
+                    {
+                        if let Ok(params) = serde_json::from_value(params) {
+                            published.push(params);
+                        }
+                    }
+                    Incoming::Request { id, method, params } if method == "workspace/applyEdit" => {
+                        // The edits a command produced: hand them to the host and tell the server we
+                        // applied them so it can complete the command.
+                        if let Ok(params) =
+                            serde_json::from_value::<ApplyWorkspaceEditParams>(params)
+                        {
+                            command_edits.push(workspace_edit_to_edits(params.edit));
+                        }
+                        let _ = server.respond(id, serde_json::json!({ "applied": true }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for edits in command_edits {
+            let _ = self.outcomes_tx.send(LspOutcome::ApplyEdit { edits });
+        }
         let mut updates = Vec::new();
         for params in published {
             // Match the published URI back to an open document (canonicalized, so it need not equal
@@ -614,6 +646,42 @@ impl LspManager {
             let actions = fetch_code_actions(&requester, uri, range, diagnostics);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::CodeActions { path, actions });
+        });
+    }
+
+    /// Runs a code action's command (LSP `workspace/executeCommand`), off the editor thread. The
+    /// command's effect typically comes back as a `workspace/applyEdit` request, which [`Self::poll`]
+    /// answers and surfaces as [`LspOutcome::ApplyEdit`]. A no-op unless the document is open and its
+    /// server is [`ServerSlot::Ready`].
+    pub fn request_execute_command(
+        &self,
+        path: &Path,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    ) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        thread::spawn(move || {
+            let params = ExecuteCommandParams {
+                command,
+                arguments,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            };
+            let Ok(value) = serde_json::to_value(params) else {
+                return;
+            };
+            // The response is usually null — the real effect is the server's `applyEdit` request,
+            // handled on the main thread (in `poll`) while this worker waits.
+            let _ = requester.request_timeout(
+                "workspace/executeCommand",
+                value,
+                Duration::from_secs(5),
+            );
         });
     }
 
@@ -1183,11 +1251,27 @@ fn fetch_code_actions(
         .map(|item| match item {
             CodeActionOrCommand::CodeAction(action) => {
                 let edits = action.edit.map(workspace_edit_to_edits).unwrap_or_default();
-                CodeAction::new(action.title, edits)
+                let base = CodeAction::new(action.title, edits);
+                // An action may also carry a command (run when it has no inline edits).
+                match action.command {
+                    Some(command) => base.with_command(to_core_command(command)),
+                    None => base,
+                }
             }
-            CodeActionOrCommand::Command(command) => CodeAction::new(command.title, Vec::new()),
+            CodeActionOrCommand::Command(command) => {
+                CodeAction::new(command.title.clone(), Vec::new())
+                    .with_command(to_core_command(command))
+            }
         })
         .collect()
+}
+
+/// Converts an LSP `Command` to the editor-facing [`Command`] (id + JSON arguments).
+fn to_core_command(command: lsp_types::Command) -> Command {
+    Command {
+        id: command.command,
+        arguments: command.arguments.unwrap_or_default(),
+    }
 }
 
 /// Issues `textDocument/documentSymbol` over a shared [`Requester`] (on a worker thread) and
@@ -2995,8 +3079,17 @@ mod tests {
             actions[0].edits[0].path,
             std::path::PathBuf::from("/tmp/does-not-exist-ca.rs")
         );
+        // A command-only action carries no edits but is applicable (it runs its command).
         assert_eq!(actions[1].title, "Run command");
-        assert!(!actions[1].is_applicable()); // command-only
+        assert!(actions[1].edits.is_empty());
+        assert!(actions[1].is_applicable());
+        assert_eq!(
+            actions[1]
+                .command
+                .as_ref()
+                .map(|command| command.id.as_str()),
+            Some("majestic.noop")
+        );
 
         mock.join().unwrap();
     }
@@ -3179,6 +3272,91 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].byte, 5); // position (0,5) → byte 5
         assert_eq!(hints[0].text, " : i32"); // leading padding folded into the text
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn execute_command_handles_the_reverse_apply_edit_and_surfaces_the_edits() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock that, on `workspace/executeCommand`, sends back a `workspace/applyEdit` REQUEST,
+        // waits for the client's `{applied:true}` response, then answers the original command.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let exec_id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "workspace/executeCommand" {
+                    break message["id"].clone();
+                }
+            };
+            // Reverse request: ask the client to apply an edit.
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 9001,
+                    "method": "workspace/applyEdit",
+                    "params": {
+                        "edit": {
+                            "changes": {
+                                "file:///tmp/does-not-exist-cmd.rs": [
+                                    {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// added\n"}
+                                ]
+                            }
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            // Wait for the client's apply-edit response, then complete the command.
+            let applied = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["id"] == 9001 {
+                    break message["result"]["applied"].clone();
+                }
+            };
+            assert_eq!(applied, json!(true), "client confirms it applied the edit");
+            write_message(
+                &mut writer,
+                &json!({ "jsonrpc": "2.0", "id": exec_id, "result": null }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-c.rs");
+        manager.open(path, "fn main() {}").unwrap();
+        manager.request_execute_command(path, "majestic.fix".to_owned(), Vec::new());
+
+        // The host loop: `poll` drains + answers the applyEdit request and surfaces the edits.
+        let mut edits = None;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = manager.poll();
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::ApplyEdit { edits: e } = outcome {
+                    edits = Some(e);
+                }
+            }
+            if edits.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let edits = edits.expect("an apply-edit outcome from the command");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "// added\n");
+        assert_eq!(
+            edits[0].path,
+            std::path::PathBuf::from("/tmp/does-not-exist-cmd.rs")
+        );
 
         mock.join().unwrap();
     }

@@ -14,30 +14,51 @@ use penumbra::{Buffer as Surface, Rect, Style, Theme};
 use crate::finder::draw_box;
 use crate::rename::RenameEdit;
 
-/// One offered code action: a human title plus the edits that applying it performs.
+/// A code action's command (LSP `workspace/executeCommand`): its identifier and JSON arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Command {
+    /// The command identifier the server registered.
+    pub id: String,
+    /// The opaque JSON arguments the server attached to the command.
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// One offered code action: a human title plus the edits applying it performs and/or a command to
+/// run. An action carrying edits applies them directly; an edit-less action runs its command (the
+/// server then sends back the edits via `workspace/applyEdit`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeAction {
     /// The action's title, shown in the menu (e.g. "Import `std::io::Write`").
     pub title: String,
     /// The edits applying this action performs, already reduced from the server's `WorkspaceEdit`.
-    /// Empty for a command-only action (which v1 does not execute).
+    /// Empty for a command-only action.
     pub edits: Vec<RenameEdit>,
+    /// The command to run when the action has no inline edits. `None` for a pure-edit action.
+    pub command: Option<Command>,
 }
 
 impl CodeAction {
-    /// Creates a code action with `title` that applies `edits`.
+    /// Creates a code action with `title` that applies `edits` (and no command).
     #[must_use]
     pub fn new(title: impl Into<String>, edits: Vec<RenameEdit>) -> Self {
         Self {
             title: title.into(),
             edits,
+            command: None,
         }
     }
 
-    /// Whether selecting this action applies an edit (false for a command-only action).
+    /// Attaches a command to run (for an action whose effect is a `workspace/executeCommand`).
+    #[must_use]
+    pub fn with_command(mut self, command: Command) -> Self {
+        self.command = Some(command);
+        self
+    }
+
+    /// Whether selecting this action does something — applies an edit or runs a command.
     #[must_use]
     pub fn is_applicable(&self) -> bool {
-        !self.edits.is_empty()
+        !self.edits.is_empty() || self.command.is_some()
     }
 }
 

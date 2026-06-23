@@ -143,6 +143,15 @@ impl Requester {
         self.send(&envelope(None, method, params))
     }
 
+    /// Answers a server-initiated request (an [`Incoming::Request`]) with `result`, keyed by its
+    /// `id`. Used to reply to `workspace/applyEdit` so the server can proceed.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the write fails.
+    pub fn respond(&self, id: Value, result: Value) -> io::Result<()> {
+        self.send(&response_envelope(id, result))
+    }
+
     fn send(&self, message: &Value) -> io::Result<()> {
         let mut writer = lock(&self.writer);
         write_message(&mut *writer, message)
@@ -202,6 +211,14 @@ impl Connection {
         self.requester.notify(method, params)
     }
 
+    /// Answers a server-initiated request by `id` (see [`Requester::respond`]).
+    ///
+    /// # Errors
+    /// Returns an I/O error if the write fails.
+    pub fn respond(&self, id: Value, result: Value) -> io::Result<()> {
+        self.requester.respond(id, result)
+    }
+
     /// Takes the server-initiated messages received since the last drain (the editor drains these
     /// each frame to surface diagnostics and the like).
     #[must_use]
@@ -220,6 +237,16 @@ fn envelope(id: Option<i64>, method: &str, params: Value) -> Value {
     }
     object.insert("method".to_owned(), Value::from(method));
     object.insert("params".to_owned(), params);
+    Value::Object(object)
+}
+
+/// Builds a JSON-RPC response envelope answering the request with the given `id` (`{id, result}`,
+/// no `method`).
+fn response_envelope(id: Value, result: Value) -> Value {
+    let mut object = Map::new();
+    object.insert("jsonrpc".to_owned(), Value::from("2.0"));
+    object.insert("id".to_owned(), id);
+    object.insert("result".to_owned(), result);
     Value::Object(object)
 }
 

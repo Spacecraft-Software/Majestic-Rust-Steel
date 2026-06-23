@@ -403,6 +403,11 @@ impl App {
                 self.workspace.apply_inlay_hints(path, hints);
                 continue;
             }
+            // A command's edits (workspace/applyEdit) carry their own paths — apply ungated too.
+            if let LspOutcome::ApplyEdit { edits } = outcome {
+                self.apply_workspace_edits(edits);
+                continue;
+            }
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
@@ -494,7 +499,7 @@ impl App {
                     self.apply_formatting(&path, formatted);
                 }
                 // Applied (by path, ungated by focus) before the focus check above.
-                LspOutcome::InlayHints { .. } => {}
+                LspOutcome::InlayHints { .. } | LspOutcome::ApplyEdit { .. } => {}
             }
         }
     }
@@ -1087,23 +1092,24 @@ impl App {
         }
     }
 
-    /// Applies the selected code action and closes the menu: its edits go through the shared
-    /// `WorkspaceEdit` applier. A command-only action (no edits) cannot be applied in v1, so it just
-    /// surfaces a status notice.
+    /// Applies the selected code action and closes the menu. An action with edits applies them
+    /// directly (the shared `WorkspaceEdit` applier); an edit-less action runs its command, whose
+    /// edits come back as a `workspace/applyEdit` request → an `ApplyEdit` outcome.
     fn apply_selected_code_action(&mut self) {
         let Some(menu) = self.code_actions.take() else {
             return;
         };
-        let Some(action) = menu.selected() else {
-            return;
+        let (edits, command) = match menu.selected() {
+            Some(action) => (action.edits.clone(), action.command.clone()),
+            None => return,
         };
-        if action.is_applicable() {
-            self.apply_workspace_edits(action.edits.clone());
-        } else {
-            self.workspace.set_status(format!(
-                "`{}` needs command execution (not yet supported)",
-                action.title
-            ));
+        if !edits.is_empty() {
+            self.apply_workspace_edits(edits);
+        } else if let Some(command) = command {
+            if let Some(path) = self.workspace.active().buffer().path() {
+                self.lsp
+                    .request_execute_command(&path, command.id, command.arguments);
+            }
         }
     }
 

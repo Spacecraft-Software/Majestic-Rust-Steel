@@ -60,7 +60,7 @@ mod workspace;
 #[doc(inline)]
 pub use buffer::Buffer;
 #[doc(inline)]
-pub use code_action::{CodeAction, CodeActions};
+pub use code_action::{CodeAction, CodeActions, Command};
 #[doc(inline)]
 pub use completion::{Completion, CompletionItem};
 #[doc(inline)]
