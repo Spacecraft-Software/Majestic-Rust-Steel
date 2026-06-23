@@ -150,6 +150,16 @@ enum Direction {
     Prev,
 }
 
+/// What the modal prompt is collecting, resolved when it is confirmed.
+enum PromptAction {
+    /// Rename the symbol recorded at `(path, byte)` to the typed name (LSP `textDocument/rename`).
+    Rename { path: PathBuf, byte: usize },
+    /// Search-and-replace, stage 1: the typed text becomes the search term, then stage 2 opens.
+    ReplaceSearch,
+    /// Search-and-replace, stage 2: the typed text replaces every `search` occurrence in the buffer.
+    ReplaceWith { search: String },
+}
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -183,9 +193,9 @@ struct App {
     /// The incremental in-buffer search (`find`); `Some` while the search line captures keys. It
     /// tints all matches and parks the cursor on the active one.
     search: Option<Search>,
-    /// The document + cursor byte a pending rename was triggered at, recorded when the prompt opens
-    /// and used to issue the request once the new name is confirmed.
-    rename_target: Option<(PathBuf, usize)>,
+    /// What the open [`Self::prompt`] is collecting input for (rename, or a stage of search/replace),
+    /// applied when the prompt is confirmed. `Some` exactly when `prompt` is.
+    prompt_action: Option<PromptAction>,
     /// The `(path, identifier byte-span)` the document-highlight tint currently tracks, so the host
     /// re-requests occurrences only when the cursor moves to a different identifier.
     highlight_anchor: Option<(PathBuf, std::ops::Range<usize>)>,
@@ -224,7 +234,7 @@ impl App {
             code_actions: None,
             prompt: None,
             search: None,
-            rename_target: None,
+            prompt_action: None,
             highlight_anchor: None,
             pending_lsp: None,
             lsp: LspManager::with_defaults(),
@@ -768,6 +778,7 @@ impl App {
                 "goto-implementation",
                 "next-diagnostic",
                 "prev-diagnostic",
+                "replace",
             ]);
             self.finder = Some(Finder::commands(&commands));
             return Ok(());
@@ -1344,7 +1355,7 @@ impl App {
             .get(identifier_start(&text, cursor)..identifier_end(&text, cursor))
             .unwrap_or_default();
         self.prompt = Some(Prompt::new("Rename symbol to", name));
-        self.rename_target = Some((path, cursor));
+        self.prompt_action = Some(PromptAction::Rename { path, byte: cursor });
     }
 
     /// Routes a key to the open rename prompt: a character extends the name, `Backspace` erases,
@@ -1361,28 +1372,75 @@ impl App {
                     prompt.backspace();
                 }
             }
-            KeyCode::Enter => self.confirm_rename(),
+            KeyCode::Enter => self.confirm_prompt(),
             KeyCode::Escape => {
                 self.prompt = None;
-                self.rename_target = None;
+                self.prompt_action = None;
             }
             _ => {}
         }
     }
 
-    /// Confirms the rename: issues `textDocument/rename` for the recorded target with the typed name
-    /// (off-thread; the edits are applied later, in `sync_lsp`), then closes the prompt. A blank name
-    /// just cancels.
-    fn confirm_rename(&mut self) {
-        let prompt = self.prompt.take();
-        let target = self.rename_target.take();
-        let (Some(prompt), Some((path, byte))) = (prompt, target) else {
+    /// Confirms the modal prompt, dispatching on what it was collecting and closing it (a blank entry
+    /// cancels). Rename issues `textDocument/rename`; search-and-replace's first stage records the
+    /// search term and opens the second stage, whose entry replaces every occurrence.
+    fn confirm_prompt(&mut self) {
+        // `take` clears both fields; missing either (shouldn't happen) just closes the prompt.
+        let (Some(prompt), Some(action)) = (self.prompt.take(), self.prompt_action.take()) else {
             return;
         };
-        let new_name = prompt.input().trim().to_owned();
-        if !new_name.is_empty() {
-            self.lsp.request_rename(&path, byte, new_name);
+        let input = prompt.input().to_owned();
+        match action {
+            PromptAction::Rename { path, byte } => {
+                let new_name = input.trim().to_owned();
+                if !new_name.is_empty() {
+                    self.lsp.request_rename(&path, byte, new_name);
+                }
+            }
+            PromptAction::ReplaceSearch => {
+                // Stage 1 → stage 2: a non-empty search term opens the "Replace with" prompt.
+                if !input.is_empty() {
+                    self.prompt = Some(Prompt::new("Replace with", ""));
+                    self.prompt_action = Some(PromptAction::ReplaceWith { search: input });
+                }
+            }
+            PromptAction::ReplaceWith { search } => self.replace_all(&search, &input),
         }
+    }
+
+    /// Replaces every (case-sensitive) occurrence of `search` in the active buffer with `replacement`,
+    /// back-to-front so earlier byte offsets stay valid, and reports the count. A no-op on an empty
+    /// search term.
+    fn replace_all(&mut self, search: &str, replacement: &str) {
+        if search.is_empty() {
+            return;
+        }
+        let text = self.workspace.active().buffer().text();
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut start = 0;
+        while let Some(offset) = text[start..].find(search) {
+            let at = start + offset;
+            let end = at + search.len();
+            ranges.push(at..end);
+            start = end;
+        }
+        let count = ranges.len();
+        for range in ranges.into_iter().rev() {
+            self.workspace.replace_active(range, replacement);
+        }
+        let plural = if count == 1 { "" } else { "s" };
+        self.workspace
+            .set_status(format!("Replaced {count} occurrence{plural}"));
+    }
+
+    /// Starts search-and-replace: opens the "Search for" prompt (its entry then opens "Replace with").
+    /// Invoked by the `replace` palette command. A no-op unless the editor is focused.
+    fn trigger_replace(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        self.prompt = Some(Prompt::new("Search for", ""));
+        self.prompt_action = Some(PromptAction::ReplaceSearch);
     }
 
     /// Applies a server-provided `WorkspaceEdit` (already reduced to positional `RenameEdit`s): groups
@@ -1642,6 +1700,7 @@ impl App {
             Action::RunCommand(name) if name == "prev-diagnostic" => {
                 self.goto_diagnostic(Direction::Prev);
             }
+            Action::RunCommand(name) if name == "replace" => self.trigger_replace(),
             Action::RunCommand(name) => self.workspace.execute(&name),
         }
         // A command may have requested the search line (e.g. `find` chosen from the palette).
@@ -2223,5 +2282,28 @@ mod tests {
     fn function_keys_are_not_encoded() {
         assert_eq!(encode_key(KeyPress::key(KeyCode::Function(5))), None);
         assert_eq!(TERMINAL_TOGGLE, KeyCode::Function(12));
+    }
+
+    #[test]
+    fn replace_flow_replaces_every_occurrence_in_the_buffer() {
+        let mut editor = Editor::new();
+        for c in "foo bar foo".chars() {
+            editor.handle_key(KeyPress::char(c));
+        }
+        let mut app = App::new(Workspace::new(editor));
+
+        // The two-stage prompt: "Search for" foo → "Replace with" baz.
+        app.trigger_replace();
+        for c in "foo".chars() {
+            app.prompt_key(KeyPress::char(c));
+        }
+        app.prompt_key(KeyPress::key(KeyCode::Enter)); // stage 1 → opens stage 2
+        for c in "baz".chars() {
+            app.prompt_key(KeyPress::char(c));
+        }
+        app.prompt_key(KeyPress::key(KeyCode::Enter)); // applies the replacement
+
+        assert_eq!(app.workspace.active().buffer().text(), "baz bar baz");
+        assert!(app.prompt.is_none(), "the prompt closes after replacing");
     }
 }
