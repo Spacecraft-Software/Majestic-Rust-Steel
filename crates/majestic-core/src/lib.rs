@@ -43,6 +43,7 @@ mod info;
 mod references;
 mod selector;
 mod session;
+mod signature;
 mod symbols;
 mod syntax;
 #[cfg(feature = "syntect-highlighting")]
@@ -72,6 +73,8 @@ pub use references::{Reference, References};
 pub use selector::ProfileSelector;
 #[doc(inline)]
 pub use session::{LayoutNode, PaneState, Session};
+#[doc(inline)]
+pub use signature::SignatureHelp;
 #[doc(inline)]
 pub use symbols::{Symbol, Symbols};
 #[doc(inline)]

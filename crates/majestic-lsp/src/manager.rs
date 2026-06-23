@@ -22,11 +22,12 @@ use lsp_types::{
     DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
     DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
     Hover as LspHover, HoverContents, HoverParams, Location, MarkedString, MarkupContent,
-    MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams, ReferenceContext,
-    ReferenceParams, SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri,
+    MarkupKind, ParameterLabel, PartialResultParams, Position, PublishDiagnosticsParams,
+    ReferenceContext, ReferenceParams, SignatureHelp as LspSignatureHelp, SignatureHelpParams,
+    SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri,
     WorkDoneProgressParams,
 };
-use majestic_core::{CompletionItem, Diagnostic, Reference, Severity, Symbol};
+use majestic_core::{CompletionItem, Diagnostic, Reference, Severity, SignatureHelp, Symbol};
 
 use crate::client::{file_uri, LanguageServer};
 use crate::connection::Requester;
@@ -97,6 +98,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The hover content reduced to plain text, or `None` when there is nothing to show.
         text: Option<String>,
+    },
+    /// Signature help for the call the cursor is inside in the document at `path`. `signature` is
+    /// `None` when the cursor is not in a call (or the server returned nothing) — the popup closes.
+    SignatureHelp {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The active signature + highlighted parameter, or `None` to close the popup.
+        signature: Option<SignatureHelp>,
     },
     /// The definition site for the cursor in the document at `path`. `target` is the destination
     /// file and LSP position, or `None` when the server found no definition (nothing happens).
@@ -309,6 +318,31 @@ impl LspManager {
             let text = fetch_hover(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::Hover { path, text });
+        });
+    }
+
+    /// Requests signature help for the cursor `byte` in `path`, off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Like
+    /// [`Self::request_hover`], the request and its bounded wait run on a worker thread holding a
+    /// shared [`Requester`]; the result arrives via [`Self::poll_outcomes`] as
+    /// [`LspOutcome::SignatureHelp`] — `Some` to show/update the popup, `None` to close it.
+    pub fn request_signature_help(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let signature = fetch_signature_help(&requester, uri, position);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::SignatureHelp { path, signature });
         });
     }
 
@@ -915,6 +949,75 @@ fn fetch_hover(requester: &Requester, uri: Uri, position: Position) -> Option<St
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Issues `textDocument/signatureHelp` over a shared [`Requester`] (on a worker thread) and reduces
+/// the reply to the active signature's label plus the byte range of the active parameter within it.
+/// A timeout, transport error, server error, `null` (not in a call), an empty signature list, or a
+/// blank label all yield `None` (the popup closes / does not open).
+fn fetch_signature_help(
+    requester: &Requester,
+    uri: Uri,
+    position: Position,
+) -> Option<SignatureHelp> {
+    let params = SignatureHelpParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        context: None,
+    };
+    let value = serde_json::to_value(params).ok()?;
+    let response = requester
+        .request_timeout("textDocument/signatureHelp", value, Duration::from_secs(3))
+        .ok()?;
+    let result = response.into_result().ok()?;
+    // A `null` result (not in a call) deserializes to `None`.
+    let help: Option<LspSignatureHelp> = serde_json::from_value(result).unwrap_or(None);
+    let help = help?;
+    // The active signature (default the first); then its active parameter (per-signature index,
+    // falling back to the reply's top-level index).
+    let signature = help
+        .signatures
+        .get(usize::try_from(help.active_signature.unwrap_or(0)).unwrap_or(0))?;
+    let label = signature.label.clone();
+    if label.trim().is_empty() {
+        return None;
+    }
+    let active = signature
+        .active_parameter
+        .or(help.active_parameter)
+        .and_then(|index| {
+            signature
+                .parameters
+                .as_ref()?
+                .get(usize::try_from(index).unwrap_or(usize::MAX))
+        })
+        .and_then(|parameter| parameter_byte_range(&label, &parameter.label));
+    Some(SignatureHelp::new(label, active))
+}
+
+/// The byte range of a parameter within the signature `label`, from its LSP [`ParameterLabel`]: a
+/// [`ParameterLabel::Simple`] substring is located by search; [`ParameterLabel::LabelOffsets`] are
+/// character offsets into the label, converted to byte offsets (exact for BMP/ASCII labels). `None`
+/// when the parameter cannot be located (so nothing is highlighted).
+fn parameter_byte_range(label: &str, parameter: &ParameterLabel) -> Option<(usize, usize)> {
+    match parameter {
+        ParameterLabel::Simple(text) => label
+            .find(text.as_str())
+            .map(|start| (start, start + text.len())),
+        ParameterLabel::LabelOffsets([start, end]) => {
+            let char_to_byte = |char_index: u32| {
+                label
+                    .char_indices()
+                    .nth(usize::try_from(char_index).unwrap_or(usize::MAX))
+                    .map_or(label.len(), |(byte, _)| byte)
+            };
+            let (start, end) = (char_to_byte(*start), char_to_byte(*end));
+            (start < end).then_some((start, end))
+        }
+    }
+}
+
 /// Reduces LSP [`HoverContents`] (markup, a marked string, or an array of them) to plain text.
 fn hover_text(contents: HoverContents) -> String {
     match contents {
@@ -976,8 +1079,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply_text_edits, byte_to_position, markup_text, position_to_byte, read_capped,
-        symbol_kind_glyph, LspManager, LspOutcome, ServerConfig,
+        apply_text_edits, byte_to_position, markup_text, parameter_byte_range, position_to_byte,
+        read_capped, symbol_kind_glyph, LspManager, LspOutcome, ServerConfig,
     };
     use crate::client::LanguageServer;
     use crate::codec::{read_message, write_message};
@@ -1813,6 +1916,152 @@ mod tests {
         assert!(
             symbols.iter().any(|symbol| symbol.name == "main"),
             "should list main: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn signature_help_request_yields_active_parameter_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one textDocument/signatureHelp with a two-parameter signature,
+        // the second parameter active. Then it idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/signatureHelp" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "signatures": [{
+                            "label": "write(buf: &[u8], n: usize)",
+                            "parameters": [{"label": "buf: &[u8]"}, {"label": "n: usize"}],
+                            "activeParameter": 1
+                        }],
+                        "activeSignature": 0,
+                        "activeParameter": 1
+                    }
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-sh.rs");
+        manager.open(path, "write(a, b").unwrap();
+        manager.request_signature_help(path, "write(a, b".len());
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::SignatureHelp {
+            path: got,
+            signature,
+        } = &outcomes[0]
+        else {
+            panic!("expected a signature-help outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        // The active parameter "n: usize" occupies bytes 18..26 of the signature label.
+        assert_eq!(
+            signature,
+            &Some(majestic_core::SignatureHelp::new(
+                "write(buf: &[u8], n: usize)",
+                Some((18, 26))
+            ))
+        );
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn parameter_byte_range_resolves_simple_and_offset_labels() {
+        use lsp_types::ParameterLabel;
+        let label = "f(alpha, beta)";
+        // A `Simple` label is located by substring search ("beta" at bytes 9..13).
+        assert_eq!(
+            parameter_byte_range(label, &ParameterLabel::Simple("beta".to_owned())),
+            Some((9, 13))
+        );
+        // `LabelOffsets` are character offsets into the label → byte offsets ("alpha" at 2..7).
+        assert_eq!(
+            parameter_byte_range(label, &ParameterLabel::LabelOffsets([2, 7])),
+            Some((2, 7))
+        );
+        // A label that does not occur yields no highlight.
+        assert_eq!(
+            parameter_byte_range(label, &ParameterLabel::Simple("zzz".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_offers_signature_help() {
+        use std::fs;
+
+        // A throwaway cargo project with a 2-arg function and a call with the cursor after the comma.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-sh-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source =
+            "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\nfn main() {\n    let _ = add(1, 2);\n}\n";
+        fs::write(&main_rs, source).unwrap();
+        // The cursor just after the comma inside `add(1, 2)`.
+        let byte = source.find("add(1, ").unwrap() + "add(1, ".len();
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        let mut signature = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup (ignore diagnostics)
+            manager.request_signature_help(&main_rs, byte); // a no-op until ready
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::SignatureHelp {
+                    signature: Some(found),
+                    ..
+                } = outcome
+                {
+                    signature = Some(found);
+                }
+            }
+            if signature.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            signature.is_some(),
+            "rust-analyzer should offer signature help inside the call"
         );
     }
 }

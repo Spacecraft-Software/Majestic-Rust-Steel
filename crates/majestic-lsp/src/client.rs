@@ -26,8 +26,9 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingClientCapabilities,
     DocumentSymbolClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
     InitializeResult, InitializedParams, MarkupKind, PublishDiagnosticsParams,
-    ReferenceClientCapabilities, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
-    TextDocumentItem, Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    ReferenceClientCapabilities, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+    WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -190,8 +191,9 @@ impl Drop for LanguageServer {
     }
 }
 
-/// The capabilities advertised in the `initialize` handshake: completion, hover, goto-definition,
-/// find-references, document symbols, and document formatting, plus the implicit defaults.
+/// The capabilities advertised in the `initialize` handshake: completion, hover, signature help,
+/// goto-definition, find-references, document symbols, and document formatting, plus the implicit
+/// defaults.
 /// Completion is requested without snippet support (we insert plain text, not `$0`-style snippet
 /// placeholders); hover accepts both Markdown and plain-text content so a server may send whichever
 /// it prefers (the editor renders it as text either way); document symbols request the hierarchical
@@ -210,6 +212,7 @@ fn client_capabilities() -> ClientCapabilities {
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 ..Default::default()
             }),
+            signature_help: Some(SignatureHelpClientCapabilities::default()),
             definition: Some(GotoCapability {
                 dynamic_registration: Some(false),
                 link_support: Some(false),
