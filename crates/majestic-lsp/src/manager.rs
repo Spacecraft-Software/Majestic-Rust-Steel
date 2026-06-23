@@ -28,7 +28,7 @@ use lsp_types::{
     Range as LspRange, ReferenceContext, ReferenceParams, RenameParams,
     SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentEdit,
     TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
-    WorkspaceEdit,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use majestic_core::{
     CodeAction, CompletionItem, Diagnostic, Occurrence, Reference, RenameEdit, Severity,
@@ -142,6 +142,15 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The use sites, each with a destination file/position and a source-line preview.
         references: Vec<Reference>,
+    },
+    /// Project-wide symbols matching a query string (LSP `workspace/symbol`), ready to show in the
+    /// (shared) references popup. Each carries its destination file/position; the preview holds the
+    /// symbol's name + kind. Empty when the server matched none (the popup does not open).
+    WorkspaceSymbols {
+        /// The document the request was issued from (for the focused-pane filter).
+        path: PathBuf,
+        /// The matching symbols, reusing [`Reference`] for the destination + label.
+        symbols: Vec<Reference>,
     },
     /// Occurrences of the symbol under the cursor *within* the document at `path` (LSP
     /// `documentHighlight`), as byte ranges to tint. Empty when the cursor is not on a symbol.
@@ -492,6 +501,27 @@ impl LspManager {
             let references = fetch_references(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::References { path, references });
+        });
+    }
+
+    /// Requests project-wide symbols matching `query` (LSP `workspace/symbol`), off the editor
+    /// thread, routed through the server handling `path`'s language. A no-op unless that document is
+    /// open and its server is [`ServerSlot::Ready`]; the result arrives via [`Self::poll_outcomes`]
+    /// as [`LspOutcome::WorkspaceSymbols`].
+    pub fn request_workspace_symbols(&self, path: &Path, query: String) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let symbols = fetch_workspace_symbols(&requester, query);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::WorkspaceSymbols { path, symbols });
         });
     }
 
@@ -887,6 +917,48 @@ fn fetch_references(requester: &Requester, uri: Uri, position: Position) -> Vec<
             })
         })
         .collect()
+}
+
+/// Issues `workspace/symbol` over a shared [`Requester`] (on a worker thread) and converts the reply
+/// to editor-facing [`Reference`]s (reused for the shared picker): the destination file/position
+/// plus a `<kind> <name>` preview. Handles the legacy flat reply (an array of `SymbolInformation`,
+/// what rust-analyzer returns); the newer nested `WorkspaceSymbol` form is a follow-up. A timeout,
+/// transport error, server error, `null`, or empty result all yield an empty list (no picker).
+fn fetch_workspace_symbols(requester: &Requester, query: String) -> Vec<Reference> {
+    let params = WorkspaceSymbolParams {
+        query,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) = requester.request_timeout("workspace/symbol", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (no matches) deserializes to `None`.
+    let parsed: Option<WorkspaceSymbolResponse> = serde_json::from_value(result).unwrap_or(None);
+    let mut out = Vec::new();
+    if let Some(WorkspaceSymbolResponse::Flat(infos)) = parsed {
+        // Field-only access never names the deprecated `SymbolInformation` type (as in
+        // `fetch_document_symbols`).
+        for info in infos {
+            if let Some(path) = uri_to_path(&info.location.uri) {
+                let glyph = symbol_kind_glyph(info.kind);
+                out.push(Reference {
+                    path,
+                    line: info.location.range.start.line,
+                    character: info.location.range.start.character,
+                    preview: format!("{glyph} {}", info.name),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The trimmed text of `line` (zero-based) in `path`, for a reference's list preview. Reads `path`
@@ -2889,6 +2961,81 @@ mod tests {
             !actions.is_empty(),
             "rust-analyzer should offer at least one assist on a struct: {actions:?}"
         );
+    }
+
+    #[test]
+    fn workspace_symbol_request_yields_matches_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock answering one `workspace/symbol` with the flat `SymbolInformation` array shape.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "workspace/symbol" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {
+                            "name": "my_function",
+                            "kind": 12,
+                            "location": {
+                                "uri": "file:///tmp/does-not-exist-ws.rs",
+                                "range": {"start": {"line": 7, "character": 3}, "end": {"line": 7, "character": 14}}
+                            }
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-q.rs");
+        manager.open(path, "fn main() {}").unwrap();
+        manager.request_workspace_symbols(path, "my_func".to_owned());
+
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::WorkspaceSymbols { symbols, .. } = &outcomes[0] else {
+            panic!(
+                "expected a workspace-symbols outcome, got {:?}",
+                outcomes[0]
+            );
+        };
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(
+            symbols[0].path,
+            std::path::PathBuf::from("/tmp/does-not-exist-ws.rs")
+        );
+        assert_eq!(symbols[0].line, 7);
+        assert!(
+            symbols[0].preview.contains("my_function"),
+            "preview names the symbol: {:?}",
+            symbols[0].preview
+        );
+
+        mock.join().unwrap();
     }
 
     #[test]
