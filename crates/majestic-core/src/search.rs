@@ -88,21 +88,37 @@ impl Search {
         self.recompute(text, from);
     }
 
-    /// Recomputes all (non-overlapping, case-sensitive) matches of the query in `text`; the active
-    /// match becomes the first one starting at/after `from`, wrapping to the first when none are
-    /// later. An empty query clears the matches.
+    /// Recomputes all (non-overlapping) matches of the query in `text`; the active match becomes the
+    /// first one starting at/after `from`, wrapping to the first when none are later. An empty query
+    /// clears the matches.
+    ///
+    /// **Smart-case:** matching folds ASCII case when the query is all-lowercase (so `foo` finds
+    /// `Foo`/`FOO`), and is exact when the query contains any uppercase letter (so `Foo` finds only
+    /// `Foo`). Non-ASCII letters are matched exactly either way (full Unicode case-folding is a
+    /// follow-up). Only char-boundary-aligned matches are kept, so a window never splits a glyph.
     pub fn recompute(&mut self, text: &str, from: usize) {
         self.matches.clear();
         self.active = 0;
         if self.query.is_empty() {
             return;
         }
-        let mut start = 0;
-        while let Some(offset) = text[start..].find(&self.query) {
-            let at = start + offset;
-            let end = at + self.query.len();
-            self.matches.push(at..end);
-            start = end; // non-overlapping; `end` is a char boundary (the query is whole)
+        let fold = !self.query.chars().any(char::is_uppercase);
+        let query = self.query.as_bytes();
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i + query.len() <= bytes.len() {
+            let window = &bytes[i..i + query.len()];
+            let hit = if fold {
+                window.eq_ignore_ascii_case(query)
+            } else {
+                window == query
+            };
+            if hit && text.is_char_boundary(i) && text.is_char_boundary(i + query.len()) {
+                self.matches.push(i..i + query.len());
+                i += query.len(); // non-overlapping
+            } else {
+                i += 1;
+            }
         }
         // Land on the first match at/after the cursor, else wrap to the first.
         self.active = self
@@ -201,5 +217,28 @@ mod tests {
         }
         assert_eq!(search.match_count(), 2);
         assert_eq!(search.active_index(), 1);
+    }
+
+    #[test]
+    fn smart_case_folds_an_all_lowercase_query() {
+        let text = "Foo foo FOO";
+        let mut search = Search::new(0);
+        for c in "foo".chars() {
+            search.push(c, text, 0);
+        }
+        // All-lowercase query is case-insensitive — every casing matches.
+        assert_eq!(search.match_count(), 3);
+    }
+
+    #[test]
+    fn an_uppercase_in_the_query_makes_it_case_sensitive() {
+        let text = "Foo foo FOO";
+        let mut search = Search::new(0);
+        for c in "Foo".chars() {
+            search.push(c, text, 0);
+        }
+        // The uppercase `F` forces an exact match — only `Foo` qualifies.
+        assert_eq!(search.match_count(), 1);
+        assert_eq!(search.active_match(), Some(0..3));
     }
 }
