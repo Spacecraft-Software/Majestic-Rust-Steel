@@ -613,7 +613,10 @@ impl App {
             return Ok(());
         }
         if is_command_palette(key) {
-            self.finder = Some(Finder::commands(&oracle::command_names()));
+            // The editor commands (from Oracle) plus the host-level `reload-config` command.
+            let mut commands = oracle::command_names();
+            commands.push("reload-config");
+            self.finder = Some(Finder::commands(&commands));
             return Ok(());
         }
         if key == FILE_FINDER {
@@ -1264,6 +1267,19 @@ impl App {
         )
     }
 
+    /// Re-runs the hybrid configuration — the Nickel manifest, its pinned extensions, and
+    /// `config.scm` — in the running editor without a restart (PRD #1 §5.5: live-reloadable config),
+    /// reporting the outcome in the status bar. Invoked by the `reload-config` palette command.
+    fn reload_config(&mut self) {
+        let notices = crate::apply_config(&mut self.workspace);
+        let status = if notices.is_empty() {
+            "config reloaded".to_owned()
+        } else {
+            format!("config reloaded with issues: {}", notices.join("; "))
+        };
+        self.workspace.set_status(status);
+    }
+
     /// Routes a key to the open finder modal: type to filter, arrows to move, Enter/Esc to
     /// accept/cancel.
     fn finder_key(&mut self, key: KeyPress) {
@@ -1307,6 +1323,7 @@ impl App {
         self.finder = None;
         match action {
             Action::OpenFile(path) => self.open_path(&path),
+            Action::RunCommand(name) if name == "reload-config" => self.reload_config(),
             Action::RunCommand(name) => self.workspace.execute(&name),
         }
     }

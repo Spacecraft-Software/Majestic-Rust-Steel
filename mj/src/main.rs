@@ -205,7 +205,7 @@ fn run_editor(paths: &[String], safe_mode: bool) -> ExitCode {
     // First run = no manifest yet (and not in safe mode): prompt for a keybinding profile.
     let first_run = !safe_mode && Config::discover().is_none();
     if !safe_mode {
-        apply_config(&mut workspace);
+        load_config(&mut workspace);
     }
     // The editor path persists its layout on exit so the next plain `mj` resumes here.
     match tui::run(workspace, initial_info, first_run, true) {
@@ -372,7 +372,7 @@ fn run_info(topic: Option<&str>, safe_mode: bool) -> ExitCode {
     };
     let mut workspace = Workspace::from_editors(vec![Editor::new()]);
     if !safe_mode {
-        apply_config(&mut workspace);
+        load_config(&mut workspace);
     }
     // `mj info` is a transient manual view: no first-run prompt, and it must not overwrite the
     // saved editing session.
@@ -422,13 +422,15 @@ fn info_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// Loads the hybrid configuration and applies it to `workspace`.
+/// Loads the hybrid configuration and applies it to `workspace`, returning any problems as
+/// human-readable notices (empty when everything loaded cleanly).
 ///
 /// The declarative Nickel manifest sets the base; the imperative Steel `config.scm` then layers
 /// overrides on top (last writer wins). Fail-soft: missing files are normal (defaults stand); a
-/// malformed manifest or script keeps the working settings and surfaces a one-line status notice
-/// (run with `--safe` to skip configuration entirely).
-fn apply_config(workspace: &mut Workspace) {
+/// malformed manifest or script keeps the working settings and yields a one-line notice rather than
+/// failing. Callers decide how to surface the notices ([`load_config`] at startup, the live
+/// `reload-config` command at runtime), so this function sets no status itself.
+fn apply_config(workspace: &mut Workspace) -> Vec<String> {
     let mut tab_width: Option<usize> = None;
     let mut keymap_name: Option<String> = None;
     let mut notices: Vec<String> = Vec::new();
@@ -496,6 +498,13 @@ fn apply_config(workspace: &mut Workspace) {
             None => notices.push(format!("unknown keymap profile `{name}`")),
         }
     }
+    notices
+}
+
+/// Loads the configuration at startup and surfaces any problems as a status notice (startup
+/// phrasing: defaults stand, `--safe` skips). A thin wrapper over [`apply_config`].
+fn load_config(workspace: &mut Workspace) {
+    let notices = apply_config(workspace);
     if !notices.is_empty() {
         workspace.set_status(format!(
             "{} — using defaults; --safe to skip",
