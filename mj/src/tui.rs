@@ -2232,9 +2232,9 @@ mod tests {
             tabs.contains("scratch"),
             "tab bar lists the buffer: {tabs:?}"
         );
-        // Editor content is drawn just below the tab bar.
-        assert_eq!(surface.cell(0, 1).unwrap().symbol, 'h');
-        assert_eq!(surface.cell(1, 1).unwrap().symbol, 'i');
+        // Editor content is drawn just below the tab bar, past the 3-column line-number gutter.
+        assert_eq!(surface.cell(3, 1).unwrap().symbol, 'h');
+        assert_eq!(surface.cell(4, 1).unwrap().symbol, 'i');
         // The bottom row is the status bar: accent background, end-anchored F12 hint present.
         let status_row = surface.height() - 1;
         assert_eq!(surface.cell(0, status_row).unwrap().style.bg, theme.accent);

@@ -500,10 +500,22 @@ impl Editor {
         }
         self.page_rows = usize::from(area.height).max(1);
         self.refresh_highlights();
-        self.ensure_cursor_visible(area);
+        // The text occupies the area to the right of the line-number gutter; cursor visibility and
+        // horizontal scroll are computed against that narrower text region.
+        let gutter = self.gutter_width();
+        let text_area = Rect::new(
+            area.x + gutter,
+            area.y,
+            area.width.saturating_sub(gutter),
+            area.height,
+        );
+        self.ensure_cursor_visible(text_area);
         surface.fill(area, theme.base_style());
 
         let base = theme.base_style();
+        let gutter_style = Style::new(theme.accent, theme.background); // Steel Blue (structural)
+        let current_style = Style::new(theme.foreground, theme.background); // brighter on the cursor row
+        let cursor_row = self.buffer.cursor_point().row;
         let rope = self.buffer.rope();
         let first_line = self.viewport_top;
         let start_byte = rope.point_to_byte(Point::new(first_line, 0));
@@ -520,19 +532,35 @@ impl Editor {
             if line_index >= rope.len_lines() {
                 break;
             }
+            // Line number, right-aligned in the gutter (1-based), brighter on the cursor's line.
+            let number = (line_index + 1).to_string();
+            let number_width = usize::from(gutter).saturating_sub(1); // reserve a trailing space
+            let style = if line_index == cursor_row {
+                current_style
+            } else {
+                gutter_style
+            };
+            for (offset, ch) in number.chars().enumerate() {
+                if let Some(col) = number_width
+                    .checked_sub(number.len())
+                    .and_then(|pad| u16::try_from(pad + offset).ok())
+                {
+                    surface.set_char(area.x + col, area.y + row, ch, style);
+                }
+            }
             let mut byte = rope.point_to_byte(Point::new(line_index, 0));
             let mut display = 0usize; // absolute display column within the line
             for ch in rope.line(line_index).chars() {
                 if display >= self.viewport_left {
                     let screen = display - self.viewport_left;
-                    if screen >= usize::from(area.width) {
+                    if screen >= usize::from(text_area.width) {
                         break; // the rest of the line is off the right edge
                     }
                     if let Ok(col) = u16::try_from(screen) {
                         let style = styles.get(byte - start_byte).copied().unwrap_or(base);
                         let style = self.apply_diagnostic(byte, style, theme);
                         let style = self.apply_occurrence(byte, style, theme);
-                        surface.set_char(area.x + col, area.y + row, ch, style);
+                        surface.set_char(text_area.x + col, area.y + row, ch, style);
                     }
                 }
                 // Glyphs left of the viewport (or a wide glyph straddling its left edge) are
@@ -545,6 +573,14 @@ impl Editor {
         if focused {
             self.draw_cursor(surface, theme, area);
         }
+    }
+
+    /// The width (columns) reserved for the line-number gutter: the digit count of the last line
+    /// number (at least 2) plus one space separating it from the text.
+    fn gutter_width(&self) -> u16 {
+        let lines = self.buffer.rope().len_lines().max(1);
+        let digits = lines.to_string().len().max(2);
+        u16::try_from(digits + 1).unwrap_or(7)
     }
 
     /// If `byte` is covered by a diagnostic, returns `style` underlined in the diagnostic's
@@ -684,6 +720,14 @@ impl Editor {
     /// view. Used both to draw the cursor and to anchor popups (completion, hover) at the cursor.
     #[must_use]
     pub fn cursor_screen_position(&self, area: Rect) -> Option<(u16, u16)> {
+        // Mirror `render_in`: the cursor sits in the text region right of the line-number gutter.
+        let gutter = self.gutter_width();
+        let text_area = Rect::new(
+            area.x + gutter,
+            area.y,
+            area.width.saturating_sub(gutter),
+            area.height,
+        );
         let row = self.buffer.cursor_point().row;
         if row < self.viewport_top {
             return None;
@@ -698,10 +742,10 @@ impl Editor {
             u16::try_from(screen_col).ok()?,
             u16::try_from(screen_row).ok()?,
         );
-        if cy >= area.height || cx >= area.width {
+        if cy >= text_area.height || cx >= text_area.width {
             return None;
         }
-        Some((area.x + cx, area.y + cy))
+        Some((text_area.x + cx, text_area.y + cy))
     }
 
     fn draw_cursor(&self, surface: &mut Surface, theme: &Theme, area: Rect) {
@@ -841,10 +885,14 @@ mod tests {
         let mut surface = Surface::new(20, 3, theme.base_style());
         editor.render(&mut surface, &theme);
 
-        assert_eq!(surface.cell(0, 0).unwrap().symbol, 'h');
-        assert_eq!(surface.cell(0, 1).unwrap().symbol, 'w');
-        // Cursor starts at (0,0) and is drawn in reverse video.
-        assert!(surface.cell(0, 0).unwrap().style.attrs.reverse);
+        // Text starts at column 3 — past the line-number gutter (2 digits + a space).
+        assert_eq!(surface.cell(3, 0).unwrap().symbol, 'h');
+        assert_eq!(surface.cell(3, 1).unwrap().symbol, 'w');
+        // The line numbers sit in the gutter (right-aligned: "1", "2" at column 1).
+        assert_eq!(surface.cell(1, 0).unwrap().symbol, '1');
+        assert_eq!(surface.cell(1, 1).unwrap().symbol, '2');
+        // Cursor starts on the first text cell (3,0) and is drawn in reverse video.
+        assert!(surface.cell(3, 0).unwrap().style.attrs.reverse);
         // Status line (row 2) is non-blank and reports line 1.
         assert_ne!(surface.cell(1, 2).unwrap().symbol, ' ');
     }
@@ -867,8 +915,8 @@ mod tests {
         editor.flush_highlights(); // highlighting is asynchronous; wait for the first result
         editor.render(&mut surface, &theme);
 
-        // `n` of the `fn` keyword (col 1, no cursor) is drawn in the accent color.
-        let cell = surface.cell(1, 0).unwrap();
+        // `n` of the `fn` keyword (text col 1 → screen col 4 past the gutter) is in the accent color.
+        let cell = surface.cell(4, 0).unwrap();
         assert_eq!(cell.symbol, 'n');
         assert_eq!(cell.style.fg, theme.accent);
 
@@ -884,23 +932,24 @@ mod tests {
         let mut surface = Surface::new(20, 2, theme.base_style());
         editor.render(&mut surface, &theme);
 
-        assert_eq!(surface.cell(0, 0).unwrap().symbol, 'a');
-        assert_eq!(surface.cell(1, 0).unwrap().symbol, '世');
-        // Column 2 is the wide glyph's continuation; `b` lands at column 3, not 2.
-        assert_eq!(surface.cell(3, 0).unwrap().symbol, 'b');
+        // Text starts at column 3 (past the gutter): `a`, then the wide `世` (cols 4-5), then `b`.
+        assert_eq!(surface.cell(3, 0).unwrap().symbol, 'a');
+        assert_eq!(surface.cell(4, 0).unwrap().symbol, '世');
+        // Column 5 is the wide glyph's continuation; `b` lands at column 6, not 5.
+        assert_eq!(surface.cell(6, 0).unwrap().symbol, 'b');
     }
 
     #[test]
     fn long_line_scrolls_horizontally_to_follow_the_cursor() {
         let theme = Theme::steelbore();
-        // 16 single-width glyphs in an 8-column viewport.
+        // 16 single-width glyphs; the 8-column viewport minus the 3-column gutter leaves 5 text cells.
         let mut editor = Editor::with_buffer(Buffer::from_text("0123456789ABCDEF"));
         editor.handle_key(KeyPress::key(KeyCode::End)); // cursor to display column 16
         let mut surface = Surface::new(8, 2, theme.base_style());
         editor.render(&mut surface, &theme);
 
-        // viewport_left = 16 + 1 - 8 = 9, so columns 9..16 ("9ABCDEF") are shown.
-        assert_eq!(surface.cell(0, 0).unwrap().symbol, '9');
+        // text width 5 → viewport_left = 16 + 1 - 5 = 12, so "CDEF" shows from text column 3.
+        assert_eq!(surface.cell(3, 0).unwrap().symbol, 'C');
         assert_eq!(surface.cell(6, 0).unwrap().symbol, 'F');
         // The cursor (display column 16) lands at the last screen column.
         assert!(
@@ -917,12 +966,12 @@ mod tests {
         let mut surface = Surface::new(20, 2, theme.base_style());
         editor.render(&mut surface, &theme);
 
-        // `世` is two columns wide, so the cursor sits at display column 2, on `x`.
-        let cell = surface.cell(2, 0).unwrap();
+        // `世` is two columns wide, so on top of the 3-column gutter the cursor sits at column 5, on `x`.
+        let cell = surface.cell(5, 0).unwrap();
         assert_eq!(cell.symbol, 'x');
         assert!(
             cell.style.attrs.reverse,
-            "cursor should highlight `x` at column 2"
+            "cursor should highlight `x` at column 5 (gutter 3 + display 2)"
         );
     }
 
@@ -1058,6 +1107,18 @@ mod tests {
     }
 
     #[test]
+    fn line_number_gutter_widens_with_the_line_count() {
+        let theme = Theme::steelbore();
+        // 101 lines → 3-digit numbers → a 4-column gutter (3 digits + a space).
+        let mut editor = Editor::with_buffer(Buffer::from_text(&"x\n".repeat(100)));
+        let mut surface = Surface::new(20, 5, theme.base_style());
+        editor.render(&mut surface, &theme);
+        // Line 1 right-aligned in the 3-digit field ("  1"); text begins at column 4.
+        assert_eq!(surface.cell(2, 0).unwrap().symbol, '1');
+        assert_eq!(surface.cell(4, 0).unwrap().symbol, 'x');
+    }
+
+    #[test]
     fn diagnostics_underline_their_span_in_the_severity_color() {
         use crate::diagnostic::{Diagnostic, Severity};
         let theme = Theme::steelbore();
@@ -1071,11 +1132,12 @@ mod tests {
         let mut surface = Surface::new(40, 2, theme.base_style());
         editor.render(&mut surface, &theme);
 
-        let inside = surface.cell(8, 0).unwrap(); // 'o' of `oops`
+        let inside = surface.cell(11, 0).unwrap(); // 'o' of `oops` (gutter 3 + display 8)
+        assert_eq!(inside.symbol, 'o');
         assert!(inside.style.attrs.underline, "the span is underlined");
         assert_eq!(inside.style.fg, theme.error, "in the error color");
-        // Text outside the diagnostic is untouched.
-        assert!(!surface.cell(0, 0).unwrap().style.attrs.underline);
+        // Text outside the diagnostic is untouched (`l` of `let` at the first text column).
+        assert!(!surface.cell(3, 0).unwrap().style.attrs.underline);
     }
 
     #[test]
