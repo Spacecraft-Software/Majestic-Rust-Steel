@@ -29,7 +29,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
     Action, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader, ProfileSelector,
-    References, Session, SignatureHelp, Symbols, Workspace,
+    Prompt, References, RenameEdit, Session, SignatureHelp, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome};
 use majestic_term::PtyTerminal;
@@ -111,6 +111,11 @@ const GOTO_DEF_KEY: KeyPress = KeyPress::key(KeyCode::Function(12));
 /// terminal toggle so `Shift+F12` opens the references popup rather than toggling the panel.
 const REFERENCES_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(12));
 
+/// The `Shift+F6` key starts an LSP rename of the symbol at the cursor (a common IDE binding;
+/// plain `F2` is already taken by hover here). Matched via [`is_rename_key`], tolerant of how
+/// terminals report the chord.
+const RENAME_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(6));
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -137,6 +142,11 @@ struct App {
     /// The LSP signature-help popup; `Some` while the active call's signature is shown over the
     /// editor. Passive: it does not capture keys (you keep typing arguments under it).
     signature: Option<SignatureHelp>,
+    /// The modal rename input; `Some` while the user is typing the new name (captures every key).
+    prompt: Option<Prompt>,
+    /// The document + cursor byte a pending rename was triggered at, recorded when the prompt opens
+    /// and used to issue the request once the new name is confirmed.
+    rename_target: Option<(PathBuf, usize)>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -166,6 +176,8 @@ impl App {
             references: None,
             symbols: None,
             signature: None,
+            prompt: None,
+            rename_target: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -214,7 +226,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -290,6 +302,9 @@ impl App {
                         self.symbols = None;
                     }
                     self.signature = signature;
+                }
+                LspOutcome::Rename { edits, .. } => {
+                    self.apply_rename(edits);
                 }
                 LspOutcome::Formatting { path, formatted } => {
                     self.apply_formatting(&path, formatted);
@@ -395,6 +410,9 @@ impl App {
         if let Some(selector) = self.selector.as_ref() {
             selector.render(surface, area, theme);
         }
+        if let Some(prompt) = self.prompt.as_ref() {
+            prompt.render(surface, area, theme);
+        }
 
         // The completion, hover, references, symbols, and signature popups are anchored at the cursor
         // within the editor region, above all else (they are mutually exclusive, so at most one shows).
@@ -473,6 +491,31 @@ impl App {
         }
     }
 
+    /// Dispatches the LSP feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
+    /// (`F12`), find-references (`Shift+F12`), document symbols (`Ctrl+Shift+O`), rename (`Shift+F6`),
+    /// and format (`Shift+Alt+F`). Returns `true` when `key` triggered one (the caller then returns).
+    /// Each trigger is itself a no-op unless the editor is focused and a server handles the buffer.
+    fn try_lsp_trigger(&mut self, key: KeyPress) -> bool {
+        if key == COMPLETION_KEY {
+            self.trigger_completion();
+        } else if key == HOVER_KEY {
+            self.trigger_hover();
+        } else if key == GOTO_DEF_KEY {
+            self.trigger_goto_definition();
+        } else if is_references_key(key) {
+            self.trigger_references();
+        } else if is_document_symbols_key(key) {
+            self.trigger_document_symbols();
+        } else if is_rename_key(key) {
+            self.trigger_rename();
+        } else if is_format_key(key) {
+            self.trigger_formatting();
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
         // The first-run selector is modal and outranks everything: it captures every key until
         // the user has chosen a keybinding profile.
@@ -491,6 +534,11 @@ impl App {
         }
         if self.info.is_some() {
             self.info_key(key);
+            return Ok(());
+        }
+        // The rename prompt is modal: while open it captures every key (the user is typing a name).
+        if self.prompt.is_some() {
+            self.prompt_key(key);
             return Ok(());
         }
         // The completion and hover popups are light modals: each captures its navigation/accept
@@ -526,28 +574,7 @@ impl App {
             self.finder = Some(Finder::files(&root));
             return Ok(());
         }
-        if key == COMPLETION_KEY {
-            self.trigger_completion();
-            return Ok(());
-        }
-        if key == HOVER_KEY {
-            self.trigger_hover();
-            return Ok(());
-        }
-        if key == GOTO_DEF_KEY {
-            self.trigger_goto_definition();
-            return Ok(());
-        }
-        if is_references_key(key) {
-            self.trigger_references();
-            return Ok(());
-        }
-        if is_document_symbols_key(key) {
-            self.trigger_document_symbols();
-            return Ok(());
-        }
-        if is_format_key(key) {
-            self.trigger_formatting();
+        if self.try_lsp_trigger(key) {
             return Ok(());
         }
         if key.code == TERMINAL_TOGGLE {
@@ -859,6 +886,110 @@ impl App {
             return;
         }
         self.lsp.request_document_symbols(&path);
+    }
+
+    /// Starts an LSP rename: opens the modal prompt pre-filled with the identifier under the cursor
+    /// and records where to rename. The request is issued later, on confirm. A no-op unless the
+    /// editor is focused and a server handles the buffer.
+    fn trigger_rename(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        let text = editor.buffer().text();
+        let name = text
+            .get(identifier_start(&text, cursor)..identifier_end(&text, cursor))
+            .unwrap_or_default();
+        self.prompt = Some(Prompt::new("Rename symbol to", name));
+        self.rename_target = Some((path, cursor));
+    }
+
+    /// Routes a key to the open rename prompt: a character extends the name, `Backspace` erases,
+    /// `Enter` confirms (issuing the request), and `Esc` cancels.
+    fn prompt_key(&mut self, key: KeyPress) {
+        match key.code {
+            KeyCode::Char(c) if !key.mods.contains(Mods::CTRL) && !key.mods.contains(Mods::ALT) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.backspace();
+                }
+            }
+            KeyCode::Enter => self.confirm_rename(),
+            KeyCode::Escape => {
+                self.prompt = None;
+                self.rename_target = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Confirms the rename: issues `textDocument/rename` for the recorded target with the typed name
+    /// (off-thread; the edits are applied later, in `sync_lsp`), then closes the prompt. A blank name
+    /// just cancels.
+    fn confirm_rename(&mut self) {
+        let prompt = self.prompt.take();
+        let target = self.rename_target.take();
+        let (Some(prompt), Some((path, byte))) = (prompt, target) else {
+            return;
+        };
+        let new_name = prompt.input().trim().to_owned();
+        if !new_name.is_empty() {
+            self.lsp.request_rename(&path, byte, new_name);
+        }
+    }
+
+    /// Applies a completed rename: groups the edits by file, and for each file reveals it (reusing an
+    /// open editor when possible, so an unsaved buffer is edited in place) and applies its edits
+    /// back-to-front (so earlier byte offsets stay valid). Focus returns to where the rename started.
+    fn apply_rename(&mut self, edits: Vec<RenameEdit>) {
+        if edits.is_empty() {
+            return;
+        }
+        let origin = self.workspace.active().buffer().path();
+        let mut by_path: HashMap<PathBuf, Vec<RenameEdit>> = HashMap::new();
+        for edit in edits {
+            by_path.entry(edit.path.clone()).or_default().push(edit);
+        }
+        for (path, file_edits) in by_path {
+            if self.workspace.reveal_path(&path).is_err() {
+                continue;
+            }
+            let text = self.workspace.active().buffer().text();
+            // Resolve every edit to a byte range against this file's text, then splice back-to-front.
+            let mut spans: Vec<(usize, usize, String)> = file_edits
+                .into_iter()
+                .map(|edit| {
+                    let start = majestic_lsp::position_to_byte(
+                        &text,
+                        edit.start_line,
+                        edit.start_character,
+                    );
+                    let end =
+                        majestic_lsp::position_to_byte(&text, edit.end_line, edit.end_character)
+                            .max(start);
+                    (start, end, edit.new_text)
+                })
+                .collect();
+            spans.sort_by_key(|span| std::cmp::Reverse(span.0));
+            for (start, end, new_text) in spans {
+                self.workspace.replace_active(start..end, &new_text);
+            }
+        }
+        // Return to the buffer the rename was triggered from.
+        if let Some(path) = origin {
+            let _ = self.workspace.reveal_path(&path);
+        }
     }
 
     /// Requests a whole-document LSP reformat, off-thread; the result is applied later, in
@@ -1335,6 +1466,19 @@ fn identifier_start(text: &str, cursor: usize) -> usize {
         .map_or(end, |(index, _)| index)
 }
 
+/// The byte offset where the identifier containing `cursor` ends: `cursor` plus the leading run of
+/// identifier characters (alphanumeric or `_`) at and after it. Paired with [`identifier_start`] it
+/// bounds the whole identifier under the cursor (used to pre-fill the rename prompt with its name).
+fn identifier_end(text: &str, cursor: usize) -> usize {
+    let start = cursor.min(text.len());
+    let run: usize = text[start..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .map(char::len_utf8)
+        .sum();
+    start + run
+}
+
 /// Whether `key` is `Ctrl+Shift+P` (the command palette), tolerant of the terminal reporting
 /// the letter as either case.
 fn is_command_palette(key: KeyPress) -> bool {
@@ -1367,6 +1511,15 @@ fn is_references_key(key: KeyPress) -> bool {
         && !key.mods.contains(Mods::CTRL)
         && !key.mods.contains(Mods::ALT)
         && key.code == REFERENCES_KEY.code
+}
+
+/// Whether `key` is `Shift+F6` (start an LSP rename). Requires `Shift`, forbids `Ctrl`/`Alt`,
+/// tolerant of extra flags the terminal may add — matched via [`RENAME_KEY`]'s code.
+fn is_rename_key(key: KeyPress) -> bool {
+    key.mods.contains(Mods::SHIFT)
+        && !key.mods.contains(Mods::CTRL)
+        && !key.mods.contains(Mods::ALT)
+        && key.code == RENAME_KEY.code
 }
 
 /// Whether `key` is `Ctrl+Shift+O` (go to symbol in file — opens the document-symbols picker).

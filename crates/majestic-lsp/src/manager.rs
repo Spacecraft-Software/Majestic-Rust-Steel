@@ -19,15 +19,18 @@ use std::time::Duration;
 
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
-    DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover as LspHover, HoverContents, HoverParams, Location, MarkedString, MarkupContent,
-    MarkupKind, ParameterLabel, PartialResultParams, Position, PublishDiagnosticsParams,
-    ReferenceContext, ReferenceParams, SignatureHelp as LspSignatureHelp, SignatureHelpParams,
-    SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri,
-    WorkDoneProgressParams,
+    DiagnosticSeverity, DocumentChangeOperation, DocumentChanges, DocumentFormattingParams,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams,
+    Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel, PartialResultParams,
+    Position, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RenameParams,
+    SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentEdit,
+    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
+    WorkspaceEdit,
 };
-use majestic_core::{CompletionItem, Diagnostic, Reference, Severity, SignatureHelp, Symbol};
+use majestic_core::{
+    CompletionItem, Diagnostic, Reference, RenameEdit, Severity, SignatureHelp, Symbol,
+};
 
 use crate::client::{file_uri, LanguageServer};
 use crate::connection::Requester;
@@ -131,6 +134,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The definitions, each with a same-file position, a kind badge, and a nesting depth.
         symbols: Vec<Symbol>,
+    },
+    /// The edits to apply for a rename triggered in the document at `path` — a flat list spanning
+    /// every affected file. Empty when the server rejected the rename (e.g. not a renameable symbol).
+    Rename {
+        /// The document the rename was triggered from (used to keep focus there afterward).
+        path: PathBuf,
+        /// The replacements across all files, applied by the host back-to-front per file.
+        edits: Vec<RenameEdit>,
     },
     /// A whole-document reformat for the document at `path`, computed off-thread by applying the
     /// server's edits to the text that was sent. `formatted` is the new document text, or `None`
@@ -419,6 +430,32 @@ impl LspManager {
             let symbols = fetch_document_symbols(&requester, uri);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::DocumentSymbols { path, symbols });
+        });
+    }
+
+    /// Requests a rename of the symbol at the cursor `byte` in `path` to `new_name`, off the editor
+    /// thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Like the other
+    /// interactive requests, the request and its bounded wait run on a worker thread holding a shared
+    /// [`Requester`]; the result arrives via [`Self::poll_outcomes`] as [`LspOutcome::Rename`] — a flat
+    /// list of edits spanning every affected file, which the host applies.
+    pub fn request_rename(&self, path: &Path, byte: usize, new_name: String) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let edits = fetch_rename(&requester, uri, position, new_name);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::Rename { path, edits });
         });
     }
 
@@ -824,6 +861,97 @@ fn symbol_kind_glyph(kind: SymbolKind) -> char {
         SymbolKind::FIELD | SymbolKind::PROPERTY => '.',
         SymbolKind::TYPE_PARAMETER => 'T',
         _ => '·',
+    }
+}
+
+/// Issues `textDocument/rename` over a shared [`Requester`] (on a worker thread) and reduces the
+/// returned `WorkspaceEdit` to a flat list of editor-facing [`RenameEdit`]s (positions, not yet
+/// applied — the host applies them against each file's live text, so an open buffer's unsaved edits
+/// stay correct). Handles both `WorkspaceEdit` shapes: the simple `changes` map and the richer
+/// `document_changes` (preferred when present). A timeout, transport error, server error, `null`, or
+/// empty result all yield an empty list (nothing changes). Uses a slightly longer (5 s) timeout than
+/// the read-only requests, since a project-wide rename can take the server longer to compute.
+fn fetch_rename(
+    requester: &Requester,
+    uri: Uri,
+    position: Position,
+    new_name: String,
+) -> Vec<RenameEdit> {
+    let params = RenameParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        new_name,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/rename", value, Duration::from_secs(5))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (rename refused) deserializes to `None`.
+    let edit: Option<WorkspaceEdit> = serde_json::from_value(result).unwrap_or(None);
+    let Some(edit) = edit else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(changes) = edit.document_changes {
+        // The richer form: a list of per-document edit batches (with optional file operations,
+        // which a rename does not need, so they are skipped).
+        let doc_edits: Vec<TextDocumentEdit> = match changes {
+            DocumentChanges::Edits(edits) => edits,
+            DocumentChanges::Operations(ops) => ops
+                .into_iter()
+                .filter_map(|op| match op {
+                    DocumentChangeOperation::Edit(edit) => Some(edit),
+                    DocumentChangeOperation::Op(_) => None,
+                })
+                .collect(),
+        };
+        for doc_edit in doc_edits {
+            let Some(path) = uri_to_path(&doc_edit.text_document.uri) else {
+                continue;
+            };
+            for edit in doc_edit.edits {
+                // Each edit is either a plain `TextEdit` or an annotated one; take the edit itself.
+                let text_edit = match edit {
+                    OneOf::Left(edit) => edit,
+                    OneOf::Right(annotated) => annotated.text_edit,
+                };
+                out.push(rename_edit(path.clone(), &text_edit));
+            }
+        }
+    } else if let Some(changes) = edit.changes {
+        // The simple form: a map of file URI → edits (what a server returns when the client does not
+        // advertise `documentChanges`, as here).
+        for (uri, text_edits) in changes {
+            let Some(path) = uri_to_path(&uri) else {
+                continue;
+            };
+            for text_edit in text_edits {
+                out.push(rename_edit(path.clone(), &text_edit));
+            }
+        }
+    }
+    out
+}
+
+/// Builds an editor-facing [`RenameEdit`] for `path` from an LSP [`TextEdit`].
+fn rename_edit(path: PathBuf, edit: &TextEdit) -> RenameEdit {
+    RenameEdit {
+        path,
+        start_line: edit.range.start.line,
+        start_character: edit.range.start.character,
+        end_line: edit.range.end.line,
+        end_character: edit.range.end.character,
+        new_text: edit.new_text.clone(),
     }
 }
 
@@ -2063,5 +2191,133 @@ mod tests {
             signature.is_some(),
             "rust-analyzer should offer signature help inside the call"
         );
+    }
+
+    #[test]
+    fn rename_request_yields_edits_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one textDocument/rename with a `changes` map: two edits in one
+        // file (the declaration + a use), both renamed to "bar". Then it idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/rename" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "changes": {
+                            "file:///tmp/does-not-exist-rn.rs": [
+                                {"range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}}, "newText": "bar"},
+                                {"range": {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 11}}, "newText": "bar"}
+                            ]
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-rn.rs");
+        manager.open(path, "fn foo() {}").unwrap();
+        manager.request_rename(path, "fn f".len(), "bar".to_owned());
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::Rename { path: got, edits } = &outcomes[0] else {
+            panic!("expected a rename outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits[0].path,
+            std::path::PathBuf::from("/tmp/does-not-exist-rn.rs")
+        );
+        assert_eq!(
+            (
+                edits[0].start_line,
+                edits[0].start_character,
+                edits[0].end_line,
+                edits[0].end_character
+            ),
+            (0, 3, 0, 6)
+        );
+        assert_eq!(edits[0].new_text, "bar");
+        assert_eq!((edits[1].start_line, edits[1].start_character), (2, 8));
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_renames_a_symbol() {
+        use std::fs;
+
+        // A throwaway cargo project where `target` is declared once and called twice.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-rn-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source =
+            "fn target() -> i32 {\n    42\n}\nfn main() {\n    let _ = target();\n    let _ = target();\n}\n";
+        fs::write(&main_rs, source).unwrap();
+        let decl_byte = source.find("target").unwrap() + 1;
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        let mut edits = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup (ignore diagnostics)
+            manager.request_rename(&main_rs, decl_byte, "renamed".to_owned()); // no-op until ready
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::Rename { edits: found, .. } = outcome {
+                    if !found.is_empty() {
+                        edits = found;
+                    }
+                }
+            }
+            if !edits.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        // The declaration plus the two calls → at least three edits, all in this file, all "renamed".
+        assert!(
+            edits.len() >= 3,
+            "rust-analyzer should rename the declaration and its uses: {edits:?}"
+        );
+        assert!(edits.iter().all(|edit| edit.path == main_rs));
+        assert!(edits.iter().all(|edit| edit.new_text == "renamed"));
     }
 }
