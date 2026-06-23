@@ -158,6 +158,37 @@ impl Editor {
         &self.diagnostics
     }
 
+    /// The start byte of the next diagnostic after `byte` (the first one starting strictly after it),
+    /// wrapping to the earliest diagnostic when none start later — so repeated calls cycle through
+    /// every diagnostic. `None` when the buffer has none. Used to jump the cursor between problems.
+    #[must_use]
+    pub fn next_diagnostic(&self, byte: usize) -> Option<usize> {
+        let mut starts: Vec<usize> = self.diagnostics.iter().map(|d| d.range.start).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+            .iter()
+            .copied()
+            .find(|&start| start > byte)
+            .or_else(|| starts.first().copied())
+    }
+
+    /// The start byte of the previous diagnostic before `byte` (the last one starting strictly before
+    /// it), wrapping to the latest diagnostic when none start earlier. `None` when the buffer has
+    /// none. The reverse of [`Self::next_diagnostic`].
+    #[must_use]
+    pub fn prev_diagnostic(&self, byte: usize) -> Option<usize> {
+        let mut starts: Vec<usize> = self.diagnostics.iter().map(|d| d.range.start).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+            .iter()
+            .rev()
+            .copied()
+            .find(|&start| start < byte)
+            .or_else(|| starts.last().copied())
+    }
+
     /// Replaces the symbol occurrences tinted in this buffer (LSP `documentHighlight`). The host
     /// refreshes these as the cursor moves to a new identifier; an empty vec clears the tint.
     pub fn set_occurrences(&mut self, occurrences: Vec<Occurrence>) {
@@ -1054,5 +1085,30 @@ mod tests {
 
         editor.handle_key(KeyPress::key(KeyCode::Home)); // move out of the span
         assert!(editor.cursor_diagnostic().is_none());
+    }
+
+    #[test]
+    fn next_and_prev_diagnostic_cycle_through_problems() {
+        use crate::diagnostic::{Diagnostic, Severity};
+        let mut editor = Editor::with_buffer(Buffer::from_text("aaa bbb ccc"));
+        // Reported out of order on purpose — navigation sorts by start byte.
+        editor.set_diagnostics(vec![
+            Diagnostic::new(8..11, Severity::Error, "c"),
+            Diagnostic::new(0..3, Severity::Warning, "a"),
+            Diagnostic::new(4..7, Severity::Error, "b"),
+        ]);
+        // `next` finds the first diagnostic starting strictly after the cursor; 8 wraps to 0.
+        assert_eq!(editor.next_diagnostic(0), Some(4));
+        assert_eq!(editor.next_diagnostic(4), Some(8));
+        assert_eq!(editor.next_diagnostic(8), Some(0));
+        // `prev` mirrors it; 0 wraps to the last (8).
+        assert_eq!(editor.prev_diagnostic(8), Some(4));
+        assert_eq!(editor.prev_diagnostic(4), Some(0));
+        assert_eq!(editor.prev_diagnostic(0), Some(8));
+
+        // No diagnostics → nothing to navigate.
+        editor.set_diagnostics(vec![]);
+        assert_eq!(editor.next_diagnostic(0), None);
+        assert_eq!(editor.prev_diagnostic(0), None);
     }
 }

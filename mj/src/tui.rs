@@ -116,6 +116,10 @@ const REFERENCES_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(12
 /// terminals report the chord.
 const RENAME_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(6));
 
+/// `F8` — jump the cursor to the next diagnostic (the common "go to next problem" key). `Shift+F8`
+/// jumps to the previous one (matched via [`is_prev_diagnostic_key`], tolerant of the chord).
+const NEXT_DIAGNOSTIC_KEY: KeyPress = KeyPress::key(KeyCode::Function(8));
+
 /// How long the cursor / typing must settle before a debounced LSP request fires. Short enough that
 /// the signature/highlight still feels live, long enough to coalesce a burst of cursor moves or
 /// keystrokes into a single request (so holding an arrow key or typing fast never floods the server).
@@ -136,6 +140,13 @@ struct PendingLsp {
     path: PathBuf,
     byte: usize,
     at: Instant,
+}
+
+/// Which way to step when navigating diagnostics (`F8` next / `Shift+F8` previous).
+#[derive(Clone, Copy)]
+enum Direction {
+    Next,
+    Prev,
 }
 
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
@@ -629,11 +640,11 @@ impl App {
         Some(format!("{name} {glyph}"))
     }
 
-    /// Dispatches the LSP feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
+    /// Dispatches the editor feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
     /// (`F12`), find-references (`Shift+F12`), document symbols (`Ctrl+Shift+O`), rename (`Shift+F6`),
-    /// code actions (`Ctrl+.`), and format (`Shift+Alt+F`). Returns `true` when `key` triggered one
-    /// (the caller then returns). Each trigger is a no-op unless the editor is focused and a server
-    /// handles the buffer.
+    /// code actions (`Ctrl+.`), format (`Shift+Alt+F`), and diagnostic navigation (`F8`/`Shift+F8`).
+    /// Returns `true` when `key` triggered one (the caller then returns). Each trigger is a no-op
+    /// unless the editor is focused (the LSP ones also need a server handling the buffer).
     fn try_lsp_trigger(&mut self, key: KeyPress) -> bool {
         if key == COMPLETION_KEY {
             self.trigger_completion();
@@ -651,6 +662,10 @@ impl App {
             self.trigger_code_actions();
         } else if is_format_key(key) {
             self.trigger_formatting();
+        } else if is_prev_diagnostic_key(key) {
+            self.goto_diagnostic(Direction::Prev);
+        } else if key == NEXT_DIAGNOSTIC_KEY {
+            self.goto_diagnostic(Direction::Next);
         } else {
             return false;
         }
@@ -716,6 +731,8 @@ impl App {
                 "reload-config",
                 "goto-type-definition",
                 "goto-implementation",
+                "next-diagnostic",
+                "prev-diagnostic",
             ]);
             self.finder = Some(Finder::commands(&commands));
             return Ok(());
@@ -1066,6 +1083,26 @@ impl App {
         }
         let cursor = editor.buffer().cursor();
         self.lsp.request_goto_definition(&path, cursor);
+    }
+
+    /// Jumps the cursor to the next/previous diagnostic in the active buffer (wrapping around), so
+    /// `F8`/`Shift+F8` step through problems; the diagnostic's message then shows in the status line.
+    /// Uses the diagnostics already in the buffer — no server round-trip — and is a no-op when the
+    /// editor is not focused or the buffer has no diagnostics. Also the `next-/prev-diagnostic` palette
+    /// commands.
+    fn goto_diagnostic(&mut self, direction: Direction) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let cursor = editor.buffer().cursor();
+        let target = match direction {
+            Direction::Next => editor.next_diagnostic(cursor),
+            Direction::Prev => editor.prev_diagnostic(cursor),
+        };
+        if let Some(byte) = target {
+            self.workspace.set_active_cursor(byte);
+        }
     }
 
     /// Requests LSP goto-type-definition at the cursor (jump to the declaration of the symbol's
@@ -1470,6 +1507,12 @@ impl App {
             Action::RunCommand(name) if name == "goto-implementation" => {
                 self.trigger_implementation();
             }
+            Action::RunCommand(name) if name == "next-diagnostic" => {
+                self.goto_diagnostic(Direction::Next);
+            }
+            Action::RunCommand(name) if name == "prev-diagnostic" => {
+                self.goto_diagnostic(Direction::Prev);
+            }
             Action::RunCommand(name) => self.workspace.execute(&name),
         }
     }
@@ -1825,6 +1868,16 @@ fn is_code_action_key(key: KeyPress) -> bool {
         && !key.mods.contains(Mods::SHIFT)
         && !key.mods.contains(Mods::ALT)
         && key.code == KeyCode::Char('.')
+}
+
+/// Whether `key` is `Shift+F8` (jump to the *previous* diagnostic). Requires `Shift`, forbids
+/// `Ctrl`/`Alt`; tolerant of extra flags the terminal may add — matched via [`NEXT_DIAGNOSTIC_KEY`]'s
+/// code.
+fn is_prev_diagnostic_key(key: KeyPress) -> bool {
+    key.mods.contains(Mods::SHIFT)
+        && !key.mods.contains(Mods::CTRL)
+        && !key.mods.contains(Mods::ALT)
+        && key.code == NEXT_DIAGNOSTIC_KEY.code
 }
 
 /// Whether `key` is `Ctrl+Shift+O` (go to symbol in file — opens the document-symbols picker).
