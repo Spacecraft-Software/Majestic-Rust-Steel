@@ -29,7 +29,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
     Action, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader, ProfileSelector,
-    References, Session, Workspace,
+    References, Session, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome};
 use majestic_term::PtyTerminal;
@@ -132,6 +132,8 @@ struct App {
     hover: Option<Hover>,
     /// The LSP find-references popup; `Some` while a symbol's use sites are shown over the editor.
     references: Option<References>,
+    /// The LSP document-symbols picker; `Some` while the file's outline is shown over the editor.
+    symbols: Option<Symbols>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -159,6 +161,7 @@ impl App {
             completion_anchor: 0,
             hover: None,
             references: None,
+            symbols: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -201,7 +204,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -212,6 +215,7 @@ impl App {
                         self.completion = Some(Completion::new(items));
                         self.hover = None;
                         self.references = None;
+                        self.symbols = None;
                     }
                 }
                 LspOutcome::Hover { text, .. } => {
@@ -221,6 +225,7 @@ impl App {
                         self.hover = Some(hover);
                         self.completion = None;
                         self.references = None;
+                        self.symbols = None;
                     }
                 }
                 LspOutcome::GotoDefinition { target, .. } => {
@@ -238,6 +243,7 @@ impl App {
                             self.completion = None;
                             self.hover = None;
                             self.references = None;
+                            self.symbols = None;
                         }
                     }
                 }
@@ -247,6 +253,16 @@ impl App {
                         self.references = Some(references);
                         self.completion = None;
                         self.hover = None;
+                        self.symbols = None;
+                    }
+                }
+                LspOutcome::DocumentSymbols { symbols, .. } => {
+                    let symbols = Symbols::new(symbols);
+                    if !symbols.is_empty() {
+                        self.symbols = Some(symbols);
+                        self.completion = None;
+                        self.hover = None;
+                        self.references = None;
                     }
                 }
                 LspOutcome::Formatting { path, formatted } => {
@@ -354,8 +370,8 @@ impl App {
             selector.render(surface, area, theme);
         }
 
-        // The completion, hover, and references popups are anchored at the cursor within the editor
-        // region, above all else (they are mutually exclusive, so at most one shows).
+        // The completion, hover, references, and symbols popups are anchored at the cursor within the
+        // editor region, above all else (they are mutually exclusive, so at most one shows).
         if let (Some(completion), Some(rect)) = (self.completion.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 completion.render(surface, rect, cursor, theme);
@@ -369,6 +385,11 @@ impl App {
         if let (Some(references), Some(rect)) = (self.references.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 references.render(surface, rect, cursor, theme);
+            }
+        }
+        if let (Some(symbols), Some(rect)) = (self.symbols.as_ref(), editor_rect) {
+            if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
+                symbols.render(surface, rect, cursor, theme);
             }
         }
     }
@@ -452,6 +473,9 @@ impl App {
         if self.references.is_some() && self.references_popup_key(key) {
             return Ok(());
         }
+        if self.symbols.is_some() && self.symbols_popup_key(key) {
+            return Ok(());
+        }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
                 "Key Bindings (Esc to close)",
@@ -482,6 +506,10 @@ impl App {
         }
         if is_references_key(key) {
             self.trigger_references();
+            return Ok(());
+        }
+        if is_document_symbols_key(key) {
+            self.trigger_document_symbols();
             return Ok(());
         }
         if is_format_key(key) {
@@ -619,6 +647,54 @@ impl App {
         }
     }
 
+    /// Routes a key to the open symbols picker: ↑/↓ move the selection, `Enter` jumps to the selected
+    /// definition, `Esc` closes it, and any other key dismisses it and falls through to editing.
+    /// Returns `true` when the key was consumed, `false` when it should fall through.
+    fn symbols_popup_key(&mut self, key: KeyPress) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(symbols) = self.symbols.as_mut() {
+                    symbols.select_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(symbols) = self.symbols.as_mut() {
+                    symbols.select_down();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                self.jump_to_selected_symbol();
+                true
+            }
+            KeyCode::Escape => {
+                self.symbols = None;
+                true
+            }
+            _ => {
+                self.symbols = None;
+                false
+            }
+        }
+    }
+
+    /// Jumps to the selected symbol and closes the picker. Document symbols are always in the file
+    /// the request was issued for — still the focused buffer — so the cursor is landed there directly
+    /// (the symbol's name position, converted against the buffer's current text).
+    fn jump_to_selected_symbol(&mut self) {
+        let Some(symbols) = self.symbols.take() else {
+            return;
+        };
+        let Some(symbol) = symbols.selected() else {
+            return;
+        };
+        let (line, character) = (symbol.line, symbol.character);
+        let text = self.workspace.active().buffer().text();
+        let byte = majestic_lsp::position_to_byte(&text, line, character);
+        self.workspace.set_active_cursor(byte);
+    }
+
     /// Requests LSP completion at the cursor: records where the in-progress identifier starts (so an
     /// accepted candidate replaces it, not the whole word), then asks the manager to fetch
     /// candidates off-thread. A no-op unless the editor is focused and a server handles the buffer;
@@ -691,6 +767,24 @@ impl App {
         }
         let cursor = editor.buffer().cursor();
         self.lsp.request_references(&path, cursor);
+    }
+
+    /// Requests the LSP document-symbol outline for the focused buffer, off-thread; the picker opens
+    /// later, in `sync_lsp`, once the reply arrives. Whole-document, so unlike the cursor-based
+    /// requests it sends no cursor. A no-op unless the editor is focused and a server handles the
+    /// buffer.
+    fn trigger_document_symbols(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        self.lsp.request_document_symbols(&path);
     }
 
     /// Requests a whole-document LSP reformat, off-thread; the result is applied later, in
@@ -1199,6 +1293,15 @@ fn is_references_key(key: KeyPress) -> bool {
         && !key.mods.contains(Mods::CTRL)
         && !key.mods.contains(Mods::ALT)
         && key.code == REFERENCES_KEY.code
+}
+
+/// Whether `key` is `Ctrl+Shift+O` (go to symbol in file — opens the document-symbols picker).
+/// Tolerant of the terminal reporting the letter as either case, mirroring [`is_command_palette`]
+/// (`Ctrl+Shift+P`).
+fn is_document_symbols_key(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && key.mods.contains(Mods::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'o'))
 }
 
 /// Translates a crossterm key event into a Keymaker [`KeyPress`], if it maps to one.

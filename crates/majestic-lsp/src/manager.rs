@@ -19,13 +19,14 @@ use std::time::Duration;
 
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
-    DiagnosticSeverity, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams, Location, MarkedString,
-    MarkupContent, MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams,
-    ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentPositionParams,
-    TextEdit, Uri, WorkDoneProgressParams,
+    DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover as LspHover, HoverContents, HoverParams, Location, MarkedString, MarkupContent,
+    MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams, ReferenceContext,
+    ReferenceParams, SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri,
+    WorkDoneProgressParams,
 };
-use majestic_core::{CompletionItem, Diagnostic, Reference, Severity};
+use majestic_core::{CompletionItem, Diagnostic, Reference, Severity, Symbol};
 
 use crate::client::{file_uri, LanguageServer};
 use crate::connection::Requester;
@@ -112,6 +113,15 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The use sites, each with a destination file/position and a source-line preview.
         references: Vec<Reference>,
+    },
+    /// The outline of every definition in the document at `path` (functions, types, members, …),
+    /// flattened in document order with nesting depth, ready to show in the symbols picker. Empty
+    /// when the server found none (the picker does not open).
+    DocumentSymbols {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The definitions, each with a same-file position, a kind badge, and a nesting depth.
+        symbols: Vec<Symbol>,
     },
     /// A whole-document reformat for the document at `path`, computed off-thread by applying the
     /// server's edits to the text that was sent. `formatted` is the new document text, or `None`
@@ -350,6 +360,31 @@ impl LspManager {
             let references = fetch_references(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::References { path, references });
+        });
+    }
+
+    /// Requests the outline of every definition in `path` (functions, types, members, …), off the
+    /// editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Whole-document,
+    /// so unlike the cursor-based requests it takes no `byte`. The request and its bounded wait run
+    /// on a worker thread holding a shared [`Requester`]; the result arrives via
+    /// [`Self::poll_outcomes`] as [`LspOutcome::DocumentSymbols`].
+    pub fn request_document_symbols(&self, path: &Path) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let symbols = fetch_document_symbols(&requester, uri);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::DocumentSymbols { path, symbols });
         });
     }
 
@@ -674,6 +709,90 @@ fn read_capped(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Issues `textDocument/documentSymbol` over a shared [`Requester`] (on a worker thread) and
+/// flattens the reply to editor-facing [`Symbol`]s in document order. Handles both response shapes:
+/// the hierarchical `Nested` tree (pre-order, recording nesting depth) and the legacy flat list (all
+/// at depth 0). A timeout, transport error, server error, `null`, or empty result all yield an empty
+/// list (the picker does not open).
+fn fetch_document_symbols(requester: &Requester, uri: Uri) -> Vec<Symbol> {
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/documentSymbol", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (no symbols) deserializes to `None`.
+    let parsed: Option<DocumentSymbolResponse> = serde_json::from_value(result).unwrap_or(None);
+    let mut symbols = Vec::new();
+    match parsed {
+        Some(DocumentSymbolResponse::Nested(nodes)) => {
+            for node in &nodes {
+                flatten_symbol(node, 0, &mut symbols);
+            }
+        }
+        Some(DocumentSymbolResponse::Flat(infos)) => {
+            // The legacy flat shape has no hierarchy; every symbol sits at depth 0. (The field-only
+            // access here never names the deprecated `SymbolInformation` type.)
+            symbols.extend(infos.into_iter().map(|info| Symbol {
+                name: info.name,
+                kind: symbol_kind_glyph(info.kind),
+                line: info.location.range.start.line,
+                character: info.location.range.start.character,
+                depth: 0,
+            }));
+        }
+        None => {}
+    }
+    symbols
+}
+
+/// Appends `node` and its descendants to `out` in pre-order, so children read directly under their
+/// parent with an increasing nesting `depth`. The jump position is the symbol's `selection_range`
+/// start — the name itself, not the whole body the `range` would span.
+fn flatten_symbol(node: &DocumentSymbol, depth: u16, out: &mut Vec<Symbol>) {
+    out.push(Symbol {
+        name: node.name.clone(),
+        kind: symbol_kind_glyph(node.kind),
+        line: node.selection_range.start.line,
+        character: node.selection_range.start.character,
+        depth,
+    });
+    if let Some(children) = node.children.as_ref() {
+        for child in children {
+            flatten_symbol(child, depth.saturating_add(1), out);
+        }
+    }
+}
+
+/// A one-character badge for an LSP [`SymbolKind`], grouping the ~26 kinds into the handful that read
+/// clearly in a TUI list: `m` module-like, `s` struct/class, `e` enum (+ members), `t` trait/
+/// interface, `f` function/method, `c` constant, `v` variable, `.` field/property, `T` type
+/// parameter, `·` everything else.
+fn symbol_kind_glyph(kind: SymbolKind) -> char {
+    match kind {
+        SymbolKind::FILE | SymbolKind::MODULE | SymbolKind::NAMESPACE | SymbolKind::PACKAGE => 'm',
+        SymbolKind::CLASS | SymbolKind::STRUCT | SymbolKind::OBJECT => 's',
+        SymbolKind::ENUM | SymbolKind::ENUM_MEMBER => 'e',
+        SymbolKind::INTERFACE => 't',
+        SymbolKind::METHOD | SymbolKind::FUNCTION | SymbolKind::CONSTRUCTOR => 'f',
+        SymbolKind::CONSTANT => 'c',
+        SymbolKind::VARIABLE => 'v',
+        SymbolKind::FIELD | SymbolKind::PROPERTY => '.',
+        SymbolKind::TYPE_PARAMETER => 'T',
+        _ => '·',
+    }
+}
+
 /// Issues `textDocument/formatting` over a shared [`Requester`] (on a worker thread) and applies the
 /// returned edits to `snapshot` (the exact text last sent to the server), yielding the reformatted
 /// document. A timeout, transport error, server error, a `null`/empty edit list, or a result
@@ -857,8 +976,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply_text_edits, byte_to_position, markup_text, position_to_byte, read_capped, LspManager,
-        LspOutcome, ServerConfig,
+        apply_text_edits, byte_to_position, markup_text, position_to_byte, read_capped,
+        symbol_kind_glyph, LspManager, LspOutcome, ServerConfig,
     };
     use crate::client::LanguageServer;
     use crate::codec::{read_message, write_message};
@@ -1540,6 +1659,160 @@ mod tests {
         assert!(
             references.iter().all(|reference| reference.path == main_rs),
             "all references are in the same file"
+        );
+    }
+
+    #[test]
+    fn document_symbols_request_yields_flattened_outline_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one textDocument/documentSymbol with a nested outline: a struct
+        // `Foo` containing a method `bar`, plus a top-level function `baz`. Then it idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/documentSymbol" {
+                    break message["id"].clone();
+                }
+            };
+            // SymbolKind 23 = STRUCT, 6 = METHOD, 12 = FUNCTION.
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {
+                            "name": "Foo", "kind": 23,
+                            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 4, "character": 1}},
+                            "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 10}},
+                            "children": [
+                                {
+                                    "name": "bar", "kind": 6,
+                                    "range": {"start": {"line": 1, "character": 4}, "end": {"line": 3, "character": 5}},
+                                    "selectionRange": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 10}}
+                                }
+                            ]
+                        },
+                        {
+                            "name": "baz", "kind": 12,
+                            "range": {"start": {"line": 6, "character": 0}, "end": {"line": 8, "character": 1}},
+                            "selectionRange": {"start": {"line": 6, "character": 3}, "end": {"line": 6, "character": 6}}
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-ds.rs");
+        manager.open(path, "struct Foo;").unwrap();
+        manager.request_document_symbols(path);
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::DocumentSymbols { path: got, symbols } = &outcomes[0] else {
+            panic!("expected a document-symbols outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        // Pre-order, flattened with depth: Foo (struct, 0) → bar (method, 1) → baz (function, 0).
+        assert_eq!(symbols.len(), 3);
+        assert_eq!(
+            (symbols[0].name.as_str(), symbols[0].kind, symbols[0].depth),
+            ("Foo", 's', 0)
+        );
+        // The jump position is the selection-range start (the name), not the body's range.
+        assert_eq!((symbols[0].line, symbols[0].character), (0, 7));
+        assert_eq!(
+            (symbols[1].name.as_str(), symbols[1].kind, symbols[1].depth),
+            ("bar", 'f', 1)
+        );
+        assert_eq!((symbols[1].line, symbols[1].character), (1, 7));
+        assert_eq!(
+            (symbols[2].name.as_str(), symbols[2].kind, symbols[2].depth),
+            ("baz", 'f', 0)
+        );
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn symbol_kind_glyph_groups_kinds() {
+        use lsp_types::SymbolKind;
+        assert_eq!(symbol_kind_glyph(SymbolKind::STRUCT), 's');
+        assert_eq!(symbol_kind_glyph(SymbolKind::METHOD), 'f');
+        assert_eq!(symbol_kind_glyph(SymbolKind::FUNCTION), 'f');
+        assert_eq!(symbol_kind_glyph(SymbolKind::ENUM), 'e');
+        assert_eq!(symbol_kind_glyph(SymbolKind::INTERFACE), 't');
+        assert_eq!(symbol_kind_glyph(SymbolKind::MODULE), 'm');
+        assert_eq!(symbol_kind_glyph(SymbolKind::CONSTANT), 'c');
+        assert_eq!(symbol_kind_glyph(SymbolKind::EVENT), '·'); // unmapped kind → fallthrough badge
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_lists_document_symbols() {
+        use std::fs;
+
+        // A throwaway cargo project with a struct (+ method) and a function.
+        let dir = std::env::temp_dir().join(format!("majestic-ra-ds-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        let source = "struct Thing;\nimpl Thing {\n    fn method(&self) {}\n}\nfn main() {}\n";
+        fs::write(&main_rs, source).unwrap();
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        // Drive startup (`poll`) and keep requesting until the (async-started) server replies.
+        let mut symbols = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup (ignore diagnostics)
+            manager.request_document_symbols(&main_rs); // a no-op until ready
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::DocumentSymbols { symbols: found, .. } = outcome {
+                    if !found.is_empty() {
+                        symbols = found;
+                    }
+                }
+            }
+            if !symbols.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "Thing"),
+            "should list the struct: {symbols:?}"
+        );
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "main"),
+            "should list main: {symbols:?}"
         );
     }
 }
