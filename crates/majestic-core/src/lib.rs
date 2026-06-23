@@ -43,6 +43,7 @@ mod info;
 mod references;
 mod selector;
 mod session;
+mod symbols;
 mod syntax;
 #[cfg(feature = "syntect-highlighting")]
 mod syntect_hl;
@@ -71,6 +72,8 @@ pub use references::{Reference, References};
 pub use selector::ProfileSelector;
 #[doc(inline)]
 pub use session::{LayoutNode, PaneState, Session};
+#[doc(inline)]
+pub use symbols::{Symbol, Symbols};
 #[doc(inline)]
 pub use whichkey::WhichKey;
 #[doc(inline)]

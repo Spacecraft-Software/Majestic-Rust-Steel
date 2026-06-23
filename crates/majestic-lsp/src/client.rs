@@ -24,10 +24,10 @@ use std::sync::Arc;
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingClientCapabilities,
-    GotoCapability, HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams,
-    MarkupKind, PublishDiagnosticsParams, ReferenceClientCapabilities,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
-    VersionedTextDocumentIdentifier, WorkspaceFolder,
+    DocumentSymbolClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
+    InitializeResult, InitializedParams, MarkupKind, PublishDiagnosticsParams,
+    ReferenceClientCapabilities, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentItem, Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -191,10 +191,11 @@ impl Drop for LanguageServer {
 }
 
 /// The capabilities advertised in the `initialize` handshake: completion, hover, goto-definition,
-/// find-references, and document formatting, plus the implicit defaults. Completion is requested
-/// without snippet support (we insert plain text, not `$0`-style snippet placeholders); hover
-/// accepts both Markdown and plain-text content so a server may send whichever it prefers (the
-/// editor renders it as text either way).
+/// find-references, document symbols, and document formatting, plus the implicit defaults.
+/// Completion is requested without snippet support (we insert plain text, not `$0`-style snippet
+/// placeholders); hover accepts both Markdown and plain-text content so a server may send whichever
+/// it prefers (the editor renders it as text either way); document symbols request the hierarchical
+/// (nested) shape so members nest under their parent.
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
@@ -215,6 +216,10 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             references: Some(ReferenceClientCapabilities {
                 dynamic_registration: Some(false),
+            }),
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
             }),
             formatting: Some(DocumentFormattingClientCapabilities {
                 dynamic_registration: Some(false),
