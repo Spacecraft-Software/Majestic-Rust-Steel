@@ -28,8 +28,8 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
-    Action, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader, ProfileSelector,
-    Prompt, References, RenameEdit, Session, SignatureHelp, Symbols, Workspace,
+    Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
+    ProfileSelector, Prompt, References, RenameEdit, Session, SignatureHelp, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome};
 use majestic_term::PtyTerminal;
@@ -142,6 +142,8 @@ struct App {
     /// The LSP signature-help popup; `Some` while the active call's signature is shown over the
     /// editor. Passive: it does not capture keys (you keep typing arguments under it).
     signature: Option<SignatureHelp>,
+    /// The LSP code-actions menu; `Some` while the quick-fixes/refactors at the cursor are shown.
+    code_actions: Option<CodeActions>,
     /// The modal rename input; `Some` while the user is typing the new name (captures every key).
     prompt: Option<Prompt>,
     /// The document + cursor byte a pending rename was triggered at, recorded when the prompt opens
@@ -179,6 +181,7 @@ impl App {
             references: None,
             symbols: None,
             signature: None,
+            code_actions: None,
             prompt: None,
             rename_target: None,
             highlight_anchor: None,
@@ -264,7 +267,7 @@ impl App {
             let active_path = self.workspace.active().buffer().path();
             let focused_match =
                 self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
-                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::DocumentHighlight { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } | LspOutcome::GotoDefinition { path, .. } | LspOutcome::References { path, .. } | LspOutcome::DocumentSymbols { path, .. } | LspOutcome::SignatureHelp { path, .. } | LspOutcome::Rename { path, .. } | LspOutcome::DocumentHighlight { path, .. } | LspOutcome::CodeActions { path, .. } | LspOutcome::Formatting { path, .. } if path == active)
                 });
             if !focused_match {
                 continue;
@@ -272,22 +275,16 @@ impl App {
             match outcome {
                 LspOutcome::Completion { items, .. } => {
                     if !items.is_empty() {
+                        self.close_cursor_popups();
                         self.completion = Some(Completion::new(items));
-                        self.hover = None;
-                        self.references = None;
-                        self.symbols = None;
-                        self.signature = None;
                     }
                 }
                 LspOutcome::Hover { text, .. } => {
                     if let Some(hover) =
                         text.map(|text| Hover::new(&text)).filter(|h| !h.is_empty())
                     {
+                        self.close_cursor_popups();
                         self.hover = Some(hover);
-                        self.completion = None;
-                        self.references = None;
-                        self.symbols = None;
-                        self.signature = None;
                     }
                 }
                 LspOutcome::GotoDefinition { target, .. } => {
@@ -302,47 +299,41 @@ impl App {
                                 position.character,
                             );
                             self.workspace.set_active_cursor(byte);
-                            self.completion = None;
-                            self.hover = None;
-                            self.references = None;
-                            self.symbols = None;
-                            self.signature = None;
+                            self.close_cursor_popups();
                         }
                     }
                 }
                 LspOutcome::References { references, .. } => {
                     let references = References::new(references);
                     if !references.is_empty() {
+                        self.close_cursor_popups();
                         self.references = Some(references);
-                        self.completion = None;
-                        self.hover = None;
-                        self.symbols = None;
-                        self.signature = None;
                     }
                 }
                 LspOutcome::DocumentSymbols { symbols, .. } => {
                     let symbols = Symbols::new(symbols);
                     if !symbols.is_empty() {
+                        self.close_cursor_popups();
                         self.symbols = Some(symbols);
-                        self.completion = None;
-                        self.hover = None;
-                        self.references = None;
-                        self.signature = None;
                     }
                 }
                 LspOutcome::SignatureHelp { signature, .. } => {
                     // Passive popup: `Some` opens/updates it (closing the interactive popups), `None`
                     // (cursor left the call) closes it.
                     if signature.is_some() {
-                        self.completion = None;
-                        self.hover = None;
-                        self.references = None;
-                        self.symbols = None;
+                        self.close_cursor_popups();
                     }
                     self.signature = signature;
                 }
+                LspOutcome::CodeActions { actions, .. } => {
+                    let actions = CodeActions::new(actions);
+                    if !actions.is_empty() {
+                        self.close_cursor_popups();
+                        self.code_actions = Some(actions);
+                    }
+                }
                 LspOutcome::Rename { edits, .. } => {
-                    self.apply_rename(edits);
+                    self.apply_workspace_edits(edits);
                 }
                 LspOutcome::DocumentHighlight { occurrences, .. } => {
                     // Tint the occurrences — but only while the cursor is still on an identifier (a
@@ -486,6 +477,11 @@ impl App {
                 signature.render(surface, rect, cursor, theme);
             }
         }
+        if let (Some(menu), Some(rect)) = (self.code_actions.as_ref(), editor_rect) {
+            if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
+                menu.render(surface, rect, cursor, theme);
+            }
+        }
     }
 
     /// Draws the explorer sidebar on the left (when shown and wide enough), returning the
@@ -538,8 +534,9 @@ impl App {
 
     /// Dispatches the LSP feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
     /// (`F12`), find-references (`Shift+F12`), document symbols (`Ctrl+Shift+O`), rename (`Shift+F6`),
-    /// and format (`Shift+Alt+F`). Returns `true` when `key` triggered one (the caller then returns).
-    /// Each trigger is itself a no-op unless the editor is focused and a server handles the buffer.
+    /// code actions (`Ctrl+.`), and format (`Shift+Alt+F`). Returns `true` when `key` triggered one
+    /// (the caller then returns). Each trigger is a no-op unless the editor is focused and a server
+    /// handles the buffer.
     fn try_lsp_trigger(&mut self, key: KeyPress) -> bool {
         if key == COMPLETION_KEY {
             self.trigger_completion();
@@ -553,6 +550,8 @@ impl App {
             self.trigger_document_symbols();
         } else if is_rename_key(key) {
             self.trigger_rename();
+        } else if is_code_action_key(key) {
+            self.trigger_code_actions();
         } else if is_format_key(key) {
             self.trigger_formatting();
         } else {
@@ -601,6 +600,9 @@ impl App {
             return Ok(());
         }
         if self.signature.is_some() && self.signature_popup_key(key) {
+            return Ok(());
+        }
+        if self.code_actions.is_some() && self.code_actions_popup_key(key) {
             return Ok(());
         }
         if key == HELP_KEY {
@@ -823,6 +825,69 @@ impl App {
         }
     }
 
+    /// Closes every cursor-anchored LSP popup (completion, hover, references, symbols, signature, code
+    /// actions). They are mutually exclusive, so an opener calls this before showing its own.
+    fn close_cursor_popups(&mut self) {
+        self.completion = None;
+        self.hover = None;
+        self.references = None;
+        self.symbols = None;
+        self.signature = None;
+        self.code_actions = None;
+    }
+
+    /// Routes a key to the open code-actions menu: ↑/↓ move the selection, `Enter` applies the
+    /// selected action, `Esc` closes it, and any other key dismisses it and falls through to editing.
+    /// Returns `true` when the key was consumed, `false` when it should fall through.
+    fn code_actions_popup_key(&mut self, key: KeyPress) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(menu) = self.code_actions.as_mut() {
+                    menu.select_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(menu) = self.code_actions.as_mut() {
+                    menu.select_down();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                self.apply_selected_code_action();
+                true
+            }
+            KeyCode::Escape => {
+                self.code_actions = None;
+                true
+            }
+            _ => {
+                self.code_actions = None;
+                false
+            }
+        }
+    }
+
+    /// Applies the selected code action and closes the menu: its edits go through the shared
+    /// `WorkspaceEdit` applier. A command-only action (no edits) cannot be applied in v1, so it just
+    /// surfaces a status notice.
+    fn apply_selected_code_action(&mut self) {
+        let Some(menu) = self.code_actions.take() else {
+            return;
+        };
+        let Some(action) = menu.selected() else {
+            return;
+        };
+        if action.is_applicable() {
+            self.apply_workspace_edits(action.edits.clone());
+        } else {
+            self.workspace.set_status(format!(
+                "`{}` needs command execution (not yet supported)",
+                action.title
+            ));
+        }
+    }
+
     /// Requests LSP signature help at the cursor, off-thread; the popup opens/updates (or closes) in
     /// `sync_lsp` once the reply arrives. Auto-invoked after typing `(`/`,`/`)`. A no-op unless the
     /// editor is focused and a server handles the buffer.
@@ -933,6 +998,23 @@ impl App {
         self.lsp.request_document_symbols(&path);
     }
 
+    /// Requests the LSP code actions at the cursor, off-thread; the menu opens later, in `sync_lsp`,
+    /// once the reply arrives. A no-op unless the editor is focused and a server handles the buffer.
+    fn trigger_code_actions(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_code_action(&path, cursor);
+    }
+
     /// Starts an LSP rename: opens the modal prompt pre-filled with the identifier under the cursor
     /// and records where to rename. The request is issued later, on confirm. A no-op unless the
     /// editor is focused and a server handles the buffer.
@@ -994,10 +1076,11 @@ impl App {
         }
     }
 
-    /// Applies a completed rename: groups the edits by file, and for each file reveals it (reusing an
-    /// open editor when possible, so an unsaved buffer is edited in place) and applies its edits
-    /// back-to-front (so earlier byte offsets stay valid). Focus returns to where the rename started.
-    fn apply_rename(&mut self, edits: Vec<RenameEdit>) {
+    /// Applies a server-provided `WorkspaceEdit` (already reduced to positional `RenameEdit`s): groups
+    /// the edits by file, and for each file reveals it (reusing an open editor when possible, so an
+    /// unsaved buffer is edited in place) and applies its edits back-to-front (so earlier byte offsets
+    /// stay valid). Focus returns to where it started. Shared by rename and code actions.
+    fn apply_workspace_edits(&mut self, edits: Vec<RenameEdit>) {
         if edits.is_empty() {
             return;
         }
@@ -1565,6 +1648,15 @@ fn is_rename_key(key: KeyPress) -> bool {
         && !key.mods.contains(Mods::CTRL)
         && !key.mods.contains(Mods::ALT)
         && key.code == RENAME_KEY.code
+}
+
+/// Whether `key` is `Ctrl+.` (show code actions / quick fixes — the universal "Quick Fix" shortcut).
+/// Requires `Ctrl`, forbids `Shift`/`Alt`.
+fn is_code_action_key(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && !key.mods.contains(Mods::SHIFT)
+        && !key.mods.contains(Mods::ALT)
+        && key.code == KeyCode::Char('.')
 }
 
 /// Whether `key` is `Ctrl+Shift+O` (go to symbol in file — opens the document-symbols picker).

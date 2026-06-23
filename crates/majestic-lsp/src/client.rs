@@ -22,7 +22,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use lsp_types::{
-    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+    ClientCapabilities, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, CompletionClientCapabilities, CompletionItemCapability,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingClientCapabilities,
     DocumentHighlightClientCapabilities, DocumentSymbolClientCapabilities, GotoCapability,
     HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams, MarkupKind,
@@ -193,8 +194,8 @@ impl Drop for LanguageServer {
 }
 
 /// The capabilities advertised in the `initialize` handshake: completion, hover, signature help,
-/// goto-definition, find-references, document highlight, document symbols, rename, and document
-/// formatting, plus the implicit defaults.
+/// goto-definition, find-references, document highlight, document symbols, code actions, rename, and
+/// document formatting, plus the implicit defaults.
 /// Completion is requested without snippet support (we insert plain text, not `$0`-style snippet
 /// placeholders); hover accepts both Markdown and plain-text content so a server may send whichever
 /// it prefers (the editor renders it as text either way); document symbols request the hierarchical
@@ -223,6 +224,21 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             document_highlight: Some(DocumentHighlightClientCapabilities {
                 dynamic_registration: Some(false),
+            }),
+            // Advertise code-action *literal* support so the server returns `CodeAction`s (carrying
+            // an `edit`) rather than legacy `Command`s. No `resolveSupport`, so rust-analyzer resolves
+            // the edits eagerly and we can apply them without a second `codeAction/resolve` round-trip.
+            code_action: Some(CodeActionClientCapabilities {
+                code_action_literal_support: Some(CodeActionLiteralSupport {
+                    code_action_kind: CodeActionKindLiteralSupport {
+                        value_set: vec![
+                            "quickfix".to_owned(),
+                            "refactor".to_owned(),
+                            "source".to_owned(),
+                        ],
+                    },
+                }),
+                ..Default::default()
             }),
             document_symbol: Some(DocumentSymbolClientCapabilities {
                 hierarchical_document_symbol_support: Some(true),
