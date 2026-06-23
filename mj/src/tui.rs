@@ -28,7 +28,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use majestic_core::{
-    Action, Completion, Editor, FileTree, Finder, HelpOverlay, InfoReader, ProfileSelector,
+    Action, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader, ProfileSelector,
     Session, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome};
@@ -98,6 +98,10 @@ const HELP_KEY: KeyPress = KeyPress::key(KeyCode::Function(1));
 /// The `Ctrl+Space` key requests LSP completion at the cursor (the editor convention).
 const COMPLETION_KEY: KeyPress = KeyPress::ctrl(' ');
 
+/// The `F2` key requests LSP hover documentation at the cursor (the keyboard counterpart to mouse
+/// hover; an F-key, like F1/F12, so it is safe to capture globally without shadowing an editing key).
+const HOVER_KEY: KeyPress = KeyPress::key(KeyCode::Function(2));
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -115,6 +119,8 @@ struct App {
     /// The byte offset where the in-progress identifier (the prefix being completed) starts; an
     /// accepted candidate replaces `completion_anchor..cursor`.
     completion_anchor: usize,
+    /// The LSP hover popup; `Some` while documentation is shown over the editor.
+    hover: Option<Hover>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -136,6 +142,7 @@ impl App {
             selector: None,
             completion: None,
             completion_anchor: 0,
+            hover: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             focus: Focus::Editor,
@@ -170,13 +177,33 @@ impl App {
         for (path, diagnostics) in self.lsp.poll() {
             self.workspace.apply_diagnostics(&path, &diagnostics);
         }
-        // Interactive-request results (completion candidates) arrive asynchronously; open the popup
-        // when a result matches the buffer that still has focus and actually has candidates.
+        // Interactive-request results (completion candidates, hover docs) arrive asynchronously;
+        // open the matching popup when a result is for the buffer that still has focus. The two
+        // popups are mutually exclusive, so opening one closes the other.
         for outcome in self.lsp.poll_outcomes() {
-            let LspOutcome::Completion { path, items } = outcome;
             let active_path = self.workspace.active().buffer().path();
-            if self.focus == Focus::Editor && active_path.as_deref() == Some(path.as_path()) {
-                self.completion = (!items.is_empty()).then(|| Completion::new(items));
+            let focused_match =
+                self.focus == Focus::Editor && active_path.as_deref().is_some_and(|active| {
+                    matches!(&outcome, LspOutcome::Completion { path, .. } | LspOutcome::Hover { path, .. } if path == active)
+                });
+            if !focused_match {
+                continue;
+            }
+            match outcome {
+                LspOutcome::Completion { items, .. } => {
+                    if !items.is_empty() {
+                        self.completion = Some(Completion::new(items));
+                        self.hover = None;
+                    }
+                }
+                LspOutcome::Hover { text, .. } => {
+                    if let Some(hover) =
+                        text.map(|text| Hover::new(&text)).filter(|h| !h.is_empty())
+                    {
+                        self.hover = Some(hover);
+                        self.completion = None;
+                    }
+                }
             }
         }
     }
@@ -279,10 +306,16 @@ impl App {
             selector.render(surface, area, theme);
         }
 
-        // The completion popup is anchored at the cursor within the editor region, above all else.
+        // The completion and hover popups are anchored at the cursor within the editor region,
+        // above all else (they are mutually exclusive, so at most one shows).
         if let (Some(completion), Some(rect)) = (self.completion.as_ref(), editor_rect) {
             if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
                 completion.render(surface, rect, cursor, theme);
+            }
+        }
+        if let (Some(hover), Some(rect)) = (self.hover.as_ref(), editor_rect) {
+            if let Some(cursor) = self.workspace.active_cursor_screen(rect) {
+                hover.render(surface, rect, cursor, theme);
             }
         }
     }
@@ -355,32 +388,13 @@ impl App {
             self.info_key(key);
             return Ok(());
         }
-        // The completion popup is a light modal: it captures navigation/accept/dismiss keys, but any
-        // other key dismisses it and falls through to normal editing (so typing keeps going).
-        if self.completion.is_some() {
-            match key.code {
-                KeyCode::Up => {
-                    if let Some(completion) = self.completion.as_mut() {
-                        completion.select_up();
-                    }
-                    return Ok(());
-                }
-                KeyCode::Down => {
-                    if let Some(completion) = self.completion.as_mut() {
-                        completion.select_down();
-                    }
-                    return Ok(());
-                }
-                KeyCode::Enter | KeyCode::Tab => {
-                    self.accept_completion();
-                    return Ok(());
-                }
-                KeyCode::Escape => {
-                    self.completion = None;
-                    return Ok(());
-                }
-                _ => self.completion = None,
-            }
+        // The completion and hover popups are light modals: each captures its navigation/accept
+        // keys while open, and any other key dismisses it and falls through to normal editing.
+        if self.completion.is_some() && self.completion_popup_key(key) {
+            return Ok(());
+        }
+        if self.hover.is_some() && self.hover_popup_key(key) {
+            return Ok(());
         }
         if key == HELP_KEY {
             self.help = Some(HelpOverlay::new(
@@ -400,6 +414,10 @@ impl App {
         }
         if key == COMPLETION_KEY {
             self.trigger_completion();
+            return Ok(());
+        }
+        if key == HOVER_KEY {
+            self.trigger_hover();
             return Ok(());
         }
         if key.code == TERMINAL_TOGGLE {
@@ -424,6 +442,65 @@ impl App {
         Ok(())
     }
 
+    /// Routes a key to the open completion popup. Returns `true` when the key was consumed (the
+    /// caller returns), `false` when the key dismissed the popup and should fall through to editing.
+    fn completion_popup_key(&mut self, key: KeyPress) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(completion) = self.completion.as_mut() {
+                    completion.select_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(completion) = self.completion.as_mut() {
+                    completion.select_down();
+                }
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.accept_completion();
+                true
+            }
+            KeyCode::Escape => {
+                self.completion = None;
+                true
+            }
+            _ => {
+                self.completion = None;
+                false
+            }
+        }
+    }
+
+    /// Routes a key to the open hover popup: ↑/↓ scroll it, `Esc` closes it, and any other key
+    /// dismisses it and falls through (so pressing `F2` again re-requests hover at the new cursor).
+    /// Returns `true` when the key was consumed, `false` when it should fall through to editing.
+    fn hover_popup_key(&mut self, key: KeyPress) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(hover) = self.hover.as_mut() {
+                    hover.scroll_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(hover) = self.hover.as_mut() {
+                    hover.scroll_down();
+                }
+                true
+            }
+            KeyCode::Escape => {
+                self.hover = None;
+                true
+            }
+            _ => {
+                self.hover = None;
+                false
+            }
+        }
+    }
+
     /// Requests LSP completion at the cursor: records where the in-progress identifier starts (so an
     /// accepted candidate replaces it, not the whole word), then asks the manager to fetch
     /// candidates off-thread. A no-op unless the editor is focused and a server handles the buffer;
@@ -443,6 +520,24 @@ impl App {
         let text = editor.buffer().text();
         self.completion_anchor = identifier_start(&text, cursor);
         self.lsp.request_completion(&path, cursor);
+    }
+
+    /// Requests LSP hover documentation at the cursor, off-thread; the popup opens later, in
+    /// `sync_lsp`, once the reply arrives. A no-op unless the editor is focused and a server handles
+    /// the buffer.
+    fn trigger_hover(&mut self) {
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let editor = self.workspace.active();
+        let Some(path) = editor.buffer().path() else {
+            return;
+        };
+        if !self.lsp.handles(&path) {
+            return;
+        }
+        let cursor = editor.buffer().cursor();
+        self.lsp.request_hover(&path, cursor);
     }
 
     /// Inserts the selected candidate over the typed identifier prefix and closes the popup.

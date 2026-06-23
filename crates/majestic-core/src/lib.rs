@@ -38,6 +38,7 @@ mod files;
 mod finder;
 mod fuzzy;
 mod git;
+mod hover;
 mod info;
 mod selector;
 mod session;
@@ -59,6 +60,8 @@ pub use editor::{EditMode, Editor};
 pub use files::FileTree;
 #[doc(inline)]
 pub use finder::{Action, Finder, HelpOverlay};
+#[doc(inline)]
+pub use hover::Hover;
 #[doc(inline)]
 pub use info::{InfoDocument, InfoReader};
 #[doc(inline)]

@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
-    DiagnosticSeverity, PartialResultParams, Position, PublishDiagnosticsParams,
-    TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+    DiagnosticSeverity, Hover as LspHover, HoverContents, HoverParams, MarkedString, MarkupContent,
+    MarkupKind, PartialResultParams, Position, PublishDiagnosticsParams, TextDocumentIdentifier,
+    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 };
 use majestic_core::{CompletionItem, Diagnostic, Severity};
 
@@ -75,8 +76,7 @@ enum ServerSlot {
 
 /// The result of an interactive LSP request, delivered back to the editor once a worker thread has
 /// the server's reply. Drained each frame by [`LspManager::poll_outcomes`] (the request itself runs
-/// off-thread so a slow server never blocks the render loop). Extensible — hover lands as a second
-/// variant on the same channel.
+/// off-thread so a slow server never blocks the render loop).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LspOutcome {
     /// Completion candidates for the document at `path`, ready to show in the popup.
@@ -85,6 +85,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The candidates, already converted to editor-facing items.
         items: Vec<CompletionItem>,
+    },
+    /// Hover documentation for the cursor in the document at `path`. `text` is `None` when the
+    /// server reported nothing to show (the popup simply does not open).
+    Hover {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The hover content reduced to plain text, or `None` when there is nothing to show.
+        text: Option<String>,
     },
 }
 
@@ -238,6 +246,30 @@ impl LspManager {
             let items = fetch_completion(&requester, uri, position);
             // The receiver is gone only if the editor has shut down; dropping the result is fine.
             let _ = tx.send(LspOutcome::Completion { path, items });
+        });
+    }
+
+    /// Requests hover documentation for the cursor `byte` in `path`, off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. Like
+    /// [`Self::request_completion`], the request and its bounded wait run on a worker thread holding
+    /// a shared [`Requester`]; the result arrives via [`Self::poll_outcomes`] as [`LspOutcome::Hover`].
+    pub fn request_hover(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let text = fetch_hover(&requester, uri, position);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::Hover { path, text });
         });
     }
 
@@ -450,6 +482,65 @@ fn fetch_completion(requester: &Requester, uri: Uri, position: Position) -> Vec<
         .collect()
 }
 
+/// Issues `textDocument/hover` over a shared [`Requester`] (on a worker thread) and reduces the
+/// reply to plain text. A timeout, transport error, server error, `null` result, or empty content
+/// all yield `None` (the popup simply does not open).
+fn fetch_hover(requester: &Requester, uri: Uri, position: Position) -> Option<String> {
+    let params = HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let value = serde_json::to_value(params).ok()?;
+    let response = requester
+        .request_timeout("textDocument/hover", value, Duration::from_secs(3))
+        .ok()?;
+    let result = response.into_result().ok()?;
+    // A `null` result (nothing to show) deserializes to `None`.
+    let hover: Option<LspHover> = serde_json::from_value(result).unwrap_or(None);
+    let text = hover_text(hover?.contents);
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Reduces LSP [`HoverContents`] (markup, a marked string, or an array of them) to plain text.
+fn hover_text(contents: HoverContents) -> String {
+    match contents {
+        HoverContents::Scalar(marked) => marked_string_text(marked),
+        HoverContents::Array(items) => items
+            .into_iter()
+            .map(marked_string_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        HoverContents::Markup(markup) => markup_text(markup),
+    }
+}
+
+/// The text of a [`MarkedString`] — a bare string, or the code body of a language-tagged block.
+fn marked_string_text(marked: MarkedString) -> String {
+    match marked {
+        MarkedString::String(text) => text,
+        MarkedString::LanguageString(block) => block.value,
+    }
+}
+
+/// The text of a [`MarkupContent`]. Markdown fence lines (```` ``` ````) are dropped so a TUI box
+/// shows the code/prose they wrap rather than literal backticks; plain text passes through.
+fn markup_text(markup: MarkupContent) -> String {
+    if markup.kind == MarkupKind::Markdown {
+        markup
+            .value
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        markup.value
+    }
+}
+
 /// The project root the language server should be pointed at: the nearest ancestor of `path`
 /// containing a `Cargo.toml`, falling back to `path`'s directory.
 fn project_root(path: &Path) -> PathBuf {
@@ -474,7 +565,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{byte_to_position, position_to_byte, LspManager, LspOutcome, ServerConfig};
+    use super::{
+        byte_to_position, markup_text, position_to_byte, LspManager, LspOutcome, ServerConfig,
+    };
     use crate::client::LanguageServer;
     use crate::codec::{read_message, write_message};
     use crate::connection::Connection;
@@ -558,7 +651,9 @@ mod tests {
         }
 
         assert_eq!(outcomes.len(), 1);
-        let LspOutcome::Completion { path: got, items } = &outcomes[0];
+        let LspOutcome::Completion { path: got, items } = &outcomes[0] else {
+            panic!("expected a completion outcome, got {:?}", outcomes[0]);
+        };
         assert_eq!(got, path);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "println!");
@@ -568,6 +663,85 @@ mod tests {
         assert_eq!(items[1].label, "print!");
         assert_eq!(items[1].insert_text, "print!");
         assert_eq!(items[1].detail, None);
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    fn markup_text_strips_markdown_fences_but_keeps_plaintext() {
+        use lsp_types::{MarkupContent, MarkupKind};
+
+        let markdown = MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "```rust\nfn foo()\n```\n\nDocs".to_owned(),
+        };
+        assert_eq!(markup_text(markdown), "fn foo()\n\nDocs");
+
+        let plain = MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: "```not a fence```".to_owned(),
+        };
+        assert_eq!(markup_text(plain), "```not a fence```");
+    }
+
+    #[test]
+    fn hover_request_yields_plain_text_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server that answers one `textDocument/hover` with fenced markdown, then idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            // `open` sends `didOpen` first; skip notifications until the hover request arrives.
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/hover" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "contents": {
+                            "kind": "markdown",
+                            "value": "```rust\nfn foo()\n```\n\nDocs for foo"
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-h.rs");
+        manager.open(path, "let _ = foo").unwrap();
+        manager.request_hover(path, "let _ = foo".len());
+
+        // The worker replies asynchronously; poll until the outcome lands.
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::Hover { path: got, text } = &outcomes[0] else {
+            panic!("expected a hover outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        // Fences stripped, surrounding text preserved.
+        assert_eq!(text.as_deref(), Some("fn foo()\n\nDocs for foo"));
 
         mock.join().unwrap();
     }
