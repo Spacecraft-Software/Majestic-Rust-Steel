@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor;
 use crossterm::event::{
@@ -116,6 +116,28 @@ const REFERENCES_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(12
 /// terminals report the chord.
 const RENAME_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(6));
 
+/// How long the cursor / typing must settle before a debounced LSP request fires. Short enough that
+/// the signature/highlight still feels live, long enough to coalesce a burst of cursor moves or
+/// keystrokes into a single request (so holding an arrow key or typing fast never floods the server).
+const LSP_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// Which auto-issued LSP request is pending behind the debounce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    /// `textDocument/documentHighlight` (auto-issued as the cursor moves between identifiers).
+    DocumentHighlight,
+    /// `textDocument/signatureHelp` (auto-issued as `(`/`,`/`)` are typed in a call).
+    SignatureHelp,
+}
+
+/// A debounced LSP request, fired once its deadline `at` passes (unless superseded first).
+struct PendingLsp {
+    kind: PendingKind,
+    path: PathBuf,
+    byte: usize,
+    at: Instant,
+}
+
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
 /// integrated terminal.
 struct App {
@@ -152,6 +174,9 @@ struct App {
     /// The `(path, identifier byte-span)` the document-highlight tint currently tracks, so the host
     /// re-requests occurrences only when the cursor moves to a different identifier.
     highlight_anchor: Option<(PathBuf, std::ops::Range<usize>)>,
+    /// A debounced auto-issued LSP request (document highlight / signature help) waiting for the
+    /// cursor or typing to settle; superseded by a newer one, fired once its deadline passes.
+    pending_lsp: Option<PendingLsp>,
     /// Language servers + document sync (diagnostics). Servers start lazily on first matching file.
     lsp: LspManager,
     /// The buffer revision last sent to a language server, keyed by path (so an unchanged buffer
@@ -185,6 +210,7 @@ impl App {
             prompt: None,
             rename_target: None,
             highlight_anchor: None,
+            pending_lsp: None,
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
@@ -222,6 +248,7 @@ impl App {
         }
         self.apply_lsp_outcomes();
         self.refresh_document_highlight();
+        self.fire_due_lsp();
     }
 
     /// Re-requests the symbol occurrences to tint (LSP `documentHighlight`) when the cursor has moved
@@ -248,13 +275,64 @@ impl App {
         if self.highlight_anchor == target {
             return; // same identifier (or still nothing) — leave the current tint as is
         }
-        // The cursor moved to a different identifier (or off one): drop the old tint, then request
-        // fresh occurrences when it is on a symbol.
+        // The cursor moved to a different identifier (or off one): drop the old tint, then schedule
+        // a (debounced) request for fresh occurrences when it is on a symbol.
         self.workspace.clear_active_occurrences();
         self.highlight_anchor.clone_from(&target);
         if let Some((path, span)) = target {
-            self.lsp.request_document_highlight(&path, span.start);
+            self.debounce_lsp(PendingKind::DocumentHighlight, path, span.start);
+        } else {
+            // Left an identifier — drop any highlight request still waiting on the debounce.
+            if matches!(
+                self.pending_lsp.as_ref().map(|p| p.kind),
+                Some(PendingKind::DocumentHighlight)
+            ) {
+                self.pending_lsp = None;
+            }
         }
+    }
+
+    /// Schedules an auto-issued LSP request behind the debounce, replacing any pending one (so a
+    /// burst of cursor moves or keystrokes coalesces to just the last position). Fired by
+    /// [`Self::fire_due_lsp`] once [`LSP_DEBOUNCE`] elapses with no newer request.
+    fn debounce_lsp(&mut self, kind: PendingKind, path: PathBuf, byte: usize) {
+        self.pending_lsp = Some(PendingLsp {
+            kind,
+            path,
+            byte,
+            at: Instant::now() + LSP_DEBOUNCE,
+        });
+    }
+
+    /// Issues a debounced LSP request whose deadline has passed (called each frame from `sync_lsp`).
+    fn fire_due_lsp(&mut self) {
+        let due = self
+            .pending_lsp
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.at);
+        if !due {
+            return;
+        }
+        let Some(pending) = self.pending_lsp.take() else {
+            return;
+        };
+        match pending.kind {
+            PendingKind::DocumentHighlight => self
+                .lsp
+                .request_document_highlight(&pending.path, pending.byte),
+            PendingKind::SignatureHelp => {
+                self.lsp.request_signature_help(&pending.path, pending.byte);
+            }
+        }
+    }
+
+    /// How long until the next debounced LSP request is due, for capping the event-loop poll timeout
+    /// so the loop wakes to fire it rather than waiting out a full idle tick. `None` when nothing is
+    /// pending.
+    fn lsp_debounce_timeout(&self) -> Option<Duration> {
+        self.pending_lsp
+            .as_ref()
+            .map(|pending| pending.at.saturating_duration_since(Instant::now()))
     }
 
     /// Drains the interactive-request results (completion, hover, goto-definition, references,
@@ -891,9 +969,10 @@ impl App {
         }
     }
 
-    /// Requests LSP signature help at the cursor, off-thread; the popup opens/updates (or closes) in
-    /// `sync_lsp` once the reply arrives. Auto-invoked after typing `(`/`,`/`)`. A no-op unless the
-    /// editor is focused and a server handles the buffer.
+    /// Schedules an LSP signature-help request at the cursor behind the debounce; it fires (off the
+    /// editor thread) once typing settles, and the popup opens/updates (or closes) in `sync_lsp` once
+    /// the reply arrives. Auto-invoked after typing `(`/`,`/`)`. A no-op unless the editor is focused
+    /// and a server handles the buffer.
     fn trigger_signature_help(&mut self) {
         if self.focus != Focus::Editor {
             return;
@@ -906,7 +985,7 @@ impl App {
             return;
         }
         let cursor = editor.buffer().cursor();
-        self.lsp.request_signature_help(&path, cursor);
+        self.debounce_lsp(PendingKind::SignatureHelp, path, cursor);
     }
 
     /// Requests LSP completion at the cursor: records where the in-progress identifier starts (so an
@@ -1563,11 +1642,16 @@ pub(crate) fn run(
 
         // Poll quickly while a shell streams output (even when the editor is focused); idle
         // longer when only editing.
-        let timeout = if app.terminal_running() {
+        let mut timeout = if app.terminal_running() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(200)
         };
+        // …but never sleep past a pending debounced LSP request, so it fires at its deadline rather
+        // than on the next idle tick.
+        if let Some(due) = app.lsp_debounce_timeout() {
+            timeout = timeout.min(due);
+        }
         if event::poll(timeout)? {
             let (columns, lines) = (screen.front().width(), screen.front().height());
             match event::read()? {
