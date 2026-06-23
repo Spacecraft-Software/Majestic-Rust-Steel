@@ -18,19 +18,21 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use lsp_types::{
-    CompletionList, CompletionParams, CompletionResponse, Diagnostic as LspDiagnostic,
-    DiagnosticSeverity, DocumentChangeOperation, DocumentChanges, DocumentFormattingParams,
-    DocumentHighlight as LspDocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover as LspHover, HoverContents, HoverParams,
-    Location, MarkedString, MarkupContent, MarkupKind, OneOf, ParameterLabel, PartialResultParams,
-    Position, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RenameParams,
+    CodeActionContext, CodeActionOrCommand, CodeActionParams, CompletionList, CompletionParams,
+    CompletionResponse, Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentChangeOperation,
+    DocumentChanges, DocumentFormattingParams, DocumentHighlight as LspDocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover as LspHover, HoverContents, HoverParams, Location, MarkedString, MarkupContent,
+    MarkupKind, OneOf, ParameterLabel, PartialResultParams, Position, PublishDiagnosticsParams,
+    Range as LspRange, ReferenceContext, ReferenceParams, RenameParams,
     SignatureHelp as LspSignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentEdit,
     TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Uri, WorkDoneProgressParams,
     WorkspaceEdit,
 };
 use majestic_core::{
-    CompletionItem, Diagnostic, Occurrence, Reference, RenameEdit, Severity, SignatureHelp, Symbol,
+    CodeAction, CompletionItem, Diagnostic, Occurrence, Reference, RenameEdit, Severity,
+    SignatureHelp, Symbol,
 };
 
 use crate::client::{file_uri, LanguageServer};
@@ -68,6 +70,9 @@ struct DocState {
     /// The `file://` URI sent to the server — used to match its `publishDiagnostics` back to this
     /// document (the URI is canonicalized, so it may differ from the editor's path).
     uri: Uri,
+    /// The raw LSP diagnostics last published for this document, retained so a `codeAction` request
+    /// can pass the ones covering the cursor as its context (which is how quick-fixes are offered).
+    diagnostics: Vec<LspDiagnostic>,
 }
 
 /// A language server's lifecycle state. Startup (spawn + the blocking `initialize` handshake) runs
@@ -134,6 +139,14 @@ pub enum LspOutcome {
         path: PathBuf,
         /// The occurrences (byte ranges + read/write), tinted in the buffer by the host.
         occurrences: Vec<Occurrence>,
+    },
+    /// The code actions (quick-fixes / refactors) the server offers at the cursor in the document at
+    /// `path`, ready to show in the menu. Empty when the server offers none (the menu does not open).
+    CodeActions {
+        /// The document the request was issued for.
+        path: PathBuf,
+        /// The offered actions, each with a title and its already-reduced edits.
+        actions: Vec<CodeAction>,
     },
     /// The outline of every definition in the document at `path` (functions, types, members, …),
     /// flattened in document order with nesting depth, ready to show in the symbols picker. Empty
@@ -244,6 +257,7 @@ impl LspManager {
                 version: 1,
                 text: text.to_owned(),
                 uri: uri.clone(),
+                diagnostics: Vec::new(),
             },
         );
         // If the server is already up, notify now; otherwise `poll` sends `didOpen` once it is
@@ -280,15 +294,35 @@ impl LspManager {
     /// Non-blocking — joining a startup thread only happens once it has finished.
     pub fn poll(&mut self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
         self.advance_startups();
+        // Drain every ready server's published diagnostics first, releasing the `servers` borrow
+        // before touching `docs` (which we mutate to retain the raw diagnostics for codeAction).
+        let published: Vec<PublishDiagnosticsParams> = self
+            .servers
+            .values()
+            .filter_map(|slot| match slot {
+                ServerSlot::Ready(server) => Some(server.diagnostics()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         let mut updates = Vec::new();
-        for slot in self.servers.values() {
-            if let ServerSlot::Ready(server) = slot {
-                for published in server.diagnostics() {
-                    if let Some(update) = self.convert(&published) {
-                        updates.push(update);
-                    }
-                }
-            }
+        for params in published {
+            // Match the published URI back to an open document (canonicalized, so it need not equal
+            // the editor's path); convert to byte ranges for the editor and retain the raw ones.
+            let Some((path, doc)) = self
+                .docs
+                .iter_mut()
+                .find(|(_, doc)| doc.uri.as_str() == params.uri.as_str())
+            else {
+                continue;
+            };
+            let diagnostics = params
+                .diagnostics
+                .iter()
+                .map(|diagnostic| to_core_diagnostic(&doc.text, diagnostic))
+                .collect();
+            doc.diagnostics = params.diagnostics;
+            updates.push((path.clone(), diagnostics));
         }
         updates
     }
@@ -445,6 +479,40 @@ impl LspManager {
         });
     }
 
+    /// Requests the code actions (quick-fixes / refactors) offered at the cursor `byte` in `path`,
+    /// off the editor thread.
+    ///
+    /// A no-op unless the document is open and its server is [`ServerSlot::Ready`]. The request's
+    /// context carries the document's diagnostics that cover the cursor (so the server can offer
+    /// their quick-fixes); the result arrives via [`Self::poll_outcomes`] as
+    /// [`LspOutcome::CodeActions`].
+    pub fn request_code_action(&self, path: &Path, byte: usize) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(ServerSlot::Ready(server)) = self.servers.get(&doc.language_id) else {
+            return;
+        };
+        let requester = server.requester();
+        let position = byte_to_position(&doc.text, byte);
+        // The diagnostics covering the cursor become the action context (quick-fix sources).
+        let diagnostics: Vec<LspDiagnostic> = doc
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic_covers(&diagnostic.range, position))
+            .cloned()
+            .collect();
+        let uri = doc.uri.clone();
+        let path = path.to_owned();
+        let tx = self.outcomes_tx.clone();
+        thread::spawn(move || {
+            let range = LspRange::new(position, position); // zero-width range at the cursor
+            let actions = fetch_code_actions(&requester, uri, range, diagnostics);
+            // The receiver is gone only if the editor has shut down; dropping the result is fine.
+            let _ = tx.send(LspOutcome::CodeActions { path, actions });
+        });
+    }
+
     /// Requests the outline of every definition in `path` (functions, types, members, …), off the
     /// editor thread.
     ///
@@ -562,21 +630,6 @@ impl LspManager {
             };
             self.servers.insert(language, slot);
         }
-    }
-
-    fn convert(&self, published: &PublishDiagnosticsParams) -> Option<(PathBuf, Vec<Diagnostic>)> {
-        // Match the published URI back to the document we opened (the URI is canonicalized, so it
-        // need not equal the editor's path) and convert against that document's current text.
-        let (path, doc) = self
-            .docs
-            .iter()
-            .find(|(_, doc)| doc.uri.as_str() == published.uri.as_str())?;
-        let diagnostics = published
-            .diagnostics
-            .iter()
-            .map(|diagnostic| to_core_diagnostic(&doc.text, diagnostic))
-            .collect();
-        Some((path.clone(), diagnostics))
     }
 
     fn config_for(&self, path: &Path) -> Option<ServerConfig> {
@@ -875,6 +928,66 @@ fn fetch_document_highlight(
         .collect()
 }
 
+/// Whether LSP `position` falls within `range` (inclusive of the end, so a cursor at a diagnostic's
+/// trailing edge still counts — quick-fixes commonly apply at the boundary).
+fn diagnostic_covers(range: &LspRange, position: Position) -> bool {
+    let after_start = position.line > range.start.line
+        || (position.line == range.start.line && position.character >= range.start.character);
+    let before_end = position.line < range.end.line
+        || (position.line == range.end.line && position.character <= range.end.character);
+    after_start && before_end
+}
+
+/// Issues `textDocument/codeAction` over a shared [`Requester`] (on a worker thread) and reduces the
+/// reply to editor-facing [`CodeAction`]s. Each `CodeAction` carries its inline `WorkspaceEdit`
+/// reduced to edits (we advertise literal support without resolve, so the server resolves them
+/// eagerly); a legacy `Command` becomes an editless action (shown but not applied in v1). A timeout,
+/// transport error, server error, `null`, or empty result all yield an empty list (no menu).
+fn fetch_code_actions(
+    requester: &Requester,
+    uri: Uri,
+    range: LspRange,
+    diagnostics: Vec<LspDiagnostic>,
+) -> Vec<CodeAction> {
+    let params = CodeActionParams {
+        text_document: TextDocumentIdentifier { uri },
+        range,
+        context: CodeActionContext {
+            diagnostics,
+            only: None,
+            trigger_kind: None,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let Ok(value) = serde_json::to_value(params) else {
+        return Vec::new();
+    };
+    let Ok(response) =
+        requester.request_timeout("textDocument/codeAction", value, Duration::from_secs(3))
+    else {
+        return Vec::new();
+    };
+    let Ok(result) = response.into_result() else {
+        return Vec::new();
+    };
+    // A `null` result (no actions) deserializes to `None`.
+    let actions: Option<Vec<CodeActionOrCommand>> = serde_json::from_value(result).unwrap_or(None);
+    let Some(actions) = actions else {
+        return Vec::new();
+    };
+    actions
+        .into_iter()
+        .map(|item| match item {
+            CodeActionOrCommand::CodeAction(action) => {
+                let edits = action.edit.map(workspace_edit_to_edits).unwrap_or_default();
+                CodeAction::new(action.title, edits)
+            }
+            CodeActionOrCommand::Command(command) => CodeAction::new(command.title, Vec::new()),
+        })
+        .collect()
+}
+
 /// Issues `textDocument/documentSymbol` over a shared [`Requester`] (on a worker thread) and
 /// flattens the reply to editor-facing [`Symbol`]s in document order. Handles both response shapes:
 /// the hierarchical `Nested` tree (pre-order, recording nesting depth) and the legacy flat list (all
@@ -993,13 +1106,18 @@ fn fetch_rename(
     };
     // A `null` result (rename refused) deserializes to `None`.
     let edit: Option<WorkspaceEdit> = serde_json::from_value(result).unwrap_or(None);
-    let Some(edit) = edit else {
-        return Vec::new();
-    };
+    edit.map(workspace_edit_to_edits).unwrap_or_default()
+}
+
+/// Reduces an LSP [`WorkspaceEdit`] to a flat list of editor-facing [`RenameEdit`]s, handling both
+/// shapes — the simple `changes` map and the richer `document_changes` (preferred when present, with
+/// file create/rename/delete operations skipped). Shared by rename and code actions, which both
+/// apply a server-provided `WorkspaceEdit`.
+fn workspace_edit_to_edits(edit: WorkspaceEdit) -> Vec<RenameEdit> {
     let mut out = Vec::new();
     if let Some(changes) = edit.document_changes {
         // The richer form: a list of per-document edit batches (with optional file operations,
-        // which a rename does not need, so they are skipped).
+        // which we do not apply, so they are skipped).
         let doc_edits: Vec<TextDocumentEdit> = match changes {
             DocumentChanges::Edits(edits) => edits,
             DocumentChanges::Operations(ops) => ops
@@ -2538,5 +2656,130 @@ mod tests {
             "rust-analyzer should highlight `total` and its uses: {occurrences:?}"
         );
         assert!(occurrences.iter().all(|occ| occ.range.end <= source.len()));
+    }
+
+    #[test]
+    fn code_action_request_yields_actions_with_edits_via_poll_outcomes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A mock server answering one textDocument/codeAction with a fix (carrying an edit) and a
+        // legacy command (no edit). Then it idles.
+        let mock = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let id = loop {
+                let message = read_message(&mut reader).unwrap();
+                if message["method"] == "textDocument/codeAction" {
+                    break message["id"].clone();
+                }
+            };
+            write_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [
+                        {
+                            "title": "Import Write",
+                            "kind": "quickfix",
+                            "edit": {
+                                "changes": {
+                                    "file:///tmp/does-not-exist-ca.rs": [
+                                        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "use std::io::Write;\n"}
+                                    ]
+                                }
+                            }
+                        },
+                        {"title": "Run command", "command": "majestic.noop"}
+                    ]
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut manager = LspManager::new();
+        manager.configure("rs", ServerConfig::new("rust-analyzer", "rust"));
+        let connection = Connection::new(client.try_clone().unwrap(), client);
+        manager.register_server("rust", LanguageServer::from_connection(connection));
+
+        let path = std::path::Path::new("/tmp/does-not-exist-ca.rs");
+        manager.open(path, "fn main() {}").unwrap();
+        manager.request_code_action(path, 0);
+
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            outcomes = manager.poll_outcomes();
+            if !outcomes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(outcomes.len(), 1);
+        let LspOutcome::CodeActions { path: got, actions } = &outcomes[0] else {
+            panic!("expected a code-actions outcome, got {:?}", outcomes[0]);
+        };
+        assert_eq!(got, path);
+        assert_eq!(actions.len(), 2);
+        // The CodeAction carries its edit (reduced from the WorkspaceEdit); the Command does not.
+        assert_eq!(actions[0].title, "Import Write");
+        assert!(actions[0].is_applicable());
+        assert_eq!(actions[0].edits.len(), 1);
+        assert_eq!(actions[0].edits[0].new_text, "use std::io::Write;\n");
+        assert_eq!(
+            actions[0].edits[0].path,
+            std::path::PathBuf::from("/tmp/does-not-exist-ca.rs")
+        );
+        assert_eq!(actions[1].title, "Run command");
+        assert!(!actions[1].is_applicable()); // command-only
+
+        mock.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns real rust-analyzer; run manually, e.g. under `nix-shell -p rust-analyzer`"]
+    fn real_rust_analyzer_offers_code_actions() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("majestic-ra-ca-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let main_rs = dir.join("src/main.rs");
+        // A struct with fields — rust-analyzer offers assists (generate impl, etc.) on its name.
+        let source = "struct Point {\n    x: i32,\n    y: i32,\n}\nfn main() {}\n";
+        fs::write(&main_rs, source).unwrap();
+        let byte = source.find("Point").unwrap() + 1;
+
+        let mut manager = LspManager::with_defaults();
+        manager.open(&main_rs, source).unwrap();
+
+        let mut actions = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let _ = manager.poll(); // advance startup + retain diagnostics
+            manager.request_code_action(&main_rs, byte);
+            for outcome in manager.poll_outcomes() {
+                if let LspOutcome::CodeActions { actions: found, .. } = outcome {
+                    if !found.is_empty() {
+                        actions = found;
+                    }
+                }
+            }
+            if !actions.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            !actions.is_empty(),
+            "rust-analyzer should offer at least one assist on a struct: {actions:?}"
+        );
     }
 }
