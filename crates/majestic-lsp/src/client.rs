@@ -25,10 +25,11 @@ use lsp_types::{
     ClientCapabilities, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
     CodeActionLiteralSupport, CompletionClientCapabilities, CompletionItemCapability,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingClientCapabilities,
-    DocumentHighlightClientCapabilities, DocumentSymbolClientCapabilities, GotoCapability,
-    HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams,
-    InlayHintClientCapabilities, MarkupKind, PublishDiagnosticsParams, ReferenceClientCapabilities,
-    RenameClientCapabilities, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+    DocumentHighlightClientCapabilities, DocumentSymbolClientCapabilities,
+    ExecuteCommandClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
+    InitializeResult, InitializedParams, InlayHintClientCapabilities, MarkupKind,
+    PublishDiagnosticsParams, ReferenceClientCapabilities, RenameClientCapabilities,
+    SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
     WorkspaceClientCapabilities, WorkspaceFolder, WorkspaceSymbolClientCapabilities,
 };
@@ -164,6 +165,21 @@ impl LanguageServer {
             .collect()
     }
 
+    /// Drains every server-initiated message since the last call (notifications *and* requests), for
+    /// the manager to route — diagnostics plus the `workspace/applyEdit` request a command produces.
+    #[must_use]
+    pub fn drain_incoming(&self) -> Vec<Incoming> {
+        self.connection.drain_incoming()
+    }
+
+    /// Answers a server-initiated request by `id` (e.g. replying to `workspace/applyEdit`).
+    ///
+    /// # Errors
+    /// Returns an I/O error if the write fails.
+    pub fn respond(&self, id: Value, result: Value) -> io::Result<()> {
+        self.connection.respond(id, result)
+    }
+
     /// Requests an orderly shutdown (`shutdown` then `exit`).
     ///
     /// # Errors
@@ -265,6 +281,12 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         workspace: Some(WorkspaceClientCapabilities {
             symbol: Some(WorkspaceSymbolClientCapabilities::default()),
+            // We answer `workspace/applyEdit` (the edits a `workspace/executeCommand` produces) and
+            // can run a code action's command.
+            apply_edit: Some(true),
+            execute_command: Some(ExecuteCommandClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
             ..Default::default()
         }),
         ..Default::default()
