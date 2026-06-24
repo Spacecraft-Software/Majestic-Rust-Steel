@@ -3,3 +3,7 @@
 
 # Clippy honors the workspace MSRV so it never suggests newer-than-supported APIs.
 msrv = "1.90.0"
+
+# Proper nouns that `doc_markdown` would otherwise flag as code missing backticks. `..` keeps
+# Clippy's built-in list (GitHub, JSON, …) and appends ours.
+doc-valid-idents = ["..", "OpenAI", "Ollama"]

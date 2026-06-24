@@ -10,10 +10,15 @@
 //! agent loop ([`run_turn`]) are in place.
 
 mod agent;
+#[cfg(feature = "http-provider")]
+mod http;
 mod provider;
 
 #[doc(inline)]
 pub use agent::{run_turn, Approver, Governor, Outcome, Tools};
+#[cfg(feature = "http-provider")]
+#[doc(inline)]
+pub use http::HttpProvider;
 #[doc(inline)]
 pub use provider::{
     CompletionRequest, CompletionResponse, Message, MockProvider, Provider, ProviderError, Role,

@@ -21,6 +21,15 @@ serde_json = "1"
 # bare path dependency as a wildcard.
 seraph = { version = "0.0.0", path = "../seraph" }
 jiff = "0.2"
+# The real provider speaks OpenAI-compatible HTTP. `ureq` is a small synchronous/blocking client that
+# fits the synchronous `Provider` trait; HTTP-only (`default-features = false`, no rustls/ring) keeps
+# the dependency tree license-clean and targets local-first servers (Ollama). Optional + off by
+# default so the standard build stays lean.
+ureq = { version = "2", default-features = false, features = ["json"], optional = true }
+
+[features]
+# Enables `HttpProvider` (an OpenAI-compatible HTTP backend). Off by default — local-first, opt-in.
+http-provider = ["dep:ureq"]
 
 [lints]
 workspace = true
