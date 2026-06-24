@@ -198,8 +198,8 @@ impl std::error::Error for ProviderError {}
 
 /// A source of model completions — the seam every backend plugs into. `complete` is synchronous so
 /// the agent loop can run it on a worker thread; implementations must be `Send + Sync` so that thread
-/// can own a shared handle.
-pub trait Provider: Send + Sync {
+/// can own a shared handle, and `Debug` so containers that hold a boxed provider stay printable.
+pub trait Provider: Send + Sync + fmt::Debug {
     /// Produces the model's next reply to `request`.
     ///
     /// # Errors

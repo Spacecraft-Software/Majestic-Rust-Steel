@@ -1800,6 +1800,7 @@ name = "majestic-agent"
 version = "0.0.0"
 dependencies = [
  "architect",
+ "jiff",
  "majestic-core",
  "seraph",
  "serde",

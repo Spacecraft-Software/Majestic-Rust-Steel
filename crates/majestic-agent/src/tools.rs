@@ -3,10 +3,11 @@
 
 //! [`BufferTools`] — the agent's read/edit tools over a single buffer.
 
-use architect::{ToolCall, Tools};
+use architect::{ToolCall, ToolSpec, Tools};
 use majestic_core::{apply_hashline, tagged_read, Buffer, HashlineEdit, LineRef};
 use seraph::AgentAction;
 use serde::Deserialize;
+use serde_json::json;
 
 /// The agent's tool surface over one buffer: `read` it as `LINE:TAG│text` lines, or `edit` it with
 /// tagged edits. The host points this at the active buffer for a turn; the governed loop has already
@@ -100,6 +101,47 @@ impl Tools for BufferTools<'_> {
             other => Err(format!("unknown tool `{other}`")),
         }
     }
+}
+
+/// The function-calling specs the agent advertises for [`BufferTools`]: `read` and `edit`. The host
+/// passes these to the provider so the model knows the tools and the exact hashline edit shape.
+#[must_use]
+pub fn buffer_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "read".to_owned(),
+            description: "Read the current buffer as `LINE:TAG│text` lines. Cite a line's LINE and \
+                          TAG when you edit it."
+                .to_owned(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "edit".to_owned(),
+            description: "Apply edits to the current buffer. Each edit cites a line by its 1-based \
+                          LINE and the TAG shown by `read`; if the tag is stale the edit is rejected \
+                          and you must re-read first."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "line": { "type": "integer", "description": "1-based line number" },
+                                "tag": { "type": "string", "description": "the line's hashline tag from `read`" },
+                                "op": { "type": "string", "enum": ["replace", "insert_after", "delete"] },
+                                "text": { "type": "string", "description": "new content (omit for delete)" }
+                            },
+                            "required": ["line", "tag", "op"]
+                        }
+                    }
+                },
+                "required": ["edits"]
+            }),
+        },
+    ]
 }
 
 #[cfg(test)]
