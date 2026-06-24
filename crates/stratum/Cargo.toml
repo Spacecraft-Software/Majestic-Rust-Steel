@@ -11,5 +11,10 @@ license.workspace = true
 repository.workspace = true
 description = "Majestic text core: rope, snapshots, anchors, spans, undo tree, journal."
 
+[dependencies]
+# Hashline agent-edit tags (PRD #1 §5.2.5): BLAKE3 over a line's content. Default features (std only,
+# no rayon) keep the footprint small; the SIMD backend is selected at build time, not via a feature.
+blake3 = "1"
+
 [lints]
 workspace = true

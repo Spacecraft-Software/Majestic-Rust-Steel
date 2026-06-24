@@ -32,6 +32,7 @@
 //! ```
 
 mod anchor;
+mod hashline;
 mod journal;
 mod rope;
 mod spans;
@@ -40,6 +41,8 @@ mod undo;
 
 #[doc(inline)]
 pub use anchor::{Anchor, Bias, Edit};
+#[doc(inline)]
+pub use hashline::{line_tag, tag_matches, LineTags, DEFAULT_TAG_WIDTH, MAX_TAG_WIDTH};
 #[doc(inline)]
 pub use journal::{replay, EditOp, FlushPolicy, Journal, Recovered};
 #[doc(inline)]
