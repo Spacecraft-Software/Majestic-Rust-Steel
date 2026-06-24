@@ -16,6 +16,7 @@ members = [
     "crates/oracle",
     "crates/seraph",
     "crates/architect",
+    "crates/majestic-agent",
     "crates/morpheus",
     "crates/majestic-term",
     "crates/majestic-config",
