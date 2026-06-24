@@ -19,6 +19,7 @@ use majestic_config::Config;
 use majestic_core::{Buffer, Editor, Session, Workspace};
 use majestic_steel::Runtime as SteelRuntime;
 
+mod agent_panel;
 #[cfg(unix)]
 mod daemon_host;
 mod tui;

@@ -27,6 +27,8 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
+
+use crate::agent_panel::{AgentPanel, AGENT_COLS};
 use majestic_core::{
     Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
     Occurrence, ProfileSelector, Prompt, References, RenameEdit, Search, Session, SignatureHelp,
@@ -85,6 +87,7 @@ enum Focus {
     Editor,
     Explorer,
     Terminal,
+    Architect,
 }
 
 /// The `Ctrl+B` key toggles the explorer sidebar (VS Code convention).
@@ -218,6 +221,8 @@ struct App {
     /// pressed. A returned reformat is applied only while the buffer is still on this revision, so an
     /// edit made while the request was in flight is never clobbered by stale output.
     format_request: Option<(PathBuf, u64)>,
+    /// The Architect agent sidebar (right of the editor). Hidden until toggled with `Ctrl+Shift+A`.
+    agent: AgentPanel,
     focus: Focus,
 }
 
@@ -248,6 +253,7 @@ impl App {
             lsp: LspManager::with_defaults(),
             lsp_synced: HashMap::new(),
             format_request: None,
+            agent: AgentPanel::new(),
             focus: Focus::Editor,
         }
     }
@@ -545,6 +551,7 @@ impl App {
         surface.clear(theme.base_style());
         let (body, status) = surface.area().split_bottom(1);
         let main = self.render_sidebar(surface, body, theme);
+        let main = self.render_agent_panel(surface, main, theme);
 
         // The region the editor was actually drawn into (none while the Info reader is showing),
         // used to anchor the completion popup at the cursor.
@@ -669,6 +676,27 @@ impl App {
             surface.set_char(divider.x, y, '│', rule);
         }
         main
+    }
+
+    /// Draws the Architect agent sidebar on the right of `body` (when shown) and returns the region to
+    /// its left for the editor + terminal. Mirrors [`Self::render_sidebar`] on the opposite edge.
+    fn render_agent_panel(&self, surface: &mut Buffer, body: Rect, theme: &Theme) -> Rect {
+        if !self.agent.is_visible() {
+            return body;
+        }
+        let agent_cols = AGENT_COLS.min(body.width.saturating_sub(MIN_MAIN_COLS + 1));
+        if agent_cols == 0 {
+            return body; // too narrow to show the panel; keep the full editor area
+        }
+        let (rest, block) = body.split_left(body.width - agent_cols - 1);
+        let (divider, panel) = block.split_left(1);
+        let rule = Style::new(theme.accent, theme.background); // Steel Blue
+        for y in divider.y..divider.bottom() {
+            surface.set_char(divider.x, y, '│', rule);
+        }
+        self.agent
+            .render(surface, panel, theme, self.focus == Focus::Architect);
+        rest
     }
 
     /// Draws the global status bar: the editor's status line plus a focus/terminal hint.
@@ -861,7 +889,12 @@ impl App {
             self.toggle_sidebar();
             return Ok(());
         }
+        if is_agent_toggle(key) {
+            self.toggle_agent();
+            return Ok(());
+        }
         match self.focus {
+            Focus::Architect => self.agent_key(key),
             Focus::Terminal => {
                 if let Some(term) = self.terminal.as_mut() {
                     if let Some(bytes) = encode_key(key) {
@@ -1739,6 +1772,34 @@ impl App {
         }
     }
 
+    /// Toggles the Architect agent sidebar (`Ctrl+Shift+A`): shows and focuses it, hides it when it is
+    /// already focused, or just focuses it when shown but unfocused — mirroring the explorer toggle.
+    fn toggle_agent(&mut self) {
+        if !self.agent.is_visible() {
+            self.agent.toggle();
+            self.focus = Focus::Architect;
+        } else if self.focus == Focus::Architect {
+            self.agent.toggle();
+            self.focus = Focus::Editor;
+        } else {
+            self.focus = Focus::Architect;
+        }
+    }
+
+    /// Routes a key to the agent panel while it is focused. `Esc` returns focus to the editor; a
+    /// submitted message is, for now, echoed with a placeholder note (the live agent wires in next).
+    fn agent_key(&mut self, key: KeyPress) {
+        if key.code == KeyCode::Escape {
+            self.focus = Focus::Editor;
+            return;
+        }
+        if let Some(message) = self.agent.handle_key(key) {
+            self.agent.push_user(message);
+            self.agent
+                .push_system("Agent backend connects in the next change.");
+        }
+    }
+
     /// The directory the fuzzy file finder searches: the explorer root, else the working dir.
     fn project_root(&self) -> PathBuf {
         self.explorer.as_ref().map_or_else(
@@ -2139,6 +2200,13 @@ fn is_command_palette(key: KeyPress) -> bool {
     key.mods.contains(Mods::CTRL)
         && key.mods.contains(Mods::SHIFT)
         && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p'))
+}
+
+/// Whether `key` is the agent-sidebar toggle (`Ctrl+Shift+A`).
+fn is_agent_toggle(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && key.mods.contains(Mods::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a'))
 }
 
 /// Whether `key` is `Shift+Alt+F` (reformat the document — the universal "Format Document"
