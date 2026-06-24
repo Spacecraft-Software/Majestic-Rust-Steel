@@ -11,7 +11,10 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 
+mod session;
 mod tools;
 
 #[doc(inline)]
-pub use tools::BufferTools;
+pub use session::AgentSession;
+#[doc(inline)]
+pub use tools::{buffer_tool_specs, BufferTools};
