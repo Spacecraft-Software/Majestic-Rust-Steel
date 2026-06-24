@@ -6,10 +6,14 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 //!
-//! M3 is landing this crate incrementally; the provider abstraction ([`Provider`]) is in place.
+//! M3 is landing this crate incrementally: the provider abstraction ([`Provider`]) and the governed
+//! agent loop ([`run_turn`]) are in place.
 
+mod agent;
 mod provider;
 
+#[doc(inline)]
+pub use agent::{run_turn, Approver, Governor, Outcome, Tools};
 #[doc(inline)]
 pub use provider::{
     CompletionRequest, CompletionResponse, Message, MockProvider, Provider, ProviderError, Role,
