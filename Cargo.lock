@@ -1745,6 +1745,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "majestic-agent"
+version = "0.0.0"
+dependencies = [
+ "architect",
+ "majestic-core",
+ "seraph",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "majestic-bench"
 version = "0.0.0"
 dependencies = [
