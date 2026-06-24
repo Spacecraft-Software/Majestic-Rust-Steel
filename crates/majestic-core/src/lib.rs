@@ -40,6 +40,7 @@ mod finder;
 mod fold;
 mod fuzzy;
 mod git;
+mod hashline;
 mod hover;
 mod info;
 mod inlay;
@@ -74,6 +75,8 @@ pub use files::FileTree;
 pub use finder::{Action, Finder, HelpOverlay};
 #[doc(inline)]
 pub use fold::FoldRange;
+#[doc(inline)]
+pub use hashline::{apply as apply_hashline, tagged_read, HashlineEdit, HashlineError, LineRef};
 #[doc(inline)]
 pub use hover::Hover;
 #[doc(inline)]
