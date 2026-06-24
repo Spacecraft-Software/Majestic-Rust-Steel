@@ -7,9 +7,13 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 //!
-//! M3 is landing this crate incrementally; the audit log is in place ([`AuditLog`]).
+//! M3 is landing this crate incrementally: the [`AuditLog`] and the fail-closed policy engine
+//! ([`Policy::decide`]) are in place.
 
 mod audit;
+mod policy;
 
 #[doc(inline)]
 pub use audit::{AuditEntry, AuditLog};
+#[doc(inline)]
+pub use policy::{AgentAction, Decision, Policy};
