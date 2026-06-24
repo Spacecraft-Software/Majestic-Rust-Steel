@@ -1756,6 +1756,7 @@ name = "majestic-config"
 version = "0.0.0"
 dependencies = [
  "nickel-lang-core",
+ "seraph",
  "serde",
 ]
 
