@@ -25,4 +25,16 @@
   extensions
     | { _ : { version | String, enabled | Bool | default = true, source | String | optional } }
     | default = {},
+
+  # Seraph agent-governance policy (PRD #1 §5.2.4) — declarative and FAIL-CLOSED. Every omitted field
+  # takes its closed default: empty `network_allowlist` / `shell_allowlist` means no network and no
+  # shell; `edits_need_approval` true means the agent can never apply an edit the user did not see.
+  # The user widens these explicitly (e.g. allow-listing program names); extensions may only tighten.
+  seraph
+    | {
+      network_allowlist | Array String | default = [],
+      shell_allowlist | Array String | default = [],
+      edits_need_approval | Bool | default = true,
+    }
+    | default = {},
 }

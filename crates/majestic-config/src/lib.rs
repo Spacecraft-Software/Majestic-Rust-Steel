@@ -45,6 +45,10 @@ pub struct Config {
     /// Manifest-pinned extensions, keyed by name. Each declares an exact pinned `version`; the host
     /// loads the enabled ones (in name order) and verifies the pin. Empty by default.
     pub extensions: BTreeMap<String, ExtensionSpec>,
+    /// The Seraph agent-governance policy (PRD #1 §5.2.4) — declarative and fail-closed. Omitted, it
+    /// is the closed default: no network, no shell, edits require approval. The host hands this to
+    /// Seraph as the only source of agent permissions (extensions may tighten it, never loosen it).
+    pub seraph: seraph::Policy,
 }
 
 impl Default for Config {
@@ -54,6 +58,7 @@ impl Default for Config {
             keymap: "cua".to_owned(),
             tab_width: DEFAULT_TAB_WIDTH,
             extensions: BTreeMap::new(),
+            seraph: seraph::Policy::default(),
         }
     }
 }
@@ -224,6 +229,7 @@ mod tests {
     use std::path::Path;
 
     use super::{write_keymap_to, Config, ConfigError, ExtensionSpec};
+    use seraph::{AgentAction, Decision};
 
     #[test]
     fn empty_manifest_yields_defaults() {
@@ -355,5 +361,57 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.keymap, "vim");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn seraph_policy_defaults_to_fail_closed() {
+        // An empty manifest yields the closed default: edits need approval, shell + network denied.
+        let config = Config::load_str("{}").unwrap();
+        assert_eq!(config.seraph, seraph::Policy::default());
+        assert_eq!(
+            config.seraph.decide(&AgentAction::Edit),
+            Decision::NeedsApproval
+        );
+        assert!(config
+            .seraph
+            .decide(&AgentAction::Shell {
+                command: "cargo test".to_owned()
+            })
+            .is_denied());
+    }
+
+    #[test]
+    fn seraph_section_drives_the_policy() {
+        // The manifest's `seraph` allow-lists flow straight into the policy that gates the agent.
+        let config = Config::load_str(
+            r#"{
+                seraph = {
+                    shell_allowlist = ["cargo", "git"],
+                    network_allowlist = ["api.github.com"],
+                    edits_need_approval = false,
+                },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.seraph.decide(&AgentAction::Edit), Decision::Allow);
+        assert_eq!(
+            config.seraph.decide(&AgentAction::Shell {
+                command: "cargo build".to_owned()
+            }),
+            Decision::NeedsApproval
+        );
+        assert_eq!(
+            config.seraph.decide(&AgentAction::Network {
+                host: "api.github.com".to_owned()
+            }),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn unknown_seraph_field_is_rejected() {
+        // A typo inside the `seraph` section is caught (Nickel contract + serde deny_unknown_fields).
+        let error = Config::load_str(r#"{ seraph = { shel_allowlist = ["cargo"] } }"#).unwrap_err();
+        assert!(matches!(error, ConfigError::Evaluate(_)));
     }
 }
