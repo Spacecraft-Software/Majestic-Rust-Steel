@@ -14,17 +14,20 @@
 //! - **Minimal environment.** The child inherits none of the parent's environment except a short safe
 //!   set (`PATH`, `HOME`, `LANG`, `TERM`), so secrets in the environment are not exposed.
 //! - **Working-directory confinement.** The child runs in the configured project root.
+//! - **Resource limits.** When `prlimit` (util-linux) is on `PATH`, the command runs through it so the
+//!   kernel caps its CPU time and written-file size and disables core dumps. Concept #1 forbids
+//!   `unsafe` (PRD §6.1, `#![deny(unsafe_code)]`, no exceptions), so Seraph cannot call `setrlimit`
+//!   itself (that needs `pre_exec`); delegating to `prlimit` keeps the syscalls inside a vetted
+//!   external tool. Where `prlimit` is absent, the limits are simply not applied (see [`Sandbox::resource_limited`]).
 //! - **Wall-clock timeout.** The child runs in its own process group; on overrun the whole group (the
 //!   command and any children it spawned) is killed (`nix`'s safe `killpg`).
 //! - **Bounded output.** stdout/stderr are drained on reader threads and truncated to a cap, so a
 //!   chatty command can neither exhaust memory nor deadlock on a full pipe.
 //!
-//! This is **defense-in-depth process confinement, not a hard security boundary**. Concept #1 forbids
-//! `unsafe` (PRD §6.1, `#![deny(unsafe_code)]` with no exceptions), so the sandbox uses no FFI: there
-//! are deliberately **no `setrlimit` resource caps** (that needs `pre_exec`, which is `unsafe`) and no
-//! namespaces or seccomp. An allowed program can still reach the filesystem and the network and use
-//! resources up to the timeout. The real gate stays the allow-list plus the human approving each
-//! command; OS-level isolation (likely via a separate privileged helper) is future hardening.
+//! This is **defense-in-depth process confinement, not a hard security boundary**: it does not use
+//! namespaces or seccomp, so an allowed program can still reach the filesystem and the network. The
+//! real gate stays the allow-list plus the human approving each command; filesystem/network isolation
+//! (via a tool such as `bwrap`/`unshare`) is the next layer.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -37,6 +40,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default cap on captured stdout/stderr (bytes each), so a chatty command can't exhaust memory.
 pub const DEFAULT_OUTPUT_CAP: usize = 64 * 1024;
+
+/// Default CPU-time cap (seconds) applied via `prlimit` when available.
+const DEFAULT_CPU_LIMIT_SECS: u64 = 120;
+
+/// Default written-file-size cap (bytes) applied via `prlimit` when available.
+const DEFAULT_FSIZE_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Why a command could not be *run* (distinct from running and exiting non-zero).
 #[derive(Debug)]
@@ -77,16 +86,23 @@ pub struct Sandbox {
     workdir: PathBuf,
     timeout: Duration,
     output_cap: usize,
+    cpu_limit_secs: u64,
+    fsize_limit_bytes: u64,
+    hardening: Hardening,
 }
 
 impl Sandbox {
-    /// A sandbox that runs commands in `workdir` with the default timeout and output cap.
+    /// A sandbox that runs commands in `workdir` with the default timeout, output cap, and (when the
+    /// tooling is present) resource limits.
     #[must_use]
     pub fn new(workdir: impl Into<PathBuf>) -> Self {
         Self {
             workdir: workdir.into(),
             timeout: DEFAULT_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
+            cpu_limit_secs: DEFAULT_CPU_LIMIT_SECS,
+            fsize_limit_bytes: DEFAULT_FSIZE_LIMIT_BYTES,
+            hardening: Hardening::detect(),
         }
     }
 
@@ -104,6 +120,19 @@ impl Sandbox {
         self
     }
 
+    /// Sets the CPU-time cap (seconds) applied when resource limits are available.
+    #[must_use]
+    pub fn with_cpu_limit_secs(mut self, secs: u64) -> Self {
+        self.cpu_limit_secs = secs;
+        self
+    }
+
+    /// Whether the sandbox can apply kernel resource limits (i.e. `prlimit` was found on `PATH`).
+    #[must_use]
+    pub fn resource_limited(&self) -> bool {
+        self.hardening.limits_resources()
+    }
+
     /// Runs `command` under the sandbox and returns its captured output.
     ///
     /// # Errors
@@ -116,9 +145,10 @@ impl Sandbox {
             return Err(ShellError::Unparseable);
         }
 
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(&self.workdir)
+        let mut cmd =
+            self.hardening
+                .command(program, args, self.cpu_limit_secs, self.fsize_limit_bytes);
+        cmd.current_dir(&self.workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -157,6 +187,57 @@ impl Sandbox {
             timed_out,
         })
     }
+}
+
+/// Detected resource-limit tooling. Concept #1 forbids `unsafe`, so Seraph cannot `setrlimit` itself;
+/// when `prlimit` (util-linux) is present, the command runs through it instead, keeping the syscalls
+/// inside that vetted external tool.
+#[derive(Clone, Debug)]
+struct Hardening {
+    /// The `prlimit` binary, if found on `PATH`. `None` means resource limits are not applied.
+    prlimit: Option<PathBuf>,
+}
+
+impl Hardening {
+    /// Looks up the limiting tools once (at [`Sandbox`] construction).
+    fn detect() -> Self {
+        Self {
+            prlimit: find_on_path("prlimit"),
+        }
+    }
+
+    /// Whether kernel resource limits will be applied to commands.
+    fn limits_resources(&self) -> bool {
+        self.prlimit.is_some()
+    }
+
+    /// The [`Command`] to spawn for `program` + `args`: prefixed with `prlimit` (CPU time, written-file
+    /// size, no core dumps) when available, otherwise the program run directly.
+    fn command(&self, program: &str, args: &[String], cpu_secs: u64, fsize_bytes: u64) -> Command {
+        let Some(prlimit) = &self.prlimit else {
+            // No `prlimit`: run the program directly (no resource limits).
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            return cmd;
+        };
+        let mut cmd = Command::new(prlimit);
+        cmd.arg(format!("--cpu={cpu_secs}"))
+            .arg(format!("--fsize={fsize_bytes}"))
+            .arg("--core=0")
+            .arg("--")
+            .arg(program)
+            .args(args);
+        cmd
+    }
+}
+
+/// Finds `name` on `PATH`, returning the first existing match (so the sandbox can detect optional
+/// tools like `prlimit` without shelling out to `which`).
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Replaces the child's environment with a minimal safe set: the parent's `PATH`/`HOME` (so tools
@@ -266,9 +347,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_program_is_a_spawn_error() {
-        let result = sandbox().run("seraph-no-such-program-xyz");
-        assert!(matches!(result, Err(ShellError::Spawn(_))));
+    fn a_missing_program_fails() {
+        // Run directly, a missing program is a Spawn error. Wrapped in `prlimit`, the wrapper spawns
+        // fine and reports the failure as a non-zero exit instead — either way the command did not run.
+        match sandbox().run("seraph-no-such-program-xyz") {
+            Err(ShellError::Spawn(_)) => {}
+            Ok(output) => assert_ne!(output.exit_code, Some(0), "the missing program must fail"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -307,6 +393,35 @@ mod tests {
             !output.stdout.contains("leak-me"),
             "the parent environment leaked into the sandbox: {}",
             output.stdout
+        );
+    }
+
+    #[test]
+    fn find_on_path_locates_a_known_program_and_rejects_a_bogus_one() {
+        assert!(
+            super::find_on_path("sh").is_some(),
+            "`sh` is on every unix PATH"
+        );
+        assert!(super::find_on_path("seraph-definitely-no-such-tool").is_none());
+    }
+
+    #[test]
+    fn resource_limits_cap_cpu_time_when_prlimit_is_available() {
+        let sandbox = Sandbox::new(std::env::temp_dir())
+            .with_cpu_limit_secs(1)
+            .with_timeout(Duration::from_secs(30));
+        if !sandbox.resource_limited() {
+            return; // `prlimit` not installed — the limit cannot be applied, nothing to assert
+        }
+        // `yes` burns CPU forever; the 1-second CPU rlimit (not our 30-second wall timeout) ends it.
+        let output = sandbox.run("yes").expect("yes spawns");
+        assert!(
+            !output.timed_out,
+            "the CPU limit, not the wall timeout, should have stopped it"
+        );
+        assert_eq!(
+            output.exit_code, None,
+            "killed by a signal, so there is no exit code"
         );
     }
 }
