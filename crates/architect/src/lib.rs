@@ -15,7 +15,7 @@ mod http;
 mod provider;
 
 #[doc(inline)]
-pub use agent::{run_turn, Approver, Governor, Outcome, Tools};
+pub use agent::{run_turn, run_turn_streaming, Approver, Governor, Outcome, Tools};
 #[cfg(feature = "http-provider")]
 #[doc(inline)]
 pub use http::HttpProvider;

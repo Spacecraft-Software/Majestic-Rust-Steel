@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::thread;
 
 use architect::{
-    run_turn, Approver, CompletionRequest, Governor, Outcome, Provider, ToolCall, Tools,
+    run_turn_streaming, Approver, CompletionRequest, Governor, Outcome, Provider, ToolCall, Tools,
 };
 use seraph::{AgentAction, AuditLog, KillSwitch, Policy};
 
@@ -62,6 +62,9 @@ pub enum AgentEvent {
         /// The channel to send the user's yes/no back on.
         reply: Sender<bool>,
     },
+    /// A chunk of assistant text streamed from the model, to append to the transcript live. Requires
+    /// no reply — the host appends and keeps polling.
+    Token(String),
     /// The turn ended. Carries how it ended and the audit log of every gated decision in it.
     Finished {
         /// How the turn ended.
@@ -107,9 +110,14 @@ impl AgentRunner {
                     events: events.clone(),
                 };
                 let mut audit = AuditLog::new();
+                // Stream assistant text back as it arrives, so the panel renders the reply live.
+                let token_events = events.clone();
+                let mut on_token = move |chunk: &str| {
+                    let _ = token_events.send(AgentEvent::Token(chunk.to_owned()));
+                };
                 let outcome = {
                     let mut governor = Governor::new(&policy, &mut audit, &worker_kill);
-                    run_turn(
+                    run_turn_streaming(
                         provider.as_ref(),
                         &mut tools,
                         &mut approver,
@@ -117,6 +125,7 @@ impl AgentRunner {
                         jiff::Timestamp::now,
                         request,
                         max_steps,
+                        &mut on_token,
                     )
                 };
                 // Best-effort: if the host dropped the runner, the receiver is gone and this just fails.
@@ -275,6 +284,7 @@ mod tests {
                 Some(AgentEvent::Approve { reply, .. }) => {
                     let _ = reply.send(approve);
                 }
+                Some(AgentEvent::Token(_)) => {} // streamed text: nothing to service in this harness
                 Some(AgentEvent::Finished { outcome, .. }) => return outcome,
                 None => thread::yield_now(),
             }
@@ -415,6 +425,7 @@ mod tests {
                 Some(AgentEvent::Approve { reply, .. }) => {
                     let _ = reply.send(true);
                 }
+                Some(AgentEvent::Token(_)) => {}
                 Some(AgentEvent::Finished { outcome, .. }) => break outcome,
                 None => thread::yield_now(),
             }
@@ -425,6 +436,36 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(100),
             "agent-stop-all must halt within 100 ms; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_tokens_reach_the_host() {
+        // A text-only turn: the worker forwards the reply as Token events before Finished, and they
+        // reassemble to the final answer.
+        let provider = MockProvider::new([CompletionResponse::text("streamed reply")]);
+        let runner = AgentRunner::spawn(
+            Arc::new(provider),
+            Policy::default(),
+            KillSwitch::new(),
+            request("hi"),
+            8,
+        );
+
+        let mut tokens = String::new();
+        let outcome = loop {
+            match runner.poll() {
+                Some(AgentEvent::Token(chunk)) => tokens.push_str(&chunk),
+                Some(AgentEvent::Finished { outcome, .. }) => break outcome,
+                Some(_) => {} // no tool/approval events in a single-text turn
+                None => thread::yield_now(),
+            }
+        };
+
+        assert_eq!(outcome, Outcome::Done("streamed reply".to_owned()));
+        assert_eq!(
+            tokens, "streamed reply",
+            "streamed tokens reassemble to the reply"
         );
     }
 }

@@ -46,6 +46,9 @@ pub struct AgentPanel {
     visible: bool,
     lines: Vec<ChatLine>,
     input: String,
+    /// Whether the last transcript line is an in-progress streamed agent reply that
+    /// [`Self::stream_token`] should append to. Reset by any explicit push or [`Self::end_stream`].
+    streaming: bool,
 }
 
 impl AgentPanel {
@@ -69,6 +72,7 @@ impl AgentPanel {
 
     /// Appends a line authored by the user.
     pub fn push_user(&mut self, text: impl Into<String>) {
+        self.streaming = false;
         self.lines.push(ChatLine {
             speaker: Speaker::User,
             text: text.into(),
@@ -78,15 +82,38 @@ impl AgentPanel {
     /// Appends a line authored by the agent.
     #[cfg(feature = "agent")]
     pub fn push_agent(&mut self, text: impl Into<String>) {
+        self.streaming = false;
         self.lines.push(ChatLine {
             speaker: Speaker::Agent,
             text: text.into(),
         });
     }
 
+    /// Appends a chunk of streamed assistant text: starts a new agent line on the first token of a
+    /// reply, then grows that same line as more tokens arrive (until any other push or
+    /// [`Self::end_stream`]).
+    #[cfg(feature = "agent")]
+    pub fn stream_token(&mut self, text: &str) {
+        if self.streaming {
+            if let Some(line) = self.lines.last_mut() {
+                line.text.push_str(text);
+                return;
+            }
+        }
+        self.push_agent(text); // resets `streaming`, so re-arm it for subsequent tokens
+        self.streaming = true;
+    }
+
+    /// Marks the current streamed reply complete, so the next token starts a fresh line.
+    #[cfg(feature = "agent")]
+    pub fn end_stream(&mut self) {
+        self.streaming = false;
+    }
+
     /// Appends a removed (old) line of a proposed edit's diff.
     #[cfg(feature = "agent")]
     pub fn push_diff_removed(&mut self, text: impl Into<String>) {
+        self.streaming = false;
         self.lines.push(ChatLine {
             speaker: Speaker::DiffRemoved,
             text: text.into(),
@@ -96,6 +123,7 @@ impl AgentPanel {
     /// Appends an added (new) line of a proposed edit's diff.
     #[cfg(feature = "agent")]
     pub fn push_diff_added(&mut self, text: impl Into<String>) {
+        self.streaming = false;
         self.lines.push(ChatLine {
             speaker: Speaker::DiffAdded,
             text: text.into(),
@@ -104,6 +132,7 @@ impl AgentPanel {
 
     /// Appends a system note (status, errors, placeholders).
     pub fn push_system(&mut self, text: impl Into<String>) {
+        self.streaming = false;
         self.lines.push(ChatLine {
             speaker: Speaker::System,
             text: text.into(),

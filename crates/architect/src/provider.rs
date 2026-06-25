@@ -205,6 +205,25 @@ pub trait Provider: Send + Sync + fmt::Debug {
     /// # Errors
     /// Returns a [`ProviderError`] if the backend fails or has no further output.
     fn complete(&self, request: &CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+
+    /// Like [`Self::complete`], but calls `on_token` with each chunk of assistant text as it arrives,
+    /// returning the fully assembled reply at the end. The default is non-streaming — it calls
+    /// `complete` and emits the whole content once — so every provider works; streaming backends
+    /// (e.g. [`HttpProvider`](crate::HttpProvider)) override this to deliver tokens live.
+    ///
+    /// # Errors
+    /// Returns a [`ProviderError`] if the backend fails or has no further output.
+    fn complete_streaming(
+        &self,
+        request: &CompletionRequest,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<CompletionResponse, ProviderError> {
+        let response = self.complete(request)?;
+        if !response.content.is_empty() {
+            on_token(&response.content);
+        }
+        Ok(response)
+    }
 }
 
 /// A scripted [`Provider`] for tests and offline runs: it hands back queued responses in order and
