@@ -43,6 +43,13 @@ use penumbra::{Buffer, Rect, Screen, Style, Theme};
 /// The `F12` key spawns/toggles the integrated terminal (reassignable once the Architect lands at M3).
 const TERMINAL_TOGGLE: KeyCode = KeyCode::Function(12);
 
+/// ``Ctrl+` `` drops down the Warp-style **Architect** terminal pane: the same shell as the bottom panel,
+/// but from the top, with `Tab` flipping the input line into natural-language `Architect` mode.
+const ARCHITECT_TERMINAL_TOGGLE: KeyPress = KeyPress::ctrl('`');
+
+/// Default height of the Architect drop-down terminal in rows (header + shell grid + an NL input row).
+const ARCHITECT_TERMINAL_ROWS: u16 = 12;
+
 /// Default height of the bottom terminal panel in rows (UI.md §5: 8–15, resizable later).
 const PANEL_ROWS: u16 = 10;
 
@@ -90,6 +97,7 @@ enum Focus {
     Explorer,
     Terminal,
     Architect,
+    ArchitectTerminal,
 }
 
 /// The `Ctrl+B` key toggles the explorer sidebar (VS Code convention).
@@ -185,6 +193,13 @@ struct App {
     explorer: Option<FileTree>,
     sidebar_visible: bool,
     terminal: Option<PtyTerminal>,
+    /// Whether the Architect drop-down terminal pane is shown (over the top of the editor).
+    architect_terminal_visible: bool,
+    /// In the Architect terminal, whether the input line is in natural-language `Architect` mode (`Tab`) rather
+    /// than feeding the shell. Always `false` in a build without the `agent` feature.
+    architect_terminal_nl: bool,
+    /// The in-progress natural-language line typed in the Architect terminal's NL mode.
+    architect_terminal_input: String,
     finder: Option<Finder>,
     help: Option<HelpOverlay>,
     info: Option<InfoReader>,
@@ -247,6 +262,9 @@ impl App {
             explorer: None,
             sidebar_visible: false,
             terminal: None,
+            architect_terminal_visible: false,
+            architect_terminal_nl: false,
+            architect_terminal_input: String::new(),
             finder: None,
             help: None,
             info: None,
@@ -547,6 +565,7 @@ impl App {
             .is_some_and(|term| !term.is_running())
         {
             self.terminal = None;
+            self.architect_terminal_visible = false;
             self.focus = Focus::Editor;
         }
     }
@@ -576,6 +595,12 @@ impl App {
         if let Some(info) = self.info.as_mut() {
             // The Info reader takes over the editor region (the sidebar + status bar remain).
             info.render(surface, main, theme);
+        } else if self.architect_terminal_visible
+            && self.terminal.is_some()
+            && main.height > MIN_EDITOR_ROWS + 3
+        {
+            // The Architect terminal drops down across the top; the editor takes the rest.
+            editor_rect = Some(self.render_architect_terminal(surface, main, theme));
         } else if self.terminal.is_some() && main.height > MIN_EDITOR_ROWS + 1 {
             let panel_rows = PANEL_ROWS.min(main.height - (MIN_EDITOR_ROWS + 1));
             let (editor_area, block) = main.split_bottom(panel_rows + 1);
@@ -715,6 +740,51 @@ impl App {
         rest
     }
 
+    /// Draws the Architect drop-down terminal across the top of `main` — a header row, the shell grid, and
+    /// (in NL mode) a natural-language input row — with the editor below it. Returns the editor region.
+    fn render_architect_terminal(&mut self, surface: &mut Buffer, main: Rect, theme: &Theme) -> Rect {
+        let pane_rows = ARCHITECT_TERMINAL_ROWS.min(main.height - (MIN_EDITOR_ROWS + 1));
+        let (block, editor_area) = main.split_top(pane_rows);
+        let focused = self.focus == Focus::ArchitectTerminal;
+        let (header, body) = block.split_top(1);
+        // In NL mode the last row of the pane is the natural-language input line.
+        let (term_area, input_area) = if self.architect_terminal_nl {
+            let (term_area, input_area) = body.split_bottom(1);
+            (term_area, Some(input_area))
+        } else {
+            (body, None)
+        };
+
+        // Keep the shell sized to its grid so what we draw matches the PTY.
+        if let Some(term) = self.terminal.as_mut() {
+            if term.columns() != usize::from(term_area.width)
+                || term.screen_lines() != usize::from(term_area.height)
+            {
+                term.resize(usize::from(term_area.width), usize::from(term_area.height));
+            }
+        }
+
+        draw_architect_terminal_header(
+            surface,
+            header,
+            theme,
+            focused,
+            self.architect_terminal_nl,
+            cfg!(feature = "agent"),
+        );
+        if let Some(term) = self.terminal.as_ref() {
+            // The shell shows its cursor only when the pane is focused *and* in shell mode.
+            term.render_in(surface, term_area, theme, focused && !self.architect_terminal_nl);
+        }
+        if let Some(input) = input_area {
+            draw_architect_terminal_input(surface, input, theme, &self.architect_terminal_input, focused);
+        }
+
+        self.workspace
+            .render(surface, editor_area, theme, self.focus == Focus::Editor);
+        editor_area
+    }
+
     /// Draws the global status bar: the editor's status line plus a focus/terminal hint.
     fn draw_status_bar(&self, surface: &mut Buffer, row: u16, theme: &Theme) {
         let style = Style::new(theme.background, theme.accent);
@@ -727,14 +797,20 @@ impl App {
             .unwrap_or_else(|| self.workspace.status_line());
         surface.set_str(0, row, &left, style);
 
-        let hint = if self.terminal.is_some() {
-            if self.focus == Focus::Terminal {
-                "[F1 help · F12 ⇄ EDITOR · Ctrl+B files]"
+        let hint = if self.focus == Focus::ArchitectTerminal {
+            if cfg!(feature = "agent") {
+                "[F1 help · Ctrl+` ⇄ EDITOR · Tab shell/NL · F12 terminal]"
             } else {
-                "[F1 help · F12 ⇄ TERMINAL · Ctrl+B files]"
+                "[F1 help · Ctrl+` ⇄ EDITOR · F12 terminal]"
+            }
+        } else if self.terminal.is_some() {
+            if self.focus == Focus::Terminal {
+                "[F1 help · F12 ⇄ EDITOR · Ctrl+` architect · Ctrl+B files]"
+            } else {
+                "[F1 help · F12 ⇄ TERMINAL · Ctrl+` architect · Ctrl+B files]"
             }
         } else {
-            "[F1 help · F12 terminal · Ctrl+B files]"
+            "[F1 help · F12 terminal · Ctrl+` architect · Ctrl+B files]"
         };
         // Right-aligned cluster: the active buffer's LSP server health (when one is configured),
         // then the key hint.
@@ -901,6 +977,10 @@ impl App {
             self.toggle_terminal(columns, lines);
             return Ok(());
         }
+        if key == ARCHITECT_TERMINAL_TOGGLE {
+            self.toggle_architect_terminal(columns, lines);
+            return Ok(());
+        }
         if key == SIDEBAR_TOGGLE {
             self.toggle_sidebar();
             return Ok(());
@@ -917,6 +997,7 @@ impl App {
                     }
                 }
             }
+            Focus::ArchitectTerminal => self.architect_terminal_key(key)?,
             Focus::Explorer => self.explorer_key(key),
             Focus::Editor => {
                 self.workspace.handle_key(key);
@@ -1792,7 +1873,7 @@ impl App {
     }
 
     /// Dispatches the agent control keys: toggle the panel (`Ctrl+Shift+A`), stop the agent
-    /// (`Ctrl+Shift+K`), or open the quake "Ask Architect" prompt (`Ctrl+Shift+N`). Returns `true` when
+    /// (`Ctrl+Shift+K`), or open the "Ask Architect" prompt (`Ctrl+Shift+N`). Returns `true` when
     /// `key` triggered one (the caller then returns). Kept out of `handle_key` for its line budget.
     fn try_agent_key(&mut self, key: KeyPress) -> bool {
         if is_agent_toggle(key) {
@@ -1825,7 +1906,7 @@ impl App {
         }
     }
 
-    /// Opens the quake "Ask Architect" minibuffer (`Ctrl+Shift+N`): a one-line natural-language request
+    /// Opens the "Ask Architect" minibuffer (`Ctrl+Shift+N`): a one-line natural-language request
     /// that starts an agent turn from anywhere, without first focusing the sidebar.
     #[cfg(feature = "agent")]
     fn open_agent_prompt(&mut self) {
@@ -1833,7 +1914,7 @@ impl App {
         self.prompt_action = Some(PromptAction::AskAgent);
     }
 
-    /// Starts an agent turn from the quake prompt: shows and focuses the panel and submits `message`,
+    /// Starts an agent turn from the Ask-Architect prompt: shows and focuses the panel and submits `message`,
     /// so the streaming reply (and any approval prompt) lands in the now-visible sidebar.
     #[cfg(feature = "agent")]
     fn ask_agent(&mut self, message: &str) {
@@ -2138,6 +2219,76 @@ impl App {
             Focus::Editor
         };
     }
+
+    /// Toggles the Warp-style Architect drop-down terminal (``Ctrl+` ``): (re)spawns a shell if needed, shows
+    /// the pane across the top, and focuses it. Toggling again hides it and returns focus to the editor.
+    fn toggle_architect_terminal(&mut self, columns: u16, lines: u16) {
+        if self.architect_terminal_visible {
+            self.architect_terminal_visible = false;
+            if self.focus == Focus::ArchitectTerminal {
+                self.focus = Focus::Editor;
+            }
+            return;
+        }
+        if self.terminal.is_none() {
+            self.terminal = PtyTerminal::spawn(usize::from(columns), usize::from(lines)).ok();
+        }
+        if self.terminal.is_some() {
+            self.architect_terminal_visible = true;
+            self.architect_terminal_nl = false;
+            self.focus = Focus::ArchitectTerminal;
+        }
+    }
+
+    /// Routes a key to the focused Architect terminal. In shell mode every key is forwarded to the PTY (like the
+    /// bottom terminal); `Tab` flips into natural-language mode (agent builds only). Closing is ``Ctrl+` ``.
+    fn architect_terminal_key(&mut self, key: KeyPress) -> io::Result<()> {
+        #[cfg(feature = "agent")]
+        if self.architect_terminal_nl {
+            self.architect_terminal_nl_key(key);
+            return Ok(());
+        }
+        #[cfg(feature = "agent")]
+        if key.code == KeyCode::Tab {
+            // Flip the input line into natural-language mode: the next Enter asks the Architect.
+            self.architect_terminal_nl = true;
+            self.architect_terminal_input.clear();
+            return Ok(());
+        }
+        if let Some(term) = self.terminal.as_mut() {
+            if let Some(bytes) = encode_key(key) {
+                term.write_input(&bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Edits the Architect terminal's natural-language line. `Tab`/`Esc` cancel back to the shell; `Enter` hands
+    /// the line to the governed agent (the streamed reply and any approval land in the Architect sidebar).
+    #[cfg(feature = "agent")]
+    fn architect_terminal_nl_key(&mut self, key: KeyPress) {
+        match key.code {
+            KeyCode::Tab | KeyCode::Escape => {
+                self.architect_terminal_nl = false;
+                self.architect_terminal_input.clear();
+            }
+            KeyCode::Enter => {
+                let line = self.architect_terminal_input.trim().to_owned();
+                self.architect_terminal_input.clear();
+                self.architect_terminal_nl = false;
+                if !line.is_empty() {
+                    self.ask_agent(&line);
+                }
+            }
+            KeyCode::Backspace => {
+                self.architect_terminal_input.pop();
+            }
+            KeyCode::Char(c) if !key.mods.contains(Mods::CTRL) && !key.mods.contains(Mods::ALT) => {
+                self.architect_terminal_input.push(c);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Draws the terminal panel's tabbed divider row: a Steel Blue rule with a `TERMINAL` tab,
@@ -2156,6 +2307,60 @@ fn draw_panel_tab(surface: &mut Buffer, area: Rect, theme: &Theme, focused: bool
         rule
     };
     surface.set_str(area.x.saturating_add(1), area.y, " TERMINAL ", label_style);
+}
+
+/// Draws the Architect terminal's header rule with a tab that names the current input mode and its
+/// toggle: `ARCHITECT · shell (Tab: NL)` while feeding the shell, `ARCHITECT · NL prompt (Tab: shell)`
+/// while typing a natural-language request. Without the `agent` feature (`nl_available = false`) it is
+/// a plain shell, so the tab is just `ARCHITECT · shell`. Reverse-highlighted when the pane is focused.
+fn draw_architect_terminal_header(
+    surface: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+    nl_mode: bool,
+    nl_available: bool,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let rule = Style::new(theme.accent, theme.background); // Steel Blue on Void Navy
+    for x in area.x..area.right() {
+        surface.set_char(x, area.y, '─', rule);
+    }
+    let label_style = if focused {
+        Style::new(theme.background, theme.accent) // active tab: Void Navy on Steel Blue
+    } else {
+        rule
+    };
+    let tab = if !nl_available {
+        " ARCHITECT · shell "
+    } else if nl_mode {
+        " ARCHITECT · NL prompt (Tab: shell) "
+    } else {
+        " ARCHITECT · shell (Tab: NL) "
+    };
+    surface.set_str(area.x.saturating_add(1), area.y, tab, label_style);
+}
+
+/// Draws the Architect terminal's natural-language input row: a `›` prompt and the typed text, truncated to the
+/// row. Drawn only while the pane is in NL mode.
+fn draw_architect_terminal_input(surface: &mut Buffer, area: Rect, theme: &Theme, input: &str, focused: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let text_style = if focused {
+        theme.base_style()
+    } else {
+        Style::new(theme.accent, theme.background)
+    };
+    for x in area.x..area.right() {
+        surface.set_char(x, area.y, ' ', text_style);
+    }
+    surface.set_str(area.x, area.y, "› ", Style::new(theme.info, theme.background));
+    let avail = usize::from(area.width.saturating_sub(2));
+    let shown: String = input.chars().take(avail).collect();
+    surface.set_str(area.x.saturating_add(2), area.y, &shown, text_style);
 }
 
 /// A headless editor session the daemon drives over a socket.
@@ -2363,7 +2568,7 @@ fn is_agent_stop(key: KeyPress) -> bool {
         && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k'))
 }
 
-/// Whether `key` is the quake "Ask Architect" NL-prompt key (`Ctrl+Shift+N`).
+/// Whether `key` is the "Ask Architect" NL-prompt key (`Ctrl+Shift+N`).
 #[cfg(feature = "agent")]
 fn is_agent_prompt(key: KeyPress) -> bool {
     key.mods.contains(Mods::CTRL)
@@ -2655,6 +2860,30 @@ mod tests {
             GOTO_DEF_KEY.mods.contains(Mods::CTRL),
             "goto-definition now requires Ctrl so it does not shadow the terminal toggle"
         );
+    }
+
+    #[test]
+    fn architect_terminal_toggle_is_ctrl_backtick() {
+        // The Architect drop-down terminal is bound to Ctrl+` (the classic drop-down-terminal key, as in VS Code).
+        assert_eq!(super::ARCHITECT_TERMINAL_TOGGLE, KeyPress::ctrl('`'));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn architect_terminal_nl_edits_the_line_then_tab_returns_to_the_shell() {
+        // In the Architect terminal's natural-language mode, typing extends the line, Backspace trims it, and
+        // Tab cancels back to feeding the shell (clearing the line). No PTY or agent turn involved.
+        let mut app = App::new(Workspace::new(Editor::new()));
+        app.architect_terminal_nl = true;
+        for c in "fix it".chars() {
+            app.architect_terminal_nl_key(KeyPress::char(c));
+        }
+        assert_eq!(app.architect_terminal_input, "fix it");
+        app.architect_terminal_nl_key(KeyPress::key(KeyCode::Backspace));
+        assert_eq!(app.architect_terminal_input, "fix i");
+        app.architect_terminal_nl_key(KeyPress::key(KeyCode::Tab));
+        assert!(!app.architect_terminal_nl, "Tab returns to shell input");
+        assert!(app.architect_terminal_input.is_empty(), "the NL line is cleared");
     }
 
     #[test]
