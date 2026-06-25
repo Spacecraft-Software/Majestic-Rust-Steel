@@ -436,4 +436,109 @@ mod tests {
         assert_eq!(outcome, Outcome::BudgetExhausted);
         assert_eq!(provider.requests().len(), 2, "exactly max_steps rounds ran");
     }
+
+    // ── M3 exit criteria ───────────────────────────────────────────────────────────────────────
+    // These two tests are the governance bar for M3: no guarded agent action reaches `Tools::run`
+    // except through Seraph, and the audit log records every decision so the run is reconstructable.
+
+    /// A tool surface that classifies by tool name and records every call that actually reaches
+    /// [`Tools::run`], so a test can prove a denied or rejected call never executed.
+    struct ClassifyingTools {
+        ran: Vec<String>,
+    }
+
+    impl Tools for ClassifyingTools {
+        fn action(&self, call: &ToolCall) -> AgentAction {
+            match call.name.as_str() {
+                "edit" => AgentAction::Edit,
+                "shell" => AgentAction::Shell {
+                    command: "rm -rf /".to_owned(),
+                },
+                _ => AgentAction::ReadPath {
+                    path: PathBuf::from("f.rs"),
+                },
+            }
+        }
+        fn run(&mut self, call: &ToolCall) -> Result<String, String> {
+            self.ran.push(call.name.clone());
+            Ok(format!("ran {}", call.name))
+        }
+    }
+
+    #[test]
+    fn red_team_no_guarded_action_bypasses_the_gate() {
+        // An adversarial model fires a barrage of guarded calls across rounds. Seraph gates by ACTION
+        // classification, not by anything the model or a tool result says, so no amount of model
+        // misbehaviour (the moral equivalent of prompt injection) can run a denied or rejected call.
+        // Default policy: `shell` denied, `edit` needs approval (the approver rejects every one),
+        // `read` allowed. Only the reads may ever reach `run`.
+        let provider = MockProvider::new([
+            CompletionResponse::calling("", vec![call("shell"), call("edit"), call("read")]),
+            CompletionResponse::calling("", vec![call("edit"), call("shell")]),
+            CompletionResponse::text("done"),
+        ]);
+        let mut tools = ClassifyingTools { ran: Vec::new() };
+        let mut approver = MockApprover(false); // reject every edit that needs approval
+        let policy = Policy::default(); // fail-closed
+        let mut audit = AuditLog::new();
+        let kill = KillSwitch::new();
+
+        let outcome = {
+            let mut governor = Governor::new(&policy, &mut audit, &kill);
+            run_turn(
+                &provider,
+                &mut tools,
+                &mut approver,
+                &mut governor,
+                now,
+                request(),
+                8,
+            )
+        };
+
+        assert_eq!(outcome, Outcome::Done("done".to_owned()));
+        assert!(
+            tools.ran.iter().all(|name| name == "read"),
+            "a guarded action bypassed the gate and ran: {:?}",
+            tools.ran
+        );
+        assert_eq!(tools.ran.len(), 1, "exactly the one allowed read ran");
+    }
+
+    #[test]
+    fn the_audit_records_every_gated_decision_for_reconstruction() {
+        // Every tool call — denied, rejected, or run — must leave one audit entry, in order, so the
+        // log alone reconstructs exactly what the agent did and what the gate decided.
+        let provider = MockProvider::new([
+            CompletionResponse::calling("", vec![call("shell"), call("edit"), call("read")]),
+            CompletionResponse::text("done"),
+        ]);
+        let mut tools = ClassifyingTools { ran: Vec::new() };
+        let mut approver = MockApprover(false);
+        let policy = Policy::default();
+        let mut audit = AuditLog::new();
+        let kill = KillSwitch::new();
+
+        let _outcome = {
+            let mut governor = Governor::new(&policy, &mut audit, &kill);
+            run_turn(
+                &provider,
+                &mut tools,
+                &mut approver,
+                &mut governor,
+                now,
+                request(),
+                8,
+            )
+        };
+
+        assert_eq!(audit.len(), 3, "one entry per tool call");
+        let actions: Vec<&str> = audit.entries().iter().map(|e| e.action.as_str()).collect();
+        assert!(actions[0].contains("denied tool `shell`"), "{actions:?}");
+        assert!(
+            actions[1].contains("user rejected tool `edit`"),
+            "{actions:?}"
+        );
+        assert!(actions[2].contains("ran tool `read`"), "{actions:?}");
+    }
 }
