@@ -48,6 +48,9 @@ pub struct AgentHost {
     tools: Vec<ToolSpec>,
     runner: Option<AgentRunner>,
     pending_approval: Option<(ToolCall, Sender<bool>)>,
+    /// Whether the current turn has streamed any assistant text — so `Finished` does not re-print a
+    /// reply the panel already rendered token by token.
+    streamed: bool,
 }
 
 impl AgentHost {
@@ -62,6 +65,7 @@ impl AgentHost {
             tools: buffer_tool_specs(),
             runner: None,
             pending_approval: None,
+            streamed: false,
         }
     }
 
@@ -90,6 +94,7 @@ impl AgentHost {
         for tool in &self.tools {
             request = request.with_tool(tool.clone());
         }
+        self.streamed = false;
         self.runner = Some(AgentRunner::spawn(
             Arc::clone(&self.provider),
             self.policy.clone(),
@@ -151,8 +156,17 @@ impl AgentHost {
                     self.pending_approval = Some((call, reply));
                     return; // the worker is blocked until we answer
                 }
+                AgentEvent::Token(chunk) => {
+                    self.streamed = true;
+                    panel.stream_token(&chunk);
+                }
                 AgentEvent::Finished { outcome, .. } => {
-                    panel.push_agent(outcome_text(&outcome));
+                    panel.end_stream();
+                    // A `Done` reply was already rendered live via tokens — don't print it twice;
+                    // anything else (stopped / step-limit / error) gets its status note.
+                    if !(self.streamed && matches!(outcome, Outcome::Done(_))) {
+                        panel.push_agent(outcome_text(&outcome));
+                    }
                     self.runner = None;
                     return;
                 }

@@ -92,15 +92,45 @@ pub fn run_turn(
     tools: &mut dyn Tools,
     approver: &mut dyn Approver,
     governor: &mut Governor<'_>,
+    now: impl FnMut() -> Timestamp,
+    request: CompletionRequest,
+    max_steps: usize,
+) -> Outcome {
+    run_turn_streaming(
+        provider,
+        tools,
+        approver,
+        governor,
+        now,
+        request,
+        max_steps,
+        &mut |_| {},
+    )
+}
+
+/// Like [`run_turn`], but streams assistant text: `on_token` is called with each chunk of the model's
+/// reply as it arrives (via [`Provider::complete_streaming`]), so the host can render the answer live.
+/// The accumulated reply is still returned as the [`Outcome`], so callers that ignore tokens behave
+/// exactly as [`run_turn`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the governed loop's inputs (provider, tools, approver, governor, clock, request, budget, token sink) are each distinct and intrinsic; bundling them would only hide the dependencies"
+)]
+pub fn run_turn_streaming(
+    provider: &dyn Provider,
+    tools: &mut dyn Tools,
+    approver: &mut dyn Approver,
+    governor: &mut Governor<'_>,
     mut now: impl FnMut() -> Timestamp,
     mut request: CompletionRequest,
     max_steps: usize,
+    on_token: &mut dyn FnMut(&str),
 ) -> Outcome {
     for _ in 0..max_steps {
         if governor.kill.is_engaged() {
             return Outcome::Stopped;
         }
-        let response = match provider.complete(&request) {
+        let response = match provider.complete_streaming(&request, on_token) {
             Ok(response) => response,
             Err(error) => return Outcome::Failed(error),
         };
@@ -166,7 +196,7 @@ fn gate_and_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_turn, Approver, Governor, Outcome, Tools};
+    use super::{run_turn, run_turn_streaming, Approver, Governor, Outcome, Tools};
     use crate::provider::{CompletionRequest, CompletionResponse, Message, MockProvider, ToolCall};
     use jiff::Timestamp;
     use seraph::{AgentAction, AuditLog, KillSwitch, Policy};
@@ -435,6 +465,43 @@ mod tests {
 
         assert_eq!(outcome, Outcome::BudgetExhausted);
         assert_eq!(provider.requests().len(), 2, "exactly max_steps rounds ran");
+    }
+
+    #[test]
+    fn run_turn_streaming_emits_assistant_text_as_tokens() {
+        // The default (non-streaming) provider emits the whole reply as one chunk via `on_token`; the
+        // accumulated text matches the returned Outcome, so the host can render live then commit.
+        let provider = MockProvider::new([CompletionResponse::text("hello world")]);
+        let mut tools = MockTools {
+            action: AgentAction::Edit,
+            ran: Vec::new(),
+            result: Ok(String::new()),
+        };
+        let mut approver = MockApprover(true);
+        let policy = Policy::default();
+        let mut audit = AuditLog::new();
+        let kill = KillSwitch::new();
+
+        let mut streamed = String::new();
+        let outcome = {
+            let mut governor = Governor::new(&policy, &mut audit, &kill);
+            run_turn_streaming(
+                &provider,
+                &mut tools,
+                &mut approver,
+                &mut governor,
+                now,
+                request(),
+                8,
+                &mut |token| streamed.push_str(token),
+            )
+        };
+
+        assert_eq!(outcome, Outcome::Done("hello world".to_owned()));
+        assert_eq!(
+            streamed, "hello world",
+            "tokens reassemble to the full reply"
+        );
     }
 
     // ── M3 exit criteria ───────────────────────────────────────────────────────────────────────
