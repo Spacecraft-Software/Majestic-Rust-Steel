@@ -11,6 +11,12 @@ license.workspace = true
 repository.workspace = true
 description = "Majestic — TUI-first terminal, editor, and coding agent (binary: mj)."
 
+# The editor as a library, so both front ends — the `mj` TTY binary and the `mj-nova` GPU binary
+# (M4) — drive the same `App` (PRD-01 §6.5 renderer parity).
+[lib]
+name = "majestic"
+path = "src/lib.rs"
+
 # `cargo install majestic` installs the `mj` binary (PRD §12).
 [[bin]]
 name = "mj"
