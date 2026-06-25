@@ -69,6 +69,25 @@ impl GlyphRaster {
         }
     }
 
+    /// The baseline offset in pixels from the top of a cell (where a glyph's bitmap `top` is measured
+    /// from), so glyphs sit on a common baseline within their cells. Derived from the font's layout.
+    pub fn ascent(&mut self) -> f32 {
+        let mut buffer =
+            Buffer::new(&mut self.font_system, Metrics::new(self.font_size, self.line_height));
+        let mut borrowed = buffer.borrow_with(&mut self.font_system);
+        borrowed.set_text(
+            "M",
+            &Attrs::new().family(Family::Name(FAMILY)),
+            Shaping::Advanced,
+            None,
+        );
+        borrowed.shape_until_scroll(false);
+        buffer
+            .layout_runs()
+            .next()
+            .map_or(self.font_size, |run| run.line_y - run.line_top)
+    }
+
     /// The pixel-exact cell box for this font: the monospace advance × the line height.
     pub fn cell_metrics(&mut self) -> CellMetrics {
         let advance = self.shape('M').map_or(self.font_size * 0.6, |(advance, _)| advance);
