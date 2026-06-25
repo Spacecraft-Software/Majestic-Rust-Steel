@@ -20,6 +20,7 @@ use architect::{
 use majestic_agent::{
     buffer_tool_specs, preview_edits, shell_tool_spec, AgentEvent, AgentRunner, BufferTools,
 };
+use majestic_config::{AgentConfig, Config};
 use majestic_core::Buffer;
 use seraph::{KillSwitch, Policy, Sandbox};
 
@@ -32,12 +33,6 @@ editor. You have two tools over the file currently open in the editor: `read` re
 as `read` showed them. Always `read` immediately before you `edit` so your tags are fresh; if an \
 edit is rejected for a stale tag, `read` again and retry. Make minimal, correct changes and briefly \
 say what you did.";
-
-/// The default model when `MAJESTIC_AGENT_MODEL` is unset — a local Ollama coding model.
-const DEFAULT_AGENT_MODEL: &str = "qwen2.5-coder";
-
-/// The default OpenAI-compatible base URL when `MAJESTIC_AGENT_URL` is unset — a local Ollama server.
-const DEFAULT_AGENT_BASE_URL: &str = "http://localhost:11434/v1";
 
 /// The step ceiling for one agent turn — bounds a misbehaving model's tool-call loop.
 const AGENT_MAX_STEPS: usize = 16;
@@ -65,13 +60,14 @@ pub struct AgentHost {
 }
 
 impl AgentHost {
-    /// Builds the host: a local-first provider (Ollama by default; see [`build_provider`]), a policy
-    /// from the environment ([`build_policy`] — fail-closed, shell off unless `MAJESTIC_AGENT_SHELL_ALLOW`
-    /// names programs), the read/edit tools plus `shell` when it is enabled, and a [`Sandbox`] rooted at
-    /// the working directory for approved commands.
+    /// Builds the host from the Nickel manifest (PRD #1 §5.4): the `agent` section selects the provider
+    /// (the API key still from the environment, §9), the `seraph` section is the fail-closed policy
+    /// (shell off unless its `shell_allowlist` names programs), and the read/edit tools gain `shell`
+    /// when it is enabled. A missing or invalid manifest falls back to the closed defaults.
     #[must_use]
     pub fn new() -> Self {
-        let policy = build_policy();
+        let config = load_manifest();
+        let policy = config.seraph;
         let shell_enabled = !policy.shell_allowlist.is_empty();
 
         let mut tools = buffer_tool_specs();
@@ -85,7 +81,7 @@ impl AgentHost {
         // with the agent's network policy, which is empty (deny) by default.
         let isolate_network = policy.network_allowlist.is_empty();
         Self {
-            provider: build_provider(),
+            provider: build_provider(&config.agent),
             policy,
             system_prompt,
             tools,
@@ -203,41 +199,25 @@ impl AgentHost {
     }
 }
 
-/// Builds the agent's model provider from the environment, local-first (Ollama by default).
-///
-/// `MAJESTIC_AGENT_MODEL` selects the model, `MAJESTIC_AGENT_URL` the OpenAI-compatible base URL, and
-/// `MAJESTIC_AGENT_KEY` an optional bearer key — read from the environment, never the manifest
-/// (PRD #1 §9). A manifest-driven configuration layers on later.
-fn build_provider() -> Arc<dyn Provider> {
-    let model =
-        std::env::var("MAJESTIC_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_AGENT_MODEL.to_owned());
-    let url =
-        std::env::var("MAJESTIC_AGENT_URL").unwrap_or_else(|_| DEFAULT_AGENT_BASE_URL.to_owned());
+/// Loads the Nickel manifest (the same one the editor's settings come from), falling back to the
+/// closed defaults if it is absent or invalid — the host surfaces a separate notice for an invalid
+/// manifest, so a silent default here is acceptable.
+fn load_manifest() -> Config {
+    Config::discover()
+        .and_then(|path| Config::load(&path).ok())
+        .unwrap_or_default()
+}
+
+/// Builds the agent's model provider from the manifest's `agent` section, local-first (Ollama by
+/// default). The bearer key is read from `MAJESTIC_AGENT_KEY` in the environment — never the manifest
+/// (PRD #1 §9).
+fn build_provider(agent: &AgentConfig) -> Arc<dyn Provider> {
     let key = std::env::var("MAJESTIC_AGENT_KEY").ok();
-    Arc::new(HttpProvider::new(url, model, key))
-}
-
-/// Builds the agent's policy from the environment (fail-closed). `MAJESTIC_AGENT_SHELL_ALLOW` is a
-/// comma-separated allow-list of programs the `shell` tool may run (e.g. `cargo,git,ls,cat,rg`); unset
-/// or empty means **no shell**. Network stays denied and edits keep needing approval. A manifest-driven
-/// policy layers on later (PRD #1 §5.4).
-fn build_policy() -> Policy {
-    let shell_allowlist = std::env::var("MAJESTIC_AGENT_SHELL_ALLOW")
-        .map(|raw| parse_shell_allowlist(&raw))
-        .unwrap_or_default();
-    Policy {
-        shell_allowlist,
-        ..Policy::default()
-    }
-}
-
-/// Parses a comma-separated shell allow-list, trimming whitespace and dropping empty entries.
-fn parse_shell_allowlist(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|program| !program.is_empty())
-        .map(str::to_owned)
-        .collect()
+    Arc::new(HttpProvider::new(
+        agent.base_url.clone(),
+        agent.model.clone(),
+        key,
+    ))
 }
 
 /// The project root the sandbox runs approved commands in — the working directory.
@@ -288,18 +268,8 @@ fn outcome_text(outcome: &Outcome) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_text, parse_shell_allowlist, AgentHost};
+    use super::{outcome_text, AgentHost};
     use architect::{Outcome, ProviderError};
-
-    #[test]
-    fn parse_shell_allowlist_trims_and_drops_blanks() {
-        assert_eq!(
-            parse_shell_allowlist("cargo, git ,, ls "),
-            vec!["cargo".to_owned(), "git".to_owned(), "ls".to_owned()]
-        );
-        assert!(parse_shell_allowlist("").is_empty());
-        assert!(parse_shell_allowlist("  ,  ").is_empty());
-    }
 
     #[test]
     fn outcome_text_maps_each_outcome() {
