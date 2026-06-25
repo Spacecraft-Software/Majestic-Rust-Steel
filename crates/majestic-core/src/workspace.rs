@@ -666,7 +666,8 @@ impl Workspace {
     ///
     /// Provisional bindings (full Keymaker rebinding lands at M2): `Ctrl+\` split the focused pane
     /// into columns, `Alt+\` into rows; `Alt+o` focus the next pane; `Alt+↑/↓` grow/shrink the
-    /// focused pane; `Alt+←/→` previous/next buffer in the focused pane; `Ctrl+W` close the pane.
+    /// focused pane; `Alt+←/→` previous/next buffer in the focused pane; `Ctrl+W` close the focused
+    /// split, or — when the window is a single pane — the current buffer (the CUA `close-buffer`).
     fn window_command(&mut self, key: KeyPress) -> bool {
         if key == KeyPress::ctrl('\\') {
             self.split_focused(Split::Columns);
@@ -683,7 +684,14 @@ impl Workspace {
         } else if key == KeyPress::new(Mods::ALT, KeyCode::Left) {
             self.cycle_buffer(false);
         } else if key == KeyPress::ctrl('w') {
-            self.close_pane();
+            // Close the focused split when the window is split; otherwise close the current buffer, so
+            // `Ctrl+W` does the expected thing with a single pane (CUA `close-buffer`) instead of a
+            // no-op (you cannot close the only pane).
+            if self.root.leaf_count() > 1 {
+                self.close_pane();
+            } else {
+                self.close_active_buffer();
+            }
         } else {
             return false;
         }
@@ -1192,6 +1200,20 @@ mod tests {
             workspace.active().buffer().text().is_empty(),
             "the last buffer is replaced with an empty scratch"
         );
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_buffer_when_there_is_a_single_pane() {
+        // Regression: `Ctrl+W` mapped to "close the pane", a no-op with one pane, so it appeared dead.
+        // With a single pane it now closes the current buffer (CUA `close-buffer`).
+        use keymaker::KeyPress;
+        let mut workspace = Workspace::new(Editor::with_buffer(Buffer::from_text("first")));
+        workspace.open(Editor::with_buffer(Buffer::from_text("second")));
+        assert_eq!(workspace.buffer_count(), 2);
+
+        workspace.handle_key(KeyPress::ctrl('w'));
+        assert_eq!(workspace.buffer_count(), 1, "Ctrl+W closed the buffer");
+        assert_eq!(workspace.active().buffer().text(), "first");
     }
 
     #[test]
