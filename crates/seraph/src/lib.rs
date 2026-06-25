@@ -13,6 +13,7 @@
 mod audit;
 mod kill_switch;
 mod policy;
+mod sandbox;
 
 #[doc(inline)]
 pub use audit::{AuditEntry, AuditLog};
@@ -20,3 +21,5 @@ pub use audit::{AuditEntry, AuditLog};
 pub use kill_switch::KillSwitch;
 #[doc(inline)]
 pub use policy::{AgentAction, Decision, Policy};
+#[doc(inline)]
+pub use sandbox::{Sandbox, ShellError, ShellOutput, DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT};
