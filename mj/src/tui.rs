@@ -108,13 +108,16 @@ const COMPLETION_KEY: KeyPress = KeyPress::ctrl(' ');
 /// hover; an F-key, like F1/F12, so it is safe to capture globally without shadowing an editing key).
 const HOVER_KEY: KeyPress = KeyPress::key(KeyCode::Function(2));
 
-/// The `F12` key requests LSP goto-definition at the cursor (the universal editor convention).
-const GOTO_DEF_KEY: KeyPress = KeyPress::key(KeyCode::Function(12));
+/// The `Ctrl+F12` key requests LSP goto-definition at the cursor. Plain `F12` toggles the integrated
+/// terminal (the visible status-bar affordance), so goto-definition takes the `Ctrl` chord — like its
+/// `Shift+F12` find-references companion it is dispatched before the modifier-agnostic terminal toggle
+/// so the chord opens the jump rather than toggling the panel.
+const GOTO_DEF_KEY: KeyPress = KeyPress::new(Mods::CTRL, KeyCode::Function(12));
 
 /// The `Shift+F12` key requests LSP find-references at the cursor (the universal "Find All
-/// References" shortcut, the companion to `F12` goto-definition). Matched via [`is_references_key`]
-/// (tolerant of how terminals report the chord), and dispatched before the modifier-agnostic
-/// terminal toggle so `Shift+F12` opens the references popup rather than toggling the panel.
+/// References" shortcut, the companion to `Ctrl+F12` goto-definition). Matched via
+/// [`is_references_key`] (tolerant of how terminals report the chord), and dispatched before the
+/// modifier-agnostic terminal toggle so `Shift+F12` opens the references popup rather than toggling.
 const REFERENCES_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(12));
 
 /// The `Shift+F6` key starts an LSP rename of the symbol at the cursor (a common IDE binding;
@@ -770,8 +773,8 @@ impl App {
     }
 
     /// Dispatches the editor feature keys — completion (`Ctrl+Space`), hover (`F2`), goto-definition
-    /// (`F12`), find-references (`Shift+F12`), document symbols (`Ctrl+Shift+O`), rename (`Shift+F6`),
-    /// code actions (`Ctrl+.`), format (`Shift+Alt+F`), and diagnostic navigation (`F8`/`Shift+F8`).
+    /// (`Ctrl+F12`), find-references (`Shift+F12`), document symbols (`Ctrl+Shift+O`), rename
+    /// (`Shift+F6`), code actions (`Ctrl+.`), format (`Shift+Alt+F`), and diagnostics (`F8`/`Shift+F8`).
     /// Returns `true` when `key` triggered one (the caller then returns). Each trigger is a no-op
     /// unless the editor is focused (the LSP ones also need a server handling the buffer).
     fn try_lsp_trigger(&mut self, key: KeyPress) -> bool {
@@ -2453,7 +2456,7 @@ fn push_char(out: &mut Vec<u8>, c: char) {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_key, App, TERMINAL_TOGGLE};
+    use super::{encode_key, App, GOTO_DEF_KEY, TERMINAL_TOGGLE};
     use keymaker::{KeyCode, KeyPress, Mods};
     use majestic_core::{Editor, Workspace};
     use penumbra::{Buffer, Theme};
@@ -2564,6 +2567,26 @@ mod tests {
     fn function_keys_are_not_encoded() {
         assert_eq!(encode_key(KeyPress::key(KeyCode::Function(5))), None);
         assert_eq!(TERMINAL_TOGGLE, KeyCode::Function(12));
+    }
+
+    #[test]
+    fn plain_f12_toggles_the_terminal_not_goto_definition() {
+        // Regression: F12 was double-bound — goto-definition (then plain F12) shadowed the terminal
+        // toggle in `try_lsp_trigger`, so the advertised "F12 terminal" did nothing. goto-definition
+        // now takes the Ctrl chord, leaving plain F12 for the modifier-agnostic terminal toggle.
+        let f12 = KeyPress::key(KeyCode::Function(12));
+        assert_eq!(
+            f12.code, TERMINAL_TOGGLE,
+            "plain F12 is the terminal toggle code"
+        );
+        assert_ne!(
+            f12, GOTO_DEF_KEY,
+            "plain F12 must not be the goto-definition key"
+        );
+        assert!(
+            GOTO_DEF_KEY.mods.contains(Mods::CTRL),
+            "goto-definition now requires Ctrl so it does not shadow the terminal toggle"
+        );
     }
 
     #[test]
