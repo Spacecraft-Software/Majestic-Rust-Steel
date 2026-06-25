@@ -232,6 +232,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn tool_call(name: &str, arguments: Value) -> ToolCall {
         ToolCall {
@@ -372,5 +373,58 @@ mod tests {
         );
 
         assert_eq!(drive(&runner, &mut buffer, true), Outcome::Stopped);
+    }
+
+    /// M3 exit criterion (PRD §5.2.4): agent-stop-all halts the loop within ≤100 ms of engaging. A
+    /// provider that always asks for another read would run to the (huge) step budget; we let a few
+    /// rounds run, engage the kill switch, and measure the time from engage to the worker reporting
+    /// `Stopped`. The cooperative check sits at every step, so this is microseconds in practice.
+    #[test]
+    fn m3_exit_engaging_the_kill_switch_stops_within_the_budget() {
+        let provider = MockProvider::new(
+            std::iter::repeat_with(|| {
+                CompletionResponse::calling("", vec![tool_call("read", json!({}))])
+            })
+            .take(10_000),
+        );
+        let kill = KillSwitch::new();
+        let runner = AgentRunner::spawn(
+            Arc::new(provider),
+            Policy::default(),
+            kill.clone(),
+            request("loop"),
+            100_000,
+        );
+
+        let mut buffer = Buffer::from_text("x\n");
+        let mut serviced = 0u32;
+        let mut engaged_at: Option<Instant> = None;
+        let outcome = loop {
+            match runner.poll() {
+                Some(AgentEvent::Classify { call, reply }) => {
+                    let _ = reply.send(BufferTools::new(&mut buffer).action(&call));
+                }
+                Some(AgentEvent::Execute { call, reply }) => {
+                    let _ = reply.send(BufferTools::new(&mut buffer).run(&call));
+                    serviced += 1;
+                    if serviced == 3 {
+                        engaged_at = Some(Instant::now());
+                        kill.engage(); // the user's agent-stop-all, mid-run
+                    }
+                }
+                Some(AgentEvent::Approve { reply, .. }) => {
+                    let _ = reply.send(true);
+                }
+                Some(AgentEvent::Finished { outcome, .. }) => break outcome,
+                None => thread::yield_now(),
+            }
+        };
+
+        assert_eq!(outcome, Outcome::Stopped);
+        let elapsed = engaged_at.expect("the kill switch was engaged").elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "agent-stop-all must halt within 100 ms; took {elapsed:?}"
+        );
     }
 }

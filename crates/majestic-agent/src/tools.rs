@@ -321,4 +321,41 @@ mod tests {
         assert!(preview_edits(&buffer, &call("read", json!({}))).is_empty());
         assert!(preview_edits(&buffer, &call("edit", json!({ "wrong": 1 }))).is_empty());
     }
+
+    /// M3 exit criterion (hashline TOCTOU safety): an edit citing a tag that has gone stale because
+    /// the line changed since the read is rejected, and the buffer is left byte-for-byte unchanged —
+    /// no edit-against-a-changed-buffer ever lands.
+    #[test]
+    fn m3_exit_stale_tag_edit_is_rejected_and_leaves_the_buffer_unchanged() {
+        let mut buffer = Buffer::from_text("alpha\nbeta\ngamma");
+        let tag = tag_of(&buffer, 1); // line 2's tag, as a first `read` showed it
+
+        // A valid edit changes line 2, so the captured `tag` (for "beta") is now stale. The inline
+        // `BufferTools` temporary releases its &mut borrow at the end of the statement.
+        let _applied = BufferTools::new(&mut buffer)
+            .run(&call(
+                "edit",
+                json!({ "edits": [{ "line": 2, "tag": tag, "op": "replace", "text": "BETA" }] }),
+            ))
+            .expect("the fresh-tag edit applies");
+        let after_valid_edit = buffer.text();
+        assert_eq!(after_valid_edit, "alpha\nBETA\ngamma");
+
+        // A second edit citing the now-stale tag must be rejected and change nothing.
+        let error = BufferTools::new(&mut buffer)
+            .run(&call(
+                "edit",
+                json!({ "edits": [{ "line": 2, "tag": tag, "op": "replace", "text": "CLOBBER" }] }),
+            ))
+            .expect_err("a stale-tag edit must be rejected");
+        assert!(
+            error.contains("changed") || error.contains("re-read"),
+            "rejection should tell the agent to re-read: {error}"
+        );
+        assert_eq!(
+            buffer.text(),
+            after_valid_edit,
+            "a stale-tag edit must not modify the buffer"
+        );
+    }
 }
