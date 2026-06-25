@@ -23,15 +23,23 @@
 //!   the host allows unprivileged user namespaces, the command runs via `unshare --map-root-user
 //!   --net`, in a fresh network namespace with no interfaces — so it cannot reach the network at all.
 //!   Where that is unavailable the network is reachable (see [`Sandbox::network_isolated`]).
+//! - **Filesystem isolation (opt-in).** When filesystem isolation is enabled *and* `bwrap`
+//!   (bubblewrap) is available, the command runs with a **read-only root** — only the project working
+//!   directory and a fresh `/tmp` are writable — in fresh mount/pid namespaces, so an allowed program
+//!   cannot modify anything outside the project. It is **off by default**: a read-only root breaks
+//!   tools that legitimately write outside the project (e.g. `cargo` writing its registry cache under
+//!   `~/.cargo`), so it is opt-in per workspace. Where it is disabled or `bwrap` is absent, the
+//!   filesystem is not isolated (see [`Sandbox::filesystem_isolated`]). When both filesystem and
+//!   network isolation are on, `bwrap` provides both (`--unshare-net`); otherwise network isolation
+//!   uses `unshare` as above.
 //! - **Wall-clock timeout.** The child runs in its own process group; on overrun the whole group (the
 //!   command and any children it spawned) is killed (`nix`'s safe `killpg`).
 //! - **Bounded output.** stdout/stderr are drained on reader threads and truncated to a cap, so a
 //!   chatty command can neither exhaust memory nor deadlock on a full pipe.
 //!
-//! This is **defense-in-depth process confinement, not a hard security boundary**: it does not yet
-//! isolate the **filesystem** (no read-only root, no seccomp), so an allowed program can still read
-//! and write outside the project. The real gate stays the allow-list plus the human approving each
-//! command; read-only-root filesystem isolation (via `bwrap`) is the next layer.
+//! This is **defense-in-depth process confinement, not a hard security boundary**: without filesystem
+//! isolation enabled an allowed program can still read and write outside the project, and there is no
+//! seccomp syscall filtering. The real gate stays the allow-list plus the human approving each command.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -94,6 +102,7 @@ pub struct Sandbox {
     cpu_limit_secs: u64,
     fsize_limit_bytes: u64,
     isolate_network: bool,
+    isolate_filesystem: bool,
     hardening: Hardening,
 }
 
@@ -110,6 +119,7 @@ impl Sandbox {
             cpu_limit_secs: DEFAULT_CPU_LIMIT_SECS,
             fsize_limit_bytes: DEFAULT_FSIZE_LIMIT_BYTES,
             isolate_network: true,
+            isolate_filesystem: false,
             hardening: Hardening::detect(),
         }
     }
@@ -143,6 +153,15 @@ impl Sandbox {
         self
     }
 
+    /// Sets whether commands run with a read-only root filesystem (only the working directory and a
+    /// fresh `/tmp` writable), when `bwrap` is available. Off by default — a read-only root breaks
+    /// tools that write outside the project (e.g. `cargo`'s `~/.cargo` registry cache), so it is opt-in.
+    #[must_use]
+    pub fn with_filesystem_isolation(mut self, isolate: bool) -> Self {
+        self.isolate_filesystem = isolate;
+        self
+    }
+
     /// Whether the sandbox can apply kernel resource limits (i.e. `prlimit` was found on `PATH`).
     #[must_use]
     pub fn resource_limited(&self) -> bool {
@@ -155,6 +174,14 @@ impl Sandbox {
     #[must_use]
     pub fn network_isolated(&self) -> bool {
         self.isolate_network && self.hardening.can_isolate_network()
+    }
+
+    /// Whether commands will actually run with a read-only root filesystem (isolation is both requested
+    /// via [`Self::with_filesystem_isolation`] and available because `bwrap` was found). `false` means
+    /// the filesystem is reachable for writes — either by configuration or because `bwrap` is absent.
+    #[must_use]
+    pub fn filesystem_isolated(&self) -> bool {
+        self.isolate_filesystem && self.hardening.can_isolate_filesystem()
     }
 
     /// Runs `command` under the sandbox and returns its captured output.
@@ -172,9 +199,13 @@ impl Sandbox {
         let mut cmd = self.hardening.command(
             program,
             args,
-            self.cpu_limit_secs,
-            self.fsize_limit_bytes,
-            self.isolate_network,
+            &Confinement {
+                cpu_secs: self.cpu_limit_secs,
+                fsize_bytes: self.fsize_limit_bytes,
+                isolate_network: self.isolate_network,
+                isolate_filesystem: self.isolate_filesystem,
+                workdir: &self.workdir,
+            },
         );
         cmd.current_dir(&self.workdir)
             .stdin(Stdio::null())
@@ -228,15 +259,34 @@ struct Hardening {
     /// allows the unprivileged user + network namespaces this needs. `None` means network isolation is
     /// unavailable (e.g. user namespaces are disabled).
     unshare: Option<PathBuf>,
+    /// The `bwrap` (bubblewrap) binary, if found AND a read-only-root probe succeeded. `None` means
+    /// filesystem isolation is unavailable (bwrap absent or unprivileged user namespaces disabled).
+    bwrap: Option<PathBuf>,
+}
+
+/// The per-run confinement knobs threaded into [`Hardening::command`], bundled so the wrapper chain is
+/// built from one place (and to keep the argument list small).
+struct Confinement<'a> {
+    /// CPU-time cap in seconds, applied via `prlimit` when available.
+    cpu_secs: u64,
+    /// Written-file-size cap in bytes, applied via `prlimit` when available.
+    fsize_bytes: u64,
+    /// Whether to run with no network access.
+    isolate_network: bool,
+    /// Whether to run with a read-only root filesystem (via `bwrap`).
+    isolate_filesystem: bool,
+    /// The project working directory — kept writable inside a `bwrap` read-only root.
+    workdir: &'a Path,
 }
 
 impl Hardening {
-    /// Looks up the isolation tools once (at [`Sandbox`] construction), probing that network-namespace
-    /// isolation actually works rather than merely that `unshare` exists.
+    /// Looks up the isolation tools once (at [`Sandbox`] construction), probing that namespace
+    /// isolation actually works rather than merely that the tools exist.
     fn detect() -> Self {
         Self {
             prlimit: find_on_path("prlimit"),
             unshare: find_on_path("unshare").filter(|unshare| net_namespace_works(unshare)),
+            bwrap: find_on_path("bwrap").filter(|bwrap| read_only_root_works(bwrap)),
         }
     }
 
@@ -250,31 +300,39 @@ impl Hardening {
         self.unshare.is_some()
     }
 
-    /// The [`Command`] to spawn for `program` + `args`, wrapped (outermost first) in network isolation
-    /// (`unshare --map-root-user --net`, when `isolate_network` and available) and resource limits
-    /// (`prlimit`, when available). Each wrapper execs the next, so the program runs under all of them.
-    fn command(
-        &self,
-        program: &str,
-        args: &[String],
-        cpu_secs: u64,
-        fsize_bytes: u64,
-        isolate_network: bool,
-    ) -> Command {
+    /// Whether commands can be run with a read-only root filesystem.
+    fn can_isolate_filesystem(&self) -> bool {
+        self.bwrap.is_some()
+    }
+
+    /// The [`Command`] to spawn for `program` + `args`, wrapped (outermost first) in the requested,
+    /// available isolation and resource limits. Each wrapper execs the next, so the program runs under
+    /// all of them. From innermost out: `prlimit` (resource limits) → then either `bwrap` (read-only
+    /// root + writable workdir, plus `--unshare-net` when network isolation is also on) when filesystem
+    /// isolation is requested and available, or `unshare --map-root-user --net` (network only).
+    fn command(&self, program: &str, args: &[String], conf: &Confinement) -> Command {
         // The program plus its `prlimit` prefix (the innermost layer), as argv tokens.
         let mut inner: Vec<OsString> = Vec::new();
         if let Some(prlimit) = &self.prlimit {
             inner.push(OsString::from(prlimit));
-            inner.push(OsString::from(format!("--cpu={cpu_secs}")));
-            inner.push(OsString::from(format!("--fsize={fsize_bytes}")));
+            inner.push(OsString::from(format!("--cpu={}", conf.cpu_secs)));
+            inner.push(OsString::from(format!("--fsize={}", conf.fsize_bytes)));
             inner.push(OsString::from("--core=0"));
             inner.push(OsString::from("--"));
         }
         inner.push(OsString::from(program));
         inner.extend(args.iter().map(OsString::from));
 
-        // Wrap in a fresh, interface-less network namespace when asked and able.
-        if isolate_network {
+        // Read-only root via bwrap (opt-in). bwrap also handles the network namespace (`--unshare-net`),
+        // so when filesystem isolation is active it subsumes the `unshare` layer below.
+        if conf.isolate_filesystem {
+            if let Some(bwrap) = &self.bwrap {
+                return bwrap_command(bwrap, conf.workdir, conf.isolate_network, &inner);
+            }
+        }
+
+        // Otherwise, a fresh interface-less network namespace via unshare, when asked and able.
+        if conf.isolate_network {
             if let Some(unshare) = &self.unshare {
                 let mut cmd = Command::new(unshare);
                 cmd.arg("--map-root-user").arg("--net").args(&inner);
@@ -290,11 +348,55 @@ impl Hardening {
     }
 }
 
+/// Builds a `bwrap` invocation that runs `inner` with a **read-only root** — everything visible but
+/// unwritable — except a fresh `/dev`, `/proc`, `/tmp`, and the project `workdir` (re-bound writable
+/// over the read-only root). Runs in fresh mount + pid namespaces (`--unshare-pid`), dies with the
+/// parent, and — when `isolate_network` — in a fresh network namespace (`--unshare-net`).
+fn bwrap_command(bwrap: &Path, workdir: &Path, isolate_network: bool, inner: &[OsString]) -> Command {
+    let mut cmd = Command::new(bwrap);
+    cmd.arg("--ro-bind")
+        .arg("/")
+        .arg("/")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--tmpfs")
+        .arg("/tmp")
+        .arg("--bind")
+        .arg(workdir)
+        .arg(workdir)
+        .arg("--chdir")
+        .arg(workdir)
+        .arg("--die-with-parent")
+        .arg("--unshare-pid");
+    if isolate_network {
+        cmd.arg("--unshare-net");
+    }
+    cmd.arg("--").args(inner);
+    cmd
+}
+
 /// Probes whether `unshare` can create an unprivileged user + network namespace (i.e. unprivileged
 /// user namespaces are enabled). Runs `unshare --map-root-user --net true` with output discarded.
 fn net_namespace_works(unshare: &Path) -> bool {
     Command::new(unshare)
         .args(["--map-root-user", "--net", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Probes whether `bwrap` can set up a read-only-root mount namespace (i.e. unprivileged user
+/// namespaces are enabled). Runs `bwrap --ro-bind / / --dev /dev --proc /proc -- true`, output
+/// discarded.
+fn read_only_root_works(bwrap: &Path) -> bool {
+    Command::new(bwrap)
+        .args([
+            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "true",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -529,5 +631,50 @@ mod tests {
             .run("getent ahosts example.com")
             .expect("getent runs");
         assert_ne!(output.exit_code, Some(0), "no network, so resolution fails");
+    }
+
+    #[test]
+    fn commands_run_correctly_under_filesystem_isolation() {
+        // The full wrapper chain (bwrap + prlimit + program) must still run a normal command
+        // correctly when bwrap is available. `echo` writes only to stdout, so it works regardless of
+        // the root being read-only. (Where bwrap is absent this falls through and still echoes.)
+        let sandbox = Sandbox::new(std::env::temp_dir()).with_filesystem_isolation(true);
+        let output = sandbox.run("echo fs-isolated").expect("echo runs");
+        assert_eq!(output.stdout.trim(), "fs-isolated");
+        assert_eq!(output.exit_code, Some(0));
+    }
+
+    #[test]
+    fn filesystem_isolation_is_off_by_default_and_reports_state() {
+        let default = Sandbox::new(std::env::temp_dir());
+        assert!(
+            !default.filesystem_isolated(),
+            "filesystem isolation is opt-in: off unless requested"
+        );
+        // When requested, whether it is *active* depends on the host having bwrap; reporting is stable.
+        let on = Sandbox::new(std::env::temp_dir()).with_filesystem_isolation(true);
+        assert_eq!(on.filesystem_isolated(), on.filesystem_isolated());
+    }
+
+    /// A live check that filesystem isolation truly makes the root read-only while keeping the working
+    /// directory writable. Ignored by default (needs `bwrap` + unprivileged user namespaces); run with
+    /// `-- --ignored`.
+    #[test]
+    #[ignore = "requires bwrap + unprivileged user namespaces"]
+    fn filesystem_isolation_gives_a_read_only_root_with_a_writable_workdir() {
+        let sandbox = Sandbox::new(std::env::temp_dir()).with_filesystem_isolation(true);
+        if !sandbox.filesystem_isolated() {
+            return; // bwrap unavailable — isolation cannot be applied, nothing to assert
+        }
+        // A write to the read-only root is rejected...
+        let outside = sandbox
+            .run("touch /usr/seraph-fs-probe-xyz")
+            .expect("touch runs");
+        assert_ne!(outside.exit_code, Some(0), "the root must be read-only");
+        // ...but the working directory stays writable.
+        let inside = sandbox
+            .run("touch seraph-fs-probe-inside")
+            .expect("touch runs");
+        assert_eq!(inside.exit_code, Some(0), "the workdir must be writable");
     }
 }

@@ -81,12 +81,17 @@ impl AgentHost {
         // Isolate the shell's network unless the policy explicitly allows network hosts — consistent
         // with the agent's network policy, which is empty (deny) by default.
         let isolate_network = policy.network_allowlist.is_empty();
+        // Read-only-root filesystem isolation is opt-in via the manifest (off by default — it breaks
+        // tools that write outside the project, e.g. cargo's registry cache).
+        let isolate_filesystem = policy.isolate_filesystem;
         Self {
             provider: build_provider(&config.agent),
             policy,
             system_prompt,
             tools,
-            sandbox: Sandbox::new(project_root()).with_network_isolation(isolate_network),
+            sandbox: Sandbox::new(project_root())
+                .with_network_isolation(isolate_network)
+                .with_filesystem_isolation(isolate_filesystem),
             runner: None,
             pending_approval: None,
             streamed: false,
