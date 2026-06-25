@@ -206,8 +206,15 @@ enum PromptAction {
 }
 
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
-/// integrated terminal.
-struct App {
+/// integrated terminal. The front ends (the `mj` TTY loop and `mj-nova`'s GPU loop) own one of these
+/// and drive it — rendering it into a cell [`penumbra::Buffer`] and feeding it `keymaker::KeyPress`es.
+#[expect(
+    missing_debug_implementations,
+    reason = "App aggregates editor subsystems (PTY terminal, LSP client, highlighter) that do not \
+              all implement Debug; it is internal editor state driven by a front end, not a public \
+              data type"
+)]
+pub struct App {
     workspace: Workspace,
     explorer: Option<FileTree>,
     sidebar_visible: bool,
