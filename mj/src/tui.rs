@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use crossterm::cursor;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode as TermKey, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -63,7 +64,10 @@ const SIDEBAR_COLS: u16 = 28;
 const MIN_MAIN_COLS: u16 = 24;
 
 /// Restores the terminal (cooked mode, main screen, visible cursor) when dropped.
-pub(crate) struct TerminalGuard;
+pub(crate) struct TerminalGuard {
+    /// Whether the Kitty keyboard protocol was enabled (so it is popped on teardown).
+    keyboard_enhanced: bool,
+}
 
 impl TerminalGuard {
     pub(crate) fn enter() -> io::Result<Self> {
@@ -74,12 +78,27 @@ impl TerminalGuard {
             EnableBracketedPaste,
             cursor::Hide
         )?;
-        Ok(Self)
+        // Enable the Kitty keyboard protocol where the terminal supports it (PRD-01 §6.5). Without
+        // it, legacy terminals collapse chords like `Ctrl+\`` to a NUL byte — indistinguishable from
+        // `Ctrl+Space` — so the Architect-terminal toggle never matches. `DISAMBIGUATE_ESCAPE_CODES`
+        // makes those chords distinct; `translate` already ignores the protocol's release events.
+        // Graceful fallback: if the terminal does not support it, it stays off.
+        let keyboard_enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if keyboard_enhanced {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+        }
+        Ok(Self { keyboard_enhanced })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.keyboard_enhanced {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             io::stdout(),
             cursor::Show,
@@ -2866,6 +2885,16 @@ mod tests {
     fn architect_terminal_toggle_is_ctrl_backtick() {
         // The Architect drop-down terminal is bound to Ctrl+` (the classic drop-down-terminal key, as in VS Code).
         assert_eq!(super::ARCHITECT_TERMINAL_TOGGLE, KeyPress::ctrl('`'));
+    }
+
+    #[test]
+    fn ctrl_backtick_translates_to_the_architect_terminal_toggle() {
+        // Once the Kitty keyboard protocol is on (TerminalGuard), the terminal reports Ctrl+` as
+        // `Char('`') + CONTROL` (instead of collapsing it to NUL/Ctrl+Space); `translate` must turn
+        // that into the toggle key. This is the routing the protocol-enable made reachable.
+        use crossterm::event::{KeyCode as TermKey, KeyEvent, KeyModifiers};
+        let event = KeyEvent::new(TermKey::Char('`'), KeyModifiers::CONTROL);
+        assert_eq!(super::translate(event), Some(super::ARCHITECT_TERMINAL_TOGGLE));
     }
 
     #[cfg(feature = "agent")]
