@@ -1,0 +1,6 @@
+SPDX-FileCopyrightText: Copyright 2015-2026, Renzhi Li (aka. Belleve Invis, belleve@typeof.net)
+SPDX-License-Identifier: OFL-1.1
+
+Adwaita Mono (built from Iosevka) — the bundled monospace font for Nova's GPU renderer (M4.3).
+Vendored in-tree (Standard §7 PFA / offline-first; never fetched at runtime). Licensed under the
+SIL Open Font License v1.1; the license text is in LICENSES/OFL-1.1.txt.
