@@ -76,7 +76,7 @@ the parity suite able to assert Nova's interpretation **without a GPU or a windo
 | Layer | Choice | Notes |
 |-------|--------|-------|
 | Window + input | `winit` 0.30 (`ApplicationHandler`) | the standard Rust windowing layer; its keyboard events map to `keymaker::KeyPress` (M4.4). |
-| GPU | `wgpu` (current) | cross-backend (Vulkan/Metal/DX12/GL); the **safe** `Instance::create_surface(&Window)` path (wgpu ≥ 0.19) needs **no `unsafe`** — see §5. |
+| GPU | **`wgpu` 26** (pinned) | cross-backend (Vulkan/Metal/DX12/GL); the **safe** `Instance::create_surface(&Window)` path needs **no `unsafe`** — see §5. **Pinned to 26, not latest:** wgpu 27+ pulls `js-sys ≥ 0.3.85`, which pins `wasm-bindgen = 0.2.108`, conflicting with the **`wasm-bindgen = 0.2.100`** that `nickel-lang-core`'s `topiary` pins (and `mj` needs Nickel). The clash is global (it bites even with `gpu` off, since cargo resolves optional deps), so Nova's GPU stack is bounded by Nickel's wasm-bindgen pin. Revisit the ceiling when Nickel's pin moves. |
 | Text | `cosmic-text` | shaping + `swash` rasterisation into a glyph atlas; PRD-01 dep list. |
 | Icons | **Material Symbols** variable font | Apache-2.0, **vendored in-tree, never fetched at runtime** (§7 PFA); `CREDITS.md` (M4.6). |
 | async glue | `pollster` | block on `wgpu`'s async adapter/device request on the one init path. |
