@@ -35,7 +35,7 @@ use std::thread;
 use architect::{
     run_turn_streaming, Approver, CompletionRequest, Governor, Outcome, Provider, ToolCall, Tools,
 };
-use seraph::{AgentAction, AuditLog, KillSwitch, Policy};
+use seraph::{AgentAction, AuditLog, KillSwitch, Policy, Sandbox, ShellOutput};
 
 /// Something the worker needs the host to do, or the turn's result. Every request variant carries a
 /// one-shot [`Sender`] the host answers on; the worker blocks until that reply arrives.
@@ -84,8 +84,9 @@ pub struct AgentRunner {
 
 impl AgentRunner {
     /// Spawns a worker thread that runs one governed turn over `request` (up to `max_steps` model
-    /// rounds), gating every tool call through `policy` and honoring `kill`. The provider is shared
-    /// (`Arc`) so the host can reuse it across turns. Returns immediately; drive it with [`Self::poll`].
+    /// rounds), gating every tool call through `policy` and honoring `kill`. Approved `shell` calls run
+    /// in `sandbox` on the worker. The provider is shared (`Arc`) so the host can reuse it across turns.
+    /// Returns immediately; drive it with [`Self::poll`].
     ///
     /// # Panics
     /// Panics only if the OS refuses to spawn the worker thread (e.g. the process is out of threads),
@@ -97,6 +98,7 @@ impl AgentRunner {
         kill: KillSwitch,
         request: CompletionRequest,
         max_steps: usize,
+        sandbox: Sandbox,
     ) -> Self {
         let (events, rx) = mpsc::channel();
         let worker_kill = kill.clone();
@@ -105,6 +107,8 @@ impl AgentRunner {
             .spawn(move || {
                 let mut tools = ChannelTools {
                     events: events.clone(),
+                    sandbox,
+                    shell_calls: 0,
                 };
                 let mut approver = ChannelApprover {
                     events: events.clone(),
@@ -164,13 +168,44 @@ impl Drop for AgentRunner {
     }
 }
 
-/// The worker-side [`Tools`]: every classification and run is marshaled to the host over `events`.
+/// The most shell commands one turn may run, so a runaway loop can't spawn unbounded subprocesses
+/// (Seraph rate-limit, PRD #1 §5.2.4).
+const MAX_SHELL_CALLS_PER_TURN: usize = 20;
+
+/// The worker-side [`Tools`]. Buffer ops (`read`/`edit`) are marshaled to the host (which owns the
+/// buffer); `shell` runs locally in the [`Sandbox`] on the worker thread — it needs neither the buffer
+/// nor the UI, so it never blocks the editor.
 struct ChannelTools {
     events: Sender<AgentEvent>,
+    sandbox: Sandbox,
+    shell_calls: usize,
+}
+
+impl ChannelTools {
+    /// Runs an approved `shell` call in the sandbox, rate-limited per turn.
+    fn run_shell(&mut self, call: &ToolCall) -> Result<String, String> {
+        self.shell_calls += 1;
+        if self.shell_calls > MAX_SHELL_CALLS_PER_TURN {
+            return Err(format!(
+                "shell rate limit reached ({MAX_SHELL_CALLS_PER_TURN} commands this turn)"
+            ));
+        }
+        let command = shell_command(call).ok_or("shell call missing a `command` string")?;
+        match self.sandbox.run(&command) {
+            Ok(output) => Ok(format_shell_output(&command, &output)),
+            Err(error) => Err(format!("could not run `{command}`: {error}")),
+        }
+    }
 }
 
 impl Tools for ChannelTools {
     fn action(&self, call: &ToolCall) -> AgentAction {
+        // `shell` classifies locally (the command is in the call) — no buffer needed.
+        if call.name == "shell" {
+            return AgentAction::Shell {
+                command: shell_command(call).unwrap_or_default(),
+            };
+        }
         let (reply, rx) = mpsc::channel();
         let request = AgentEvent::Classify {
             call: call.clone(),
@@ -189,6 +224,10 @@ impl Tools for ChannelTools {
     }
 
     fn run(&mut self, call: &ToolCall) -> Result<String, String> {
+        // `shell` runs on the worker in the sandbox; buffer ops marshal to the host.
+        if call.name == "shell" {
+            return self.run_shell(call);
+        }
         let (reply, rx) = mpsc::channel();
         let request = AgentEvent::Execute {
             call: call.clone(),
@@ -202,6 +241,42 @@ impl Tools for ChannelTools {
             Err(_disconnected) => Err(host_gone()),
         }
     }
+}
+
+/// The `command` string of a `shell` tool call, if present.
+fn shell_command(call: &ToolCall) -> Option<String> {
+    call.arguments.get("command")?.as_str().map(str::to_owned)
+}
+
+/// Formats a sandboxed command's result as the text fed back to the model.
+fn format_shell_output(command: &str, output: &ShellOutput) -> String {
+    let mut text = format!("$ {command}\n");
+    if !output.stdout.is_empty() {
+        text.push_str(&output.stdout);
+        if !output.stdout.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    if !output.stderr.is_empty() {
+        text.push_str("stderr:\n");
+        text.push_str(&output.stderr);
+        if !output.stderr.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    if output.timed_out {
+        text.push_str("(killed: timed out)\n");
+    } else {
+        match output.exit_code {
+            Some(code) => {
+                text.push_str("(exit code ");
+                text.push_str(&code.to_string());
+                text.push_str(")\n");
+            }
+            None => text.push_str("(killed)\n"),
+        }
+    }
+    text
 }
 
 /// The worker-side [`Approver`]: the prompt is marshaled to the host's dialog over `events`.
@@ -231,13 +306,13 @@ fn host_gone() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEvent, AgentRunner};
-    use crate::{buffer_tool_specs, BufferTools};
+    use super::{AgentEvent, AgentRunner, ChannelTools, MAX_SHELL_CALLS_PER_TURN};
+    use crate::{buffer_tool_specs, shell_tool_spec, BufferTools};
     use architect::{
         CompletionRequest, CompletionResponse, Message, MockProvider, Outcome, ToolCall, Tools,
     };
     use majestic_core::{tagged_read, Buffer};
-    use seraph::{KillSwitch, Policy};
+    use seraph::{KillSwitch, Policy, Sandbox};
     use serde_json::{json, Value};
     use std::sync::Arc;
     use std::thread;
@@ -321,6 +396,7 @@ mod tests {
             KillSwitch::new(),
             request("add a hello print"),
             8,
+            Sandbox::new(std::env::temp_dir()),
         );
 
         let outcome = drive(&runner, &mut buffer, false);
@@ -355,6 +431,7 @@ mod tests {
                 KillSwitch::new(),
                 request("edit it"),
                 8,
+                Sandbox::new(std::env::temp_dir()),
             );
 
             let outcome = drive(&runner, &mut buffer, approve);
@@ -380,6 +457,7 @@ mod tests {
             kill,
             request("go"),
             8,
+            Sandbox::new(std::env::temp_dir()),
         );
 
         assert_eq!(drive(&runner, &mut buffer, true), Outcome::Stopped);
@@ -404,6 +482,7 @@ mod tests {
             kill.clone(),
             request("loop"),
             100_000,
+            Sandbox::new(std::env::temp_dir()),
         );
 
         let mut buffer = Buffer::from_text("x\n");
@@ -450,6 +529,7 @@ mod tests {
             KillSwitch::new(),
             request("hi"),
             8,
+            Sandbox::new(std::env::temp_dir()),
         );
 
         let mut tokens = String::new();
@@ -467,5 +547,63 @@ mod tests {
             tokens, "streamed reply",
             "streamed tokens reassemble to the reply"
         );
+    }
+
+    #[test]
+    fn an_allowed_shell_command_runs_in_the_sandbox() {
+        // The model calls `shell`; the allow-list permits `echo`, the user approves, and the command's
+        // output is fed back so the model can use it. `shell` runs on the worker, not via the host.
+        let provider = Arc::new(MockProvider::new([
+            CompletionResponse::calling(
+                "",
+                vec![tool_call("shell", json!({ "command": "echo sandbox-ran" }))],
+            ),
+            CompletionResponse::text("done"),
+        ]));
+        let policy = Policy {
+            shell_allowlist: vec!["echo".to_owned()],
+            ..Policy::default()
+        };
+        let runner = AgentRunner::spawn(
+            Arc::<MockProvider>::clone(&provider), // turbofish: keep the concrete type, coerce at the arg
+            policy,
+            KillSwitch::new(),
+            request("run echo"),
+            8,
+            Sandbox::new(std::env::temp_dir()),
+        );
+
+        let mut buffer = Buffer::from_text("x\n");
+        let outcome = drive(&runner, &mut buffer, true); // approve the command
+
+        assert_eq!(outcome, Outcome::Done("done".to_owned()));
+        let second = &provider.requests()[1];
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|message| message.content.contains("sandbox-ran")),
+            "the command's output should be fed back to the model"
+        );
+        // Prove `shell` really is advertised when enabled.
+        assert_eq!(shell_tool_spec().name, "shell");
+    }
+
+    #[test]
+    fn shell_calls_are_rate_limited_per_turn() {
+        let (events, _rx) = std::sync::mpsc::channel();
+        let mut tools = ChannelTools {
+            events,
+            sandbox: Sandbox::new(std::env::temp_dir()),
+            shell_calls: 0,
+        };
+        let call = tool_call("shell", json!({ "command": "echo hi" }));
+        for _ in 0..MAX_SHELL_CALLS_PER_TURN {
+            tools.run(&call).expect("commands under the limit run");
+        }
+        let error = tools
+            .run(&call)
+            .expect_err("the next command is rate-limited");
+        assert!(error.contains("rate limit"), "got: {error}");
     }
 }

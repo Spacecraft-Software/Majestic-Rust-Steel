@@ -17,9 +17,11 @@ use std::sync::Arc;
 use architect::{
     CompletionRequest, HttpProvider, Message, Outcome, Provider, ToolCall, ToolSpec, Tools,
 };
-use majestic_agent::{buffer_tool_specs, preview_edits, AgentEvent, AgentRunner, BufferTools};
+use majestic_agent::{
+    buffer_tool_specs, preview_edits, shell_tool_spec, AgentEvent, AgentRunner, BufferTools,
+};
 use majestic_core::Buffer;
-use seraph::{KillSwitch, Policy};
+use seraph::{KillSwitch, Policy, Sandbox};
 
 use crate::agent_panel::AgentPanel;
 
@@ -40,12 +42,21 @@ const DEFAULT_AGENT_BASE_URL: &str = "http://localhost:11434/v1";
 /// The step ceiling for one agent turn — bounds a misbehaving model's tool-call loop.
 const AGENT_MAX_STEPS: usize = 16;
 
+/// Appended to the system prompt when the shell tool is enabled, so the model knows it exists and how
+/// it is constrained.
+const SHELL_PROMPT_ADDENDUM: &str =
+    " You also have a `shell` tool that runs ONE program (no pipes, \
+redirects, chaining, or globs) in the project directory and returns its output. Only allow-listed \
+programs run and the user approves every command, so prefer it for read-only checks (build, test, \
+status) and keep commands simple.";
+
 /// The editor-side owner of the agent's configuration and its in-flight turn.
 pub struct AgentHost {
     provider: Arc<dyn Provider>,
     policy: Policy,
     system_prompt: String,
     tools: Vec<ToolSpec>,
+    sandbox: Sandbox,
     runner: Option<AgentRunner>,
     pending_approval: Option<(ToolCall, Sender<bool>)>,
     /// Whether the current turn has streamed any assistant text — so `Finished` does not re-print a
@@ -54,15 +65,28 @@ pub struct AgentHost {
 }
 
 impl AgentHost {
-    /// Builds the host with a local-first provider (Ollama by default; see [`build_provider`]), the
-    /// fail-closed [`Policy::default`], and the standard read/edit tool specs.
+    /// Builds the host: a local-first provider (Ollama by default; see [`build_provider`]), a policy
+    /// from the environment ([`build_policy`] — fail-closed, shell off unless `MAJESTIC_AGENT_SHELL_ALLOW`
+    /// names programs), the read/edit tools plus `shell` when it is enabled, and a [`Sandbox`] rooted at
+    /// the working directory for approved commands.
     #[must_use]
     pub fn new() -> Self {
+        let policy = build_policy();
+        let shell_enabled = !policy.shell_allowlist.is_empty();
+
+        let mut tools = buffer_tool_specs();
+        let mut system_prompt = AGENT_SYSTEM_PROMPT.to_owned();
+        if shell_enabled {
+            tools.push(shell_tool_spec());
+            system_prompt.push_str(SHELL_PROMPT_ADDENDUM);
+        }
+
         Self {
             provider: build_provider(),
-            policy: Policy::default(),
-            system_prompt: AGENT_SYSTEM_PROMPT.to_owned(),
-            tools: buffer_tool_specs(),
+            policy,
+            system_prompt,
+            tools,
+            sandbox: Sandbox::new(project_root()),
             runner: None,
             pending_approval: None,
             streamed: false,
@@ -101,6 +125,7 @@ impl AgentHost {
             KillSwitch::new(),
             request,
             AGENT_MAX_STEPS,
+            self.sandbox.clone(),
         ));
     }
 
@@ -189,9 +214,47 @@ fn build_provider() -> Arc<dyn Provider> {
     Arc::new(HttpProvider::new(url, model, key))
 }
 
-/// Renders a proposed edit as a +/- diff in the panel and prompts for approval. Falls back to a plain
-/// confirmation for a call that is not a previewable edit.
+/// Builds the agent's policy from the environment (fail-closed). `MAJESTIC_AGENT_SHELL_ALLOW` is a
+/// comma-separated allow-list of programs the `shell` tool may run (e.g. `cargo,git,ls,cat,rg`); unset
+/// or empty means **no shell**. Network stays denied and edits keep needing approval. A manifest-driven
+/// policy layers on later (PRD #1 §5.4).
+fn build_policy() -> Policy {
+    let shell_allowlist = std::env::var("MAJESTIC_AGENT_SHELL_ALLOW")
+        .map(|raw| parse_shell_allowlist(&raw))
+        .unwrap_or_default();
+    Policy {
+        shell_allowlist,
+        ..Policy::default()
+    }
+}
+
+/// Parses a comma-separated shell allow-list, trimming whitespace and dropping empty entries.
+fn parse_shell_allowlist(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|program| !program.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The project root the sandbox runs approved commands in — the working directory.
+fn project_root() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Shows the approval prompt for `call`: the exact command for a `shell` call, a +/- diff for an
+/// `edit`, or a plain confirmation otherwise.
 fn show_approval_diff(panel: &mut AgentPanel, buffer: &Buffer, call: &ToolCall) {
+    if call.name == "shell" {
+        panel.push_system("run this command? (y = run / n = reject)");
+        let command = call
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing command>");
+        panel.push_system(format!("$ {command}"));
+        return;
+    }
     let preview = preview_edits(buffer, call);
     if preview.is_empty() {
         panel.push_system(format!("approve `{}`? (y = yes / n = no)", call.name));
@@ -222,8 +285,18 @@ fn outcome_text(outcome: &Outcome) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_text, AgentHost};
+    use super::{outcome_text, parse_shell_allowlist, AgentHost};
     use architect::{Outcome, ProviderError};
+
+    #[test]
+    fn parse_shell_allowlist_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_shell_allowlist("cargo, git ,, ls "),
+            vec!["cargo".to_owned(), "git".to_owned(), "ls".to_owned()]
+        );
+        assert!(parse_shell_allowlist("").is_empty());
+        assert!(parse_shell_allowlist("  ,  ").is_empty());
+    }
 
     #[test]
     fn outcome_text_maps_each_outcome() {
