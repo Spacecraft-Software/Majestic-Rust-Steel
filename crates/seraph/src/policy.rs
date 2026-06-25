@@ -79,6 +79,10 @@ pub struct Policy {
     /// Whether buffer edits require the user's diff-approval. Default `true` — diff-approval is on, so
     /// the agent can never apply an edit the user did not see.
     pub edits_need_approval: bool,
+    /// Whether approved shell commands run with a **read-only root filesystem** (only the project
+    /// directory writable), via `bwrap`. Default `false` — it is opt-in because a read-only root breaks
+    /// tools that write outside the project (e.g. `cargo`'s `~/.cargo` registry cache).
+    pub isolate_filesystem: bool,
 }
 
 impl Default for Policy {
@@ -87,6 +91,7 @@ impl Default for Policy {
             network_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
             edits_need_approval: true,
+            isolate_filesystem: false,
         }
     }
 }

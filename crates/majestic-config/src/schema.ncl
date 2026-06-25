@@ -35,6 +35,7 @@
       network_allowlist | Array String | default = [],
       shell_allowlist | Array String | default = [],
       edits_need_approval | Bool | default = true,
+      isolate_filesystem | Bool | default = false,
     }
     | default = {},
 
