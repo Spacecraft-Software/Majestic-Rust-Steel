@@ -81,6 +81,20 @@ the parity suite able to assert Nova's interpretation **without a GPU or a windo
 | Icons | **Material Symbols** variable font | Apache-2.0, **vendored in-tree, never fetched at runtime** (§7 PFA); `CREDITS.md` (M4.6). |
 | async glue | `pollster` | block on `wgpu`'s async adapter/device request on the one init path. |
 
+## 3.1 Running Nova on NixOS
+
+winit and wgpu **`dlopen`** their runtime libraries by soname at startup — `libwayland-client` +
+`libxkbcommon` (the Wayland window + keymap) and `libvulkan` (the GPU loader). NixOS doesn't put
+those on the default loader path, so a bare `cargo run -p nova --features gpu --bin mj-nova` fails
+with `WaylandError(Connection(NoWaylandLib))`. (Watch the **ELF class**: a stray *32-bit* multilib
+`libwayland-client.so.0` on `LD_LIBRARY_PATH` also yields `NoWaylandLib` — "wrong ELF class" — so use
+the 64-bit paths.) The repo ships **`crates/nova/shell.nix`**, which puts the 64-bit libraries on
+`LD_LIBRARY_PATH` (GPU driver ICDs come from `/run/opengl-driver` as usual):
+
+```
+nix-shell crates/nova/shell.nix --run 'cargo run -p nova --features gpu --bin mj-nova'
+```
+
 ## 4. Binary budget & build cost (non-negotiable constraints)
 
 Two hard constraints shape the crate layout:
