@@ -23,12 +23,24 @@ workspace = true
 # `grammars-common` set (§7 binary-size target); build `--features grammars-all` (or
 # `grammars-extra`, or any `lang-*`) for more languages.
 [features]
-default = []
+default = ["agent"]
+# The governed AI surface (M3). On by default — the agent is core to Majestic. Building with
+# `--no-default-features` drops it (and the `ureq`/`http-provider` stack), keeping the binary under
+# the §7 25 MB target for size-constrained builds; the agent panel then shows a placeholder.
+agent = ["dep:architect", "dep:majestic-agent", "dep:seraph", "architect/http-provider"]
 grammars-common = ["majestic-core/grammars-common"]
 grammars-extra = ["majestic-core/grammars-extra"]
 grammars-all = ["majestic-core/grammars-all"]
 
 [dependencies]
+# The governed AI surface (M3), behind the default-on `agent` feature: Architect's loop + provider
+# (the real Ollama/OpenAI-compatible HTTP backend, `http-provider` enabled via the `agent` feature),
+# the buffer tool bridge + off-thread runner, and Seraph's policy/kill switch. `http-provider` pulls
+# `ureq` (HTTP-only, small) — the chief reason the default binary sits just over the §7 25 MB target
+# while staying far under the 40 MB CI ceiling; `--no-default-features` drops all of this.
+architect = { version = "0.0.0", path = "../crates/architect", optional = true }
+majestic-agent = { version = "0.0.0", path = "../crates/majestic-agent", optional = true }
+seraph = { version = "0.0.0", path = "../crates/seraph", optional = true }
 # `serde` derives Serialize/Deserialize on the event types, so the attach client can forward
 # key/resize events to the daemon over the wire.
 crossterm = { version = "0.28", features = ["serde"] }
