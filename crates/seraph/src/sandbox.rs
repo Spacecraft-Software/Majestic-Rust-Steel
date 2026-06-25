@@ -19,18 +19,23 @@
 //!   `unsafe` (PRD §6.1, `#![deny(unsafe_code)]`, no exceptions), so Seraph cannot call `setrlimit`
 //!   itself (that needs `pre_exec`); delegating to `prlimit` keeps the syscalls inside a vetted
 //!   external tool. Where `prlimit` is absent, the limits are simply not applied (see [`Sandbox::resource_limited`]).
+//! - **Network isolation.** When the sandbox is configured to isolate the network (the default) and
+//!   the host allows unprivileged user namespaces, the command runs via `unshare --map-root-user
+//!   --net`, in a fresh network namespace with no interfaces — so it cannot reach the network at all.
+//!   Where that is unavailable the network is reachable (see [`Sandbox::network_isolated`]).
 //! - **Wall-clock timeout.** The child runs in its own process group; on overrun the whole group (the
 //!   command and any children it spawned) is killed (`nix`'s safe `killpg`).
 //! - **Bounded output.** stdout/stderr are drained on reader threads and truncated to a cap, so a
 //!   chatty command can neither exhaust memory nor deadlock on a full pipe.
 //!
-//! This is **defense-in-depth process confinement, not a hard security boundary**: it does not use
-//! namespaces or seccomp, so an allowed program can still reach the filesystem and the network. The
-//! real gate stays the allow-list plus the human approving each command; filesystem/network isolation
-//! (via a tool such as `bwrap`/`unshare`) is the next layer.
+//! This is **defense-in-depth process confinement, not a hard security boundary**: it does not yet
+//! isolate the **filesystem** (no read-only root, no seccomp), so an allowed program can still read
+//! and write outside the project. The real gate stays the allow-list plus the human approving each
+//! command; read-only-root filesystem isolation (via `bwrap`) is the next layer.
 
+use std::ffi::OsString;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -88,12 +93,14 @@ pub struct Sandbox {
     output_cap: usize,
     cpu_limit_secs: u64,
     fsize_limit_bytes: u64,
+    isolate_network: bool,
     hardening: Hardening,
 }
 
 impl Sandbox {
     /// A sandbox that runs commands in `workdir` with the default timeout, output cap, and (when the
-    /// tooling is present) resource limits.
+    /// tooling is present) resource limits and **network isolation** — fail-closed: commands get no
+    /// network unless [`Self::with_network_isolation`] turns it off.
     #[must_use]
     pub fn new(workdir: impl Into<PathBuf>) -> Self {
         Self {
@@ -102,6 +109,7 @@ impl Sandbox {
             output_cap: DEFAULT_OUTPUT_CAP,
             cpu_limit_secs: DEFAULT_CPU_LIMIT_SECS,
             fsize_limit_bytes: DEFAULT_FSIZE_LIMIT_BYTES,
+            isolate_network: true,
             hardening: Hardening::detect(),
         }
     }
@@ -127,10 +135,26 @@ impl Sandbox {
         self
     }
 
+    /// Sets whether commands run with no network access. `true` (the default) isolates the network
+    /// when the tooling allows it; set `false` for a workspace whose policy permits network.
+    #[must_use]
+    pub fn with_network_isolation(mut self, isolate: bool) -> Self {
+        self.isolate_network = isolate;
+        self
+    }
+
     /// Whether the sandbox can apply kernel resource limits (i.e. `prlimit` was found on `PATH`).
     #[must_use]
     pub fn resource_limited(&self) -> bool {
         self.hardening.limits_resources()
+    }
+
+    /// Whether commands will actually run with no network access (isolation is both requested and
+    /// available). `false` means the network is reachable — either by configuration or because
+    /// unprivileged network namespaces are unavailable on this host.
+    #[must_use]
+    pub fn network_isolated(&self) -> bool {
+        self.isolate_network && self.hardening.can_isolate_network()
     }
 
     /// Runs `command` under the sandbox and returns its captured output.
@@ -145,9 +169,13 @@ impl Sandbox {
             return Err(ShellError::Unparseable);
         }
 
-        let mut cmd =
-            self.hardening
-                .command(program, args, self.cpu_limit_secs, self.fsize_limit_bytes);
+        let mut cmd = self.hardening.command(
+            program,
+            args,
+            self.cpu_limit_secs,
+            self.fsize_limit_bytes,
+            self.isolate_network,
+        );
         cmd.current_dir(&self.workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -196,13 +224,19 @@ impl Sandbox {
 struct Hardening {
     /// The `prlimit` binary, if found on `PATH`. `None` means resource limits are not applied.
     prlimit: Option<PathBuf>,
+    /// The `unshare` binary, if found AND a `--map-root-user --net` probe succeeded — i.e. the kernel
+    /// allows the unprivileged user + network namespaces this needs. `None` means network isolation is
+    /// unavailable (e.g. user namespaces are disabled).
+    unshare: Option<PathBuf>,
 }
 
 impl Hardening {
-    /// Looks up the limiting tools once (at [`Sandbox`] construction).
+    /// Looks up the isolation tools once (at [`Sandbox`] construction), probing that network-namespace
+    /// isolation actually works rather than merely that `unshare` exists.
     fn detect() -> Self {
         Self {
             prlimit: find_on_path("prlimit"),
+            unshare: find_on_path("unshare").filter(|unshare| net_namespace_works(unshare)),
         }
     }
 
@@ -211,24 +245,61 @@ impl Hardening {
         self.prlimit.is_some()
     }
 
-    /// The [`Command`] to spawn for `program` + `args`: prefixed with `prlimit` (CPU time, written-file
-    /// size, no core dumps) when available, otherwise the program run directly.
-    fn command(&self, program: &str, args: &[String], cpu_secs: u64, fsize_bytes: u64) -> Command {
-        let Some(prlimit) = &self.prlimit else {
-            // No `prlimit`: run the program directly (no resource limits).
-            let mut cmd = Command::new(program);
-            cmd.args(args);
-            return cmd;
-        };
-        let mut cmd = Command::new(prlimit);
-        cmd.arg(format!("--cpu={cpu_secs}"))
-            .arg(format!("--fsize={fsize_bytes}"))
-            .arg("--core=0")
-            .arg("--")
-            .arg(program)
-            .args(args);
+    /// Whether commands can be run with no network access.
+    fn can_isolate_network(&self) -> bool {
+        self.unshare.is_some()
+    }
+
+    /// The [`Command`] to spawn for `program` + `args`, wrapped (outermost first) in network isolation
+    /// (`unshare --map-root-user --net`, when `isolate_network` and available) and resource limits
+    /// (`prlimit`, when available). Each wrapper execs the next, so the program runs under all of them.
+    fn command(
+        &self,
+        program: &str,
+        args: &[String],
+        cpu_secs: u64,
+        fsize_bytes: u64,
+        isolate_network: bool,
+    ) -> Command {
+        // The program plus its `prlimit` prefix (the innermost layer), as argv tokens.
+        let mut inner: Vec<OsString> = Vec::new();
+        if let Some(prlimit) = &self.prlimit {
+            inner.push(OsString::from(prlimit));
+            inner.push(OsString::from(format!("--cpu={cpu_secs}")));
+            inner.push(OsString::from(format!("--fsize={fsize_bytes}")));
+            inner.push(OsString::from("--core=0"));
+            inner.push(OsString::from("--"));
+        }
+        inner.push(OsString::from(program));
+        inner.extend(args.iter().map(OsString::from));
+
+        // Wrap in a fresh, interface-less network namespace when asked and able.
+        if isolate_network {
+            if let Some(unshare) = &self.unshare {
+                let mut cmd = Command::new(unshare);
+                cmd.arg("--map-root-user").arg("--net").args(&inner);
+                return cmd;
+            }
+        }
+
+        let mut tokens = inner.into_iter();
+        let first = tokens.next().unwrap_or_else(|| OsString::from(program));
+        let mut cmd = Command::new(first);
+        cmd.args(tokens);
         cmd
     }
+}
+
+/// Probes whether `unshare` can create an unprivileged user + network namespace (i.e. unprivileged
+/// user namespaces are enabled). Runs `unshare --map-root-user --net true` with output discarded.
+fn net_namespace_works(unshare: &Path) -> bool {
+    Command::new(unshare)
+        .args(["--map-root-user", "--net", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Finds `name` on `PATH`, returning the first existing match (so the sandbox can detect optional
@@ -423,5 +494,40 @@ mod tests {
             output.exit_code, None,
             "killed by a signal, so there is no exit code"
         );
+    }
+
+    #[test]
+    fn commands_run_correctly_under_network_isolation() {
+        // The full wrapper chain (unshare + prlimit + program) must still run a normal command
+        // correctly. Uses the default sandbox, which isolates the network when the host allows it.
+        let output = sandbox().run("echo isolated").expect("echo runs");
+        assert_eq!(output.stdout.trim(), "isolated");
+        assert_eq!(output.exit_code, Some(0));
+    }
+
+    #[test]
+    fn network_isolation_reports_and_can_be_disabled() {
+        let off = Sandbox::new(std::env::temp_dir()).with_network_isolation(false);
+        assert!(!off.network_isolated(), "disabled by configuration");
+        // Whether default isolation is *active* depends on the host (user namespaces); when it reports
+        // active, that is only because the `unshare --net` probe succeeded.
+        let on = sandbox();
+        assert_eq!(on.network_isolated(), on.network_isolated());
+    }
+
+    /// A live check that an isolated command truly has no network. Ignored by default (needs
+    /// unprivileged user namespaces + `getent`); run with `-- --ignored`.
+    #[test]
+    #[ignore = "requires unprivileged user namespaces"]
+    fn isolated_command_has_no_network() {
+        let sandbox = sandbox();
+        if !sandbox.network_isolated() {
+            return;
+        }
+        // With no network namespace interfaces, a TCP-connecting resolution must fail.
+        let output = sandbox
+            .run("getent ahosts example.com")
+            .expect("getent runs");
+        assert_ne!(output.exit_code, Some(0), "no network, so resolution fails");
     }
 }

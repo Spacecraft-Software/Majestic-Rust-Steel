@@ -81,12 +81,15 @@ impl AgentHost {
             system_prompt.push_str(SHELL_PROMPT_ADDENDUM);
         }
 
+        // Isolate the shell's network unless the policy explicitly allows network hosts — consistent
+        // with the agent's network policy, which is empty (deny) by default.
+        let isolate_network = policy.network_allowlist.is_empty();
         Self {
             provider: build_provider(),
             policy,
             system_prompt,
             tools,
-            sandbox: Sandbox::new(project_root()),
+            sandbox: Sandbox::new(project_root()).with_network_isolation(isolate_network),
             runner: None,
             pending_approval: None,
             streamed: false,
