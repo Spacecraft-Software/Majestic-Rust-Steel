@@ -37,4 +37,15 @@
       edits_need_approval | Bool | default = true,
     }
     | default = {},
+
+  # Architect agent provider (PRD #1 §5.2.3 / §9) — LOCAL-FIRST. `model` and `base_url` select the
+  # OpenAI-compatible backend (a local Ollama server by default). The API key is deliberately NOT
+  # here: it comes from the environment (`MAJESTIC_AGENT_KEY`), never the manifest (§9). The agent's
+  # shell/network permissions live in the `seraph` policy above.
+  agent
+    | {
+      model | String | default = "qwen2.5-coder",
+      base_url | String | default = "http://localhost:11434/v1",
+    }
+    | default = {},
 }

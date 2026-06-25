@@ -49,6 +49,9 @@ pub struct Config {
     /// is the closed default: no network, no shell, edits require approval. The host hands this to
     /// Seraph as the only source of agent permissions (extensions may tighten it, never loosen it).
     pub seraph: seraph::Policy,
+    /// The Architect agent's provider settings (model + base URL). The API key is **not** here — it
+    /// comes from the environment (PRD #1 §9).
+    pub agent: AgentConfig,
 }
 
 impl Default for Config {
@@ -59,6 +62,27 @@ impl Default for Config {
             tab_width: DEFAULT_TAB_WIDTH,
             extensions: BTreeMap::new(),
             seraph: seraph::Policy::default(),
+            agent: AgentConfig::default(),
+        }
+    }
+}
+
+/// The Architect agent's provider configuration (PRD #1 §5.2.3 / §9), from the manifest's `agent`
+/// section. The API key is intentionally absent — it is read from the environment, never the manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentConfig {
+    /// The model name the provider requests (e.g. `"qwen2.5-coder"`).
+    pub model: String,
+    /// The OpenAI-compatible base URL (a local Ollama server by default).
+    pub base_url: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            model: "qwen2.5-coder".to_owned(),
+            base_url: "http://localhost:11434/v1".to_owned(),
         }
     }
 }
@@ -228,7 +252,7 @@ impl std::error::Error for ConfigError {
 mod tests {
     use std::path::Path;
 
-    use super::{write_keymap_to, Config, ConfigError, ExtensionSpec};
+    use super::{write_keymap_to, AgentConfig, Config, ConfigError, ExtensionSpec};
     use seraph::{AgentAction, Decision};
 
     #[test]
@@ -413,5 +437,22 @@ mod tests {
         // A typo inside the `seraph` section is caught (Nickel contract + serde deny_unknown_fields).
         let error = Config::load_str(r#"{ seraph = { shel_allowlist = ["cargo"] } }"#).unwrap_err();
         assert!(matches!(error, ConfigError::Evaluate(_)));
+    }
+
+    #[test]
+    fn agent_section_drives_provider_settings() {
+        let config = Config::load_str(
+            r#"{ agent = { model = "llama3.2", base_url = "http://host:1234/v1" } }"#,
+        )
+        .unwrap();
+        assert_eq!(config.agent.model, "llama3.2");
+        assert_eq!(config.agent.base_url, "http://host:1234/v1");
+    }
+
+    #[test]
+    fn agent_section_defaults_to_local_ollama_when_omitted() {
+        let config = Config::load_str("{}").unwrap();
+        assert_eq!(config.agent, AgentConfig::default());
+        assert_eq!(config.agent.model, "qwen2.5-coder");
     }
 }
