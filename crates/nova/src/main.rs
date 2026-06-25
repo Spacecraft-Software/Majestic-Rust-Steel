@@ -5,43 +5,111 @@
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 //!
-//! M4.2 milestone: opens a wgpu window and paints the editor's cell *layout* as coloured rectangles
-//! (a static demo frame — glyphs land in M4.3, a live editor in M4.4). Only built with the `gpu`
-//! feature (`cargo run -p nova --features gpu --bin mj-nova`); the TTY `mj` is unaffected.
+//! M4.3 milestone: opens a wgpu window and paints a static editor mock — coloured regions (M4.2) plus
+//! real **text** rendered through the cosmic-text glyph atlas (M4.3b). The live editor frame is M4.4.
+//! Only built with the `gpu` feature (`cargo run -p nova --features gpu --bin mj-nova`); the TTY `mj`
+//! is unaffected.
 
 use penumbra::{Buffer, Cell, Rgb, Style, Theme};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let theme = Theme::steelbore();
     let frame = demo_frame(&theme);
-    let scene = nova::build_scene(&frame, nova::CellMetrics::new(8.0, 16.0));
-    let background = theme.background;
+    // Cell metrics come from the bundled font (M4.3), so the grid matches the rasterised glyphs.
+    let metrics = nova::GlyphRaster::new(nova::FONT_SIZE).cell_metrics();
+    let scene = nova::build_scene(&frame, metrics);
+    let bg = theme.background;
     let clear = [
-        f64::from(background.r) / 255.0,
-        f64::from(background.g) / 255.0,
-        f64::from(background.b) / 255.0,
+        f64::from(bg.r) / 255.0,
+        f64::from(bg.g) / 255.0,
+        f64::from(bg.b) / 255.0,
         1.0,
     ];
     nova::run(scene, clear)?;
     Ok(())
 }
 
-/// A static 120 × 36 frame that sketches the editor shell as coloured regions on Void Navy — a status
-/// bar, an explorer divider, an agent-panel band, and a couple of markers — so the window proves the
-/// quad pipeline lays cells out correctly before glyphs exist (M4.3).
+/// A static 120 × 36 editor mock on Void Navy: an explorer sidebar, a code editor, an Architect panel,
+/// and a status bar — with real text — so the window proves the glyph atlas + textured-quad pass.
 fn demo_frame(theme: &Theme) -> Buffer {
     let (cols, rows) = (120_u16, 36_u16);
     let mut frame = Buffer::new(cols, rows, Style::new(theme.foreground, theme.background));
-    // Status bar across the bottom row (Steel Blue), like the TTY status line.
-    paint(&mut frame, 0, cols, rows - 1, rows, theme.accent, theme.background);
-    // Explorer sidebar divider (a Steel Blue column at the left).
+    let text = Style::new(theme.foreground, theme.background); // Molten Amber on Void Navy
+    let dim = Style::new(theme.accent, theme.background); // Steel Blue (labels / comments)
+    let info = Style::new(theme.info, theme.background); // Liquid Coolant (accents)
+
+    // Vertical dividers: explorer | editor | Architect panel.
     paint(&mut frame, 23, 24, 0, rows - 1, theme.accent, theme.background);
-    // Agent-panel divider on the right.
     paint(&mut frame, cols - 36, cols - 35, 0, rows - 1, theme.accent, theme.background);
-    // A "selection" block in the editor (Liquid Coolant) and an error marker (Red Oxide).
-    paint(&mut frame, 30, 52, 6, 9, theme.info, theme.foreground);
-    paint(&mut frame, 30, 31, 12, 13, theme.error, theme.foreground);
+
+    // Explorer sidebar.
+    frame.set_str(1, 0, "EXPLORER", dim);
+    frame.set_str(1, 2, "v majestic-rust", info);
+    let tree = [
+        " Cargo.toml",
+        " README.md",
+        " v crates/nova/src",
+        "     atlas.rs",
+        "     raster.rs",
+        "     renderer.rs",
+        "     window.rs",
+        " v mj/src",
+        "     main.rs",
+        "     tui.rs",
+    ];
+    write_lines(&mut frame, 1, 4, &tree, text);
+
+    // Code editor, with a line-number gutter.
+    let code = [
+        "// nova/src/renderer.rs — the GPU side of Nova",
+        "",
+        "pub fn render(&mut self, scene: &Scene) {",
+        "    let glyphs = self.glyph_instances(scene);",
+        "    // backgrounds first, then glyphs over them",
+        "    pass.set_pipeline(&self.glyph_pipeline);",
+        "    pass.set_bind_group(1, self.atlas.bind(), &[]);",
+        "    pass.draw(0..6, 0..glyph_count);",
+        "}",
+    ];
+    for (i, _) in code.iter().enumerate() {
+        let row = 3 + u16::try_from(i).unwrap_or(0);
+        let line_no = i + 1;
+        frame.set_str(25, row, &format!("{line_no:>3}"), dim);
+    }
+    write_lines(&mut frame, 29, 3, &code, text);
+    // A cursor cell on the open-brace line.
+    paint(&mut frame, 64, 65, 5, 6, theme.info, theme.background);
+
+    // Architect panel.
+    frame.set_str(cols - 34, 0, "ARCHITECT", dim);
+    frame.set_str(cols - 34, 2, "> render the glyphs", info);
+    let reply = [
+        "Done. M4.3b draws the",
+        "Scene's glyphs as textured",
+        "quads sampling a cosmic-text",
+        "atlas, alpha-blended over",
+        "the cell backgrounds.",
+    ];
+    write_lines(&mut frame, cols - 34, 4, &reply, text);
+
+    // Status bar across the bottom.
+    paint(&mut frame, 0, cols, rows - 1, rows, theme.accent, theme.background);
+    let status = Style::new(theme.background, theme.accent);
+    frame.set_str(
+        1,
+        rows - 1,
+        " mj   Majestic — Nova (M4.3)    rust    Ln 9, Col 2    UTF-8 ",
+        status,
+    );
+
     frame
+}
+
+/// Writes `lines` top-to-bottom starting at `(x, y0)`.
+fn write_lines(frame: &mut Buffer, x: u16, y0: u16, lines: &[&str], style: Style) {
+    for (i, line) in lines.iter().enumerate() {
+        frame.set_str(x, y0 + u16::try_from(i).unwrap_or(0), line, style);
+    }
 }
 
 /// Fills the cell rectangle `[x0, x1) × [y0, y1)` with background colour `bg` (foreground `fg`).

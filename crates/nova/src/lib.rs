@@ -22,6 +22,10 @@
 
 use penumbra::{char_width, Buffer, Rgb};
 
+/// The font size in pixels Nova renders cells at (M4.3). Shared so the cell grid the demo lays out
+/// (via [`GlyphRaster::cell_metrics`](crate::GlyphRaster)) matches the glyph atlas the renderer fills.
+pub const FONT_SIZE: f32 = 16.0;
+
 /// The pixel size of one terminal cell. A parameter for now; M4.3 derives it from the chosen
 /// monospace font's `cosmic-text` metrics so the grid is pixel-exact.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -153,12 +157,16 @@ pub fn build_scene(buffer: &Buffer, metrics: CellMetrics) -> Scene {
 // The GPU front end (M4.2+), behind the `gpu` feature so the pure model above stays in the cheap
 // `--workspace` gate (docs/nova.md §4). `mj-nova` (the binary) and these re-exports require it.
 #[cfg(feature = "gpu")]
+mod atlas;
+#[cfg(feature = "gpu")]
 mod raster;
 #[cfg(feature = "gpu")]
 mod renderer;
 #[cfg(feature = "gpu")]
 mod window;
 
+#[cfg(feature = "gpu")]
+pub use atlas::{AtlasEntry, GlyphAtlas};
 #[cfg(feature = "gpu")]
 pub use raster::{GlyphRaster, RasterGlyph};
 #[cfg(feature = "gpu")]
