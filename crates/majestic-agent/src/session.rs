@@ -99,16 +99,16 @@ impl AgentSession {
 #[cfg(test)]
 mod tests {
     use super::AgentSession;
-    use architect::{Approver, CompletionResponse, MockProvider, Outcome, ToolCall};
+    use architect::{Approval, Approver, CompletionResponse, MockProvider, Outcome, ToolCall};
     use majestic_core::{tagged_read, Buffer};
     use seraph::Policy;
     use serde_json::{json, Value};
 
     /// An approver with a fixed answer.
-    struct FixedApprover(bool);
+    struct FixedApprover(Approval);
     impl Approver for FixedApprover {
-        fn approve(&mut self, _call: &ToolCall) -> bool {
-            self.0
+        fn approve(&mut self, _call: &ToolCall) -> Approval {
+            self.0.clone()
         }
     }
 
@@ -154,7 +154,7 @@ mod tests {
             ..Policy::default()
         };
         let mut session = AgentSession::new(Box::new(provider), policy, "You edit code.");
-        let mut approver = FixedApprover(false); // never consulted: edits are auto-approved
+        let mut approver = FixedApprover(Approval::Reject); // never consulted: edits are auto-approved
 
         let outcome = session.run(&mut buffer, &mut approver, "add a hello print");
 
@@ -185,7 +185,7 @@ mod tests {
         ]);
         let mut session =
             AgentSession::new(Box::new(provider), Policy::default(), "You edit code.");
-        let mut approver = FixedApprover(false); // user rejects the edit
+        let mut approver = FixedApprover(Approval::Reject); // user rejects the edit
 
         let outcome = session.run(&mut buffer, &mut approver, "wreck it");
 
@@ -204,7 +204,7 @@ mod tests {
         let mut session = AgentSession::new(Box::new(provider), Policy::default(), "sys");
         session.kill_switch().engage(); // engage via a clone, as the UI would
 
-        let mut approver = FixedApprover(true);
+        let mut approver = FixedApprover(Approval::Run);
         let outcome = session.run(&mut buffer, &mut approver, "go");
 
         assert_eq!(outcome, Outcome::Stopped);

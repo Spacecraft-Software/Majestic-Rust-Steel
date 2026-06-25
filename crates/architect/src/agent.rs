@@ -37,11 +37,22 @@ pub trait Tools {
     fn run(&mut self, call: &ToolCall) -> Result<String, String>;
 }
 
-/// Decides the [`Decision::NeedsApproval`] cases — a diff/confirmation dialog in the UI, a scripted
+/// The user's ruling on a [`Decision::NeedsApproval`] tool call (the Apply / Edit / Reject card).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Approval {
+    /// Run the call unchanged.
+    Run,
+    /// Do not run it.
+    Reject,
+    /// Run this modified call instead — the user edited the proposed change before applying it.
+    RunModified(ToolCall),
+}
+
+/// Decides the [`Decision::NeedsApproval`] cases — the Apply/Edit/Reject dialog in the UI, a scripted
 /// answer in tests.
 pub trait Approver {
-    /// Whether the user approves running `call`.
-    fn approve(&mut self, call: &ToolCall) -> bool;
+    /// How the user wishes to proceed with `call`: run it, reject it, or run an edited version.
+    fn approve(&mut self, call: &ToolCall) -> Approval;
 }
 
 /// The Seraph governance context threaded through a turn: the policy to rule by, the audit log to
@@ -170,33 +181,52 @@ fn gate_and_run(
                 .append(now(), format!("denied tool `{}`: {reason}", call.name));
             format!("denied by policy: {reason}")
         }
-        Decision::NeedsApproval if !approver.approve(call) => {
-            governor
-                .audit
-                .append(now(), format!("user rejected tool `{}`", call.name));
-            "rejected by the user".to_owned()
-        }
-        // Allowed outright, or NeedsApproval that the user approved: run it.
-        _ => match tools.run(call) {
-            Ok(output) => {
+        Decision::NeedsApproval => match approver.approve(call) {
+            Approval::Reject => {
                 governor
                     .audit
-                    .append(now(), format!("ran tool `{}`", call.name));
-                output
+                    .append(now(), format!("user rejected tool `{}`", call.name));
+                "rejected by the user".to_owned()
             }
-            Err(message) => {
+            Approval::Run => run_tool(call, governor, tools, now),
+            Approval::RunModified(modified) => {
                 governor
                     .audit
-                    .append(now(), format!("tool `{}` failed: {message}", call.name));
-                format!("tool error: {message}")
+                    .append(now(), format!("user edited tool `{}`", call.name));
+                run_tool(&modified, governor, tools, now)
             }
         },
+        Decision::Allow => run_tool(call, governor, tools, now),
+    }
+}
+
+/// Runs an approved or allowed `call` via [`Tools::run`], recording success or failure to the audit
+/// log and returning the text to feed back to the model.
+fn run_tool(
+    call: &ToolCall,
+    governor: &mut Governor<'_>,
+    tools: &mut dyn Tools,
+    now: &mut impl FnMut() -> Timestamp,
+) -> String {
+    match tools.run(call) {
+        Ok(output) => {
+            governor
+                .audit
+                .append(now(), format!("ran tool `{}`", call.name));
+            output
+        }
+        Err(message) => {
+            governor
+                .audit
+                .append(now(), format!("tool `{}` failed: {message}", call.name));
+            format!("tool error: {message}")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run_turn, run_turn_streaming, Approver, Governor, Outcome, Tools};
+    use super::{run_turn, run_turn_streaming, Approval, Approver, Governor, Outcome, Tools};
     use crate::provider::{CompletionRequest, CompletionResponse, Message, MockProvider, ToolCall};
     use jiff::Timestamp;
     use seraph::{AgentAction, AuditLog, KillSwitch, Policy};
@@ -226,10 +256,10 @@ mod tests {
     }
 
     /// A mock approver that answers every prompt the same way.
-    struct MockApprover(bool);
+    struct MockApprover(Approval);
     impl Approver for MockApprover {
-        fn approve(&mut self, _call: &ToolCall) -> bool {
-            self.0
+        fn approve(&mut self, _call: &ToolCall) -> Approval {
+            self.0.clone()
         }
     }
 
@@ -259,7 +289,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok("file contents".to_owned()),
         };
-        let mut approver = MockApprover(false); // not needed: reads are allowed outright
+        let mut approver = MockApprover(Approval::Reject); // not needed: reads are allowed outright
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -300,7 +330,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok("should never run".to_owned()),
         };
-        let mut approver = MockApprover(true);
+        let mut approver = MockApprover(Approval::Run);
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -341,7 +371,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok("edited".to_owned()),
         };
-        let mut approver = MockApprover(false); // user rejects
+        let mut approver = MockApprover(Approval::Reject); // user rejects
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -377,7 +407,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok("edited".to_owned()),
         };
-        let mut approver = MockApprover(true); // user approves
+        let mut approver = MockApprover(Approval::Run); // user approves
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -400,6 +430,50 @@ mod tests {
     }
 
     #[test]
+    fn a_needs_approval_tool_runs_the_user_modified_call() {
+        // The Edit option: the user approves a *modified* call, and that one runs (not the original).
+        let provider = MockProvider::new([
+            CompletionResponse::calling("", vec![call("edit")]),
+            CompletionResponse::text("done"),
+        ]);
+        let mut tools = MockTools {
+            action: AgentAction::Edit,
+            ran: Vec::new(),
+            result: Ok("edited".to_owned()),
+        };
+        let modified = ToolCall {
+            id: "edit-1".to_owned(),
+            name: "edit-modified".to_owned(),
+            arguments: json!({}),
+        };
+        let mut approver = MockApprover(Approval::RunModified(modified));
+        let policy = Policy::default();
+        let mut audit = AuditLog::new();
+        let kill = KillSwitch::new();
+
+        let outcome = {
+            let mut governor = Governor::new(&policy, &mut audit, &kill);
+            run_turn(
+                &provider,
+                &mut tools,
+                &mut approver,
+                &mut governor,
+                now,
+                request(),
+                8,
+            )
+        };
+
+        assert_eq!(outcome, Outcome::Done("done".to_owned()));
+        assert_eq!(
+            tools.ran,
+            vec!["edit-modified"],
+            "the user's modified call ran, not the original"
+        );
+        assert!(audit.entries()[0].action.contains("user edited tool"));
+    }
+
+    #[test]
     fn the_kill_switch_halts_the_turn() {
         let provider = MockProvider::new([CompletionResponse::text("never reached")]);
         let mut tools = MockTools {
@@ -407,7 +481,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok(String::new()),
         };
-        let mut approver = MockApprover(true);
+        let mut approver = MockApprover(Approval::Run);
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -445,7 +519,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok("more".to_owned()),
         };
-        let mut approver = MockApprover(true);
+        let mut approver = MockApprover(Approval::Run);
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -477,7 +551,7 @@ mod tests {
             ran: Vec::new(),
             result: Ok(String::new()),
         };
-        let mut approver = MockApprover(true);
+        let mut approver = MockApprover(Approval::Run);
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -545,7 +619,7 @@ mod tests {
             CompletionResponse::text("done"),
         ]);
         let mut tools = ClassifyingTools { ran: Vec::new() };
-        let mut approver = MockApprover(false); // reject every edit that needs approval
+        let mut approver = MockApprover(Approval::Reject); // reject every edit that needs approval
         let policy = Policy::default(); // fail-closed
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
@@ -581,7 +655,7 @@ mod tests {
             CompletionResponse::text("done"),
         ]);
         let mut tools = ClassifyingTools { ran: Vec::new() };
-        let mut approver = MockApprover(false);
+        let mut approver = MockApprover(Approval::Reject);
         let policy = Policy::default();
         let mut audit = AuditLog::new();
         let kill = KillSwitch::new();
