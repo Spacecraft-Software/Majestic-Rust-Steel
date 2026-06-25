@@ -33,7 +33,8 @@ use std::sync::Arc;
 use std::thread;
 
 use architect::{
-    run_turn_streaming, Approver, CompletionRequest, Governor, Outcome, Provider, ToolCall, Tools,
+    run_turn_streaming, Approval, Approver, CompletionRequest, Governor, Outcome, Provider,
+    ToolCall, Tools,
 };
 use seraph::{AgentAction, AuditLog, KillSwitch, Policy, Sandbox, ShellOutput};
 
@@ -55,12 +56,12 @@ pub enum AgentEvent {
         /// The channel to send the run result back on.
         reply: Sender<Result<String, String>>,
     },
-    /// Ask the user whether to run `call` (the diff/confirm dialog). Answer `true` to approve.
+    /// Ask the user whether to run `call` (the Apply/Edit/Reject dialog). Answer with an [`Approval`].
     Approve {
         /// The tool call awaiting the user's decision.
         call: ToolCall,
-        /// The channel to send the user's yes/no back on.
-        reply: Sender<bool>,
+        /// The channel to send the user's [`Approval`] back on.
+        reply: Sender<Approval>,
     },
     /// A chunk of assistant text streamed from the model, to append to the transcript live. Requires
     /// no reply — the host appends and keeps polling.
@@ -285,7 +286,7 @@ struct ChannelApprover {
 }
 
 impl Approver for ChannelApprover {
-    fn approve(&mut self, call: &ToolCall) -> bool {
+    fn approve(&mut self, call: &ToolCall) -> Approval {
         let (reply, rx) = mpsc::channel();
         let request = AgentEvent::Approve {
             call: call.clone(),
@@ -293,9 +294,9 @@ impl Approver for ChannelApprover {
         };
         // Fail closed: a missing host means no approval, so a guarded action never runs unattended.
         if self.events.send(request).is_err() {
-            return false;
+            return Approval::Reject;
         }
-        rx.recv().unwrap_or(false)
+        rx.recv().unwrap_or(Approval::Reject)
     }
 }
 
@@ -309,7 +310,8 @@ mod tests {
     use super::{AgentEvent, AgentRunner, ChannelTools, MAX_SHELL_CALLS_PER_TURN};
     use crate::{buffer_tool_specs, shell_tool_spec, BufferTools};
     use architect::{
-        CompletionRequest, CompletionResponse, Message, MockProvider, Outcome, ToolCall, Tools,
+        Approval, CompletionRequest, CompletionResponse, Message, MockProvider, Outcome, ToolCall,
+        Tools,
     };
     use majestic_core::{tagged_read, Buffer};
     use seraph::{KillSwitch, Policy, Sandbox};
@@ -357,7 +359,11 @@ mod tests {
                     let _ = reply.send(result);
                 }
                 Some(AgentEvent::Approve { reply, .. }) => {
-                    let _ = reply.send(approve);
+                    let _ = reply.send(if approve {
+                        Approval::Run
+                    } else {
+                        Approval::Reject
+                    });
                 }
                 Some(AgentEvent::Token(_)) => {} // streamed text: nothing to service in this harness
                 Some(AgentEvent::Finished { outcome, .. }) => return outcome,
@@ -502,7 +508,7 @@ mod tests {
                     }
                 }
                 Some(AgentEvent::Approve { reply, .. }) => {
-                    let _ = reply.send(true);
+                    let _ = reply.send(Approval::Run);
                 }
                 Some(AgentEvent::Token(_)) => {}
                 Some(AgentEvent::Finished { outcome, .. }) => break outcome,

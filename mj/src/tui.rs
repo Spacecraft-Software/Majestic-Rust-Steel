@@ -173,6 +173,9 @@ enum PromptAction {
     /// Ask the Architect agent: the typed natural-language request starts an agent turn (`Ctrl+Shift+N`).
     #[cfg(feature = "agent")]
     AskAgent,
+    /// Edit a pending agent edit's text before applying it (the Edit option of the approval card).
+    #[cfg(feature = "agent")]
+    EditApproval,
 }
 
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
@@ -1521,6 +1524,8 @@ impl App {
             }
             #[cfg(feature = "agent")]
             PromptAction::AskAgent => self.ask_agent(&input),
+            #[cfg(feature = "agent")]
+            PromptAction::EditApproval => self.agent_host.answer_modified(&mut self.agent, &input),
         }
     }
 
@@ -1855,6 +1860,7 @@ impl App {
                 KeyCode::Char('n' | 'N') | KeyCode::Escape => {
                     self.agent_host.answer_approval(&mut self.agent, false);
                 }
+                KeyCode::Char('e' | 'E') => self.start_edit_approval(),
                 _ => {}
             }
             return;
@@ -1873,6 +1879,16 @@ impl App {
     #[cfg(feature = "agent")]
     fn submit_agent_message(&mut self, message: &str) {
         self.agent_host.start_turn(&mut self.agent, message);
+    }
+
+    /// Opens the minibuffer to edit a pending edit's proposed text (the Edit option of the approval
+    /// card). A no-op when the pending change is not a single, editable edit.
+    #[cfg(feature = "agent")]
+    fn start_edit_approval(&mut self) {
+        if let Some(text) = self.agent_host.pending_edit_text() {
+            self.prompt = Some(Prompt::new("Edit the change", text));
+            self.prompt_action = Some(PromptAction::EditApproval);
+        }
     }
 
     /// Without the `agent` feature there is no backend: note it in the panel.

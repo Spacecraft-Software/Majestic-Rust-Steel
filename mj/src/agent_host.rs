@@ -15,7 +15,8 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use architect::{
-    CompletionRequest, HttpProvider, Message, Outcome, Provider, ToolCall, ToolSpec, Tools,
+    Approval, CompletionRequest, HttpProvider, Message, Outcome, Provider, ToolCall, ToolSpec,
+    Tools,
 };
 use majestic_agent::{
     buffer_tool_specs, preview_edits, shell_tool_spec, AgentEvent, AgentRunner, BufferTools,
@@ -53,7 +54,7 @@ pub struct AgentHost {
     tools: Vec<ToolSpec>,
     sandbox: Sandbox,
     runner: Option<AgentRunner>,
-    pending_approval: Option<(ToolCall, Sender<bool>)>,
+    pending_approval: Option<(ToolCall, Sender<Approval>)>,
     /// Whether the current turn has streamed any assistant text — so `Finished` does not re-print a
     /// reply the panel already rendered token by token.
     streamed: bool,
@@ -128,15 +129,50 @@ impl AgentHost {
         ));
     }
 
-    /// Answers a pending approval prompt and notes the decision; the blocked worker then continues.
+    /// Answers a pending approval (Apply or Reject) and notes the decision; the blocked worker then
+    /// continues.
     pub fn answer_approval(&mut self, panel: &mut AgentPanel, approve: bool) {
         if let Some((call, reply)) = self.pending_approval.take() {
-            let _ = reply.send(approve);
+            let _ = reply.send(if approve {
+                Approval::Run
+            } else {
+                Approval::Reject
+            });
             panel.push_system(if approve {
                 format!("approved `{}`", call.name)
             } else {
                 format!("rejected `{}`", call.name)
             });
+        }
+    }
+
+    /// The proposed text of a pending single-edit approval — what the Edit option pre-fills. `None`
+    /// when there is no editable pending edit (no approval, not an `edit`, or a multi-edit batch).
+    #[must_use]
+    pub fn pending_edit_text(&self) -> Option<String> {
+        let (call, _) = self.pending_approval.as_ref()?;
+        if call.name != "edit" {
+            return None;
+        }
+        let edits = call.arguments.get("edits")?.as_array()?;
+        if edits.len() != 1 {
+            return None; // editing is offered only for a single proposed edit
+        }
+        edits[0]
+            .get("text")?
+            .as_str()
+            .map(std::borrow::ToOwned::to_owned)
+    }
+
+    /// Applies the pending edit with the user's edited `text` substituted (the Edit option): the
+    /// blocked worker runs the modified call instead of the original.
+    pub fn answer_modified(&mut self, panel: &mut AgentPanel, text: &str) {
+        if let Some((mut call, reply)) = self.pending_approval.take() {
+            if let Some(slot) = call.arguments.pointer_mut("/edits/0/text") {
+                *slot = serde_json::Value::String(text.to_owned());
+            }
+            let _ = reply.send(Approval::RunModified(call));
+            panel.push_system("applied your edited change");
         }
     }
 
@@ -148,7 +184,7 @@ impl AgentHost {
             panel.push_system("stopping the agent…");
         }
         if let Some((_, reply)) = self.pending_approval.take() {
-            let _ = reply.send(false);
+            let _ = reply.send(Approval::Reject);
         }
     }
 
@@ -243,7 +279,7 @@ fn show_approval_diff(panel: &mut AgentPanel, buffer: &Buffer, call: &ToolCall) 
         panel.push_system(format!("approve `{}`? (y = yes / n = no)", call.name));
         return;
     }
-    panel.push_system("apply this edit? (y = apply / n = reject)");
+    panel.push_system("apply this edit? (y = apply / e = edit / n = reject)");
     for change in preview {
         panel.push_system(format!("@ line {}", change.line));
         if let Some(old) = change.old {
