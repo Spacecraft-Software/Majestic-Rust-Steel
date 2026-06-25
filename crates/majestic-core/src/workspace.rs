@@ -93,6 +93,25 @@ impl Node {
         }
     }
 
+    /// Adjusts every leaf's editor index after editor `removed` is deleted from the workspace's
+    /// `editors` vector: a leaf that showed it now shows `replacement`, and indices above `removed`
+    /// shift down by one to track the vector.
+    fn remap_editors(&mut self, removed: usize, replacement: usize) {
+        match self {
+            Self::Leaf(editor) => {
+                if *editor == removed {
+                    *editor = replacement;
+                } else if *editor > removed {
+                    *editor -= 1;
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.remap_editors(removed, replacement);
+                second.remap_editors(removed, replacement);
+            }
+        }
+    }
+
     /// Collects every leaf's editor index, in-order.
     fn collect_editors(&self, out: &mut Vec<usize>) {
         match self {
@@ -508,11 +527,44 @@ impl Workspace {
         self.editors[editor_index].cursor_screen_position(rect)
     }
 
+    /// The number of open buffers (tabs).
+    #[must_use]
+    pub fn buffer_count(&self) -> usize {
+        self.editors.len()
+    }
+
     /// Runs editor command `command` on the focused pane, propagating any resulting edit to the
-    /// other views of the same buffer.
+    /// other views of the same buffer. The workspace-level `close-buffer` is handled here; everything
+    /// else is an editor command.
     pub fn execute(&mut self, command: &str) {
+        if command == "close-buffer" {
+            self.close_active_buffer();
+            return;
+        }
         self.active_mut().execute(command);
         self.propagate_edits();
+    }
+
+    /// Closes the buffer shown in the focused pane (`close-buffer`, e.g. CUA `Ctrl+W`). The focused
+    /// pane then shows the next open buffer; closing the last remaining buffer replaces it with a fresh
+    /// empty scratch buffer, so a pane is never left without a buffer. Panes that were showing the
+    /// closed buffer follow to the same replacement; other panes keep their buffers.
+    pub fn close_active_buffer(&mut self) {
+        let Some(closing) = self.root.nth_editor(self.focused) else {
+            return;
+        };
+        if self.editors.len() <= 1 {
+            // The only buffer: swap in a fresh scratch rather than removing it (every leaf points here).
+            let mut scratch = Editor::new();
+            scratch.set_tab_width(self.tab_width);
+            scratch.set_profile(self.profile);
+            self.editors[closing] = scratch;
+            return;
+        }
+        self.editors.remove(closing);
+        // Show the next tab in any pane that held the closed buffer (or the last, if it was last).
+        let replacement = closing.min(self.editors.len() - 1);
+        self.root.remap_editors(closing, replacement);
     }
 
     /// Takes the focused pane's pending `find` request (set when the `find` command runs), clearing
@@ -1116,5 +1168,44 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&journal);
+    }
+
+    #[test]
+    fn close_buffer_removes_the_tab_then_replaces_the_last_with_a_scratch() {
+        let mut workspace = Workspace::new(Editor::with_buffer(Buffer::from_text("first")));
+        workspace.open(Editor::with_buffer(Buffer::from_text("second")));
+        workspace.open(Editor::with_buffer(Buffer::from_text("third")));
+        assert_eq!(workspace.buffer_count(), 3);
+        assert_eq!(workspace.active().buffer().text(), "third");
+
+        workspace.execute("close-buffer"); // close "third"; the focused pane shows the next buffer
+        assert_eq!(workspace.buffer_count(), 2);
+        assert_eq!(workspace.active().buffer().text(), "second");
+
+        workspace.execute("close-buffer"); // close "second"
+        assert_eq!(workspace.buffer_count(), 1);
+        assert_eq!(workspace.active().buffer().text(), "first");
+
+        workspace.execute("close-buffer"); // closing the last buffer leaves a fresh scratch
+        assert_eq!(workspace.buffer_count(), 1, "never zero buffers");
+        assert!(
+            workspace.active().buffer().text().is_empty(),
+            "the last buffer is replaced with an empty scratch"
+        );
+    }
+
+    #[test]
+    fn remap_editors_repoints_the_closed_leaf_and_shifts_higher_indices() {
+        // Two panes showing editors 0 and 2; editor 1 is removed from the vector.
+        let mut tree = Node::Split {
+            dir: Split::Columns,
+            ratio: 50,
+            first: Box::new(Node::Leaf(0)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        tree.remap_editors(1, 1); // removed=1: leaf 0 stays, leaf 2 shifts down to 1
+        let mut indices = Vec::new();
+        tree.collect_editors(&mut indices);
+        assert_eq!(indices, vec![0, 1]);
     }
 }
