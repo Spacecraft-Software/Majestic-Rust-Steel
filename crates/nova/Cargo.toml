@@ -13,9 +13,28 @@ description = "Majestic GPU renderer (wgpu + cosmic-text)."
 
 [dependencies]
 # The shared layout layer: Nova renders the same cell `Buffer` Penumbra emits to a TTY
-# (PRD-01 §6.5 renderer parity). The heavy GPU stack (wgpu/winit/cosmic-text) lands behind a
-# default-off `gpu` feature in M4.2, so `--workspace` gates stay cheap (see docs/nova.md §4).
+# (PRD-01 §6.5 renderer parity). Always built — the pure `Scene` model keeps `--workspace` cheap.
 penumbra = { version = "0.0.0", path = "../penumbra" }
+
+# The GPU stack, behind the default-off `gpu` feature so `--workspace` gates don't rebuild it
+# (docs/nova.md §4). winit 0.30 (ApplicationHandler), wgpu's safe `create_surface` (no unsafe,
+# §6.1), pollster to block on wgpu's async init, bytemuck to cast vertex/instance data to bytes.
+wgpu = { version = "26", optional = true }
+winit = { version = "0.30", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+[features]
+# Off by default: the cheap workspace gate builds only the pure `Scene` model. Build the GPU
+# renderer + the `mj-nova` binary deliberately with `cargo build -p nova --features gpu`.
+gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck"]
+
+# The GPU window front end. `required-features` keeps it out of a `gpu`-off (`--workspace`) build,
+# so the cheap gate never pulls wgpu/winit.
+[[bin]]
+name = "mj-nova"
+path = "src/main.rs"
+required-features = ["gpu"]
 
 [lints]
 workspace = true
