@@ -28,6 +28,8 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use keymaker::{KeyCode, KeyPress, Mods, Profile};
 
+#[cfg(feature = "agent")]
+use crate::agent_host::AgentHost;
 use crate::agent_panel::{AgentPanel, AGENT_COLS};
 use majestic_core::{
     Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
@@ -223,6 +225,9 @@ struct App {
     format_request: Option<(PathBuf, u64)>,
     /// The Architect agent sidebar (right of the editor). Hidden until toggled with `Ctrl+Shift+A`.
     agent: AgentPanel,
+    /// The governed agent's host — config + in-flight turn. Present with the `agent` feature.
+    #[cfg(feature = "agent")]
+    agent_host: AgentHost,
     focus: Focus,
 }
 
@@ -254,6 +259,8 @@ impl App {
             lsp_synced: HashMap::new(),
             format_request: None,
             agent: AgentPanel::new(),
+            #[cfg(feature = "agent")]
+            agent_host: AgentHost::new(),
             focus: Focus::Editor,
         }
     }
@@ -891,6 +898,10 @@ impl App {
         }
         if is_agent_toggle(key) {
             self.toggle_agent();
+            return Ok(());
+        }
+        if is_agent_stop(key) {
+            self.stop_agent();
             return Ok(());
         }
         match self.focus {
@@ -1786,19 +1797,90 @@ impl App {
         }
     }
 
-    /// Routes a key to the agent panel while it is focused. `Esc` returns focus to the editor; a
-    /// submitted message is, for now, echoed with a placeholder note (the live agent wires in next).
+    /// Routes a key to the agent panel while it is focused. While an approval is pending, `y` approves
+    /// and `n`/`Esc` rejects; otherwise `Esc` returns focus to the editor and a submitted message is
+    /// sent to the agent.
     fn agent_key(&mut self, key: KeyPress) {
+        #[cfg(feature = "agent")]
+        if self.agent_host.has_pending_approval() {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => self.agent_host.answer_approval(&mut self.agent, true),
+                KeyCode::Char('n' | 'N') | KeyCode::Escape => {
+                    self.agent_host.answer_approval(&mut self.agent, false);
+                }
+                _ => {}
+            }
+            return;
+        }
         if key.code == KeyCode::Escape {
             self.focus = Focus::Editor;
             return;
         }
         if let Some(message) = self.agent.handle_key(key) {
-            self.agent.push_user(message);
-            self.agent
-                .push_system("Agent backend connects in the next change.");
+            self.agent.push_user(message.clone());
+            self.submit_agent_message(&message);
         }
     }
+
+    /// Hands a submitted panel message to the agent (starts a governed turn).
+    #[cfg(feature = "agent")]
+    fn submit_agent_message(&mut self, message: &str) {
+        self.agent_host.start_turn(&mut self.agent, message);
+    }
+
+    /// Without the `agent` feature there is no backend: note it in the panel.
+    #[cfg(not(feature = "agent"))]
+    fn submit_agent_message(&mut self, message: &str) {
+        let _ = message;
+        self.agent
+            .push_system("this build has no agent backend (built without the `agent` feature)");
+    }
+
+    /// Engages the running agent's kill switch (`agent-stop-all`, `Ctrl+Shift+K`).
+    #[cfg(feature = "agent")]
+    fn stop_agent(&mut self) {
+        self.agent_host.stop(&mut self.agent);
+    }
+
+    /// No agent to stop without the feature.
+    #[cfg(not(feature = "agent"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "uniform no-op mirroring the agent-enabled method"
+    )]
+    fn stop_agent(&mut self) {}
+
+    /// Whether an agent turn is in flight (so the frame loop polls more responsively while it runs).
+    #[cfg(feature = "agent")]
+    fn agent_running(&self) -> bool {
+        self.agent_host.is_running()
+    }
+
+    /// No turn can run without the feature.
+    #[cfg(not(feature = "agent"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "uniform no-op mirroring the agent-enabled method"
+    )]
+    fn agent_running(&self) -> bool {
+        false
+    }
+
+    /// Services the agent worker against the active buffer each frame (no-op without the feature).
+    #[cfg(feature = "agent")]
+    fn poll_agent(&mut self) {
+        let buffer = self.workspace.active_mut().buffer_mut();
+        // Split borrow: `agent` (panel) and `agent_host` are distinct fields from `workspace`.
+        self.agent_host.poll(&mut self.agent, buffer);
+    }
+
+    /// No worker to service without the feature.
+    #[cfg(not(feature = "agent"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "uniform no-op mirroring the agent-enabled method"
+    )]
+    fn poll_agent(&mut self) {}
 
     /// The directory the fuzzy file finder searches: the explorer root, else the working dir.
     fn project_root(&self) -> PathBuf {
@@ -2122,13 +2204,14 @@ pub(crate) fn run(
 
     loop {
         app.reap_dead_terminal();
+        app.poll_agent(); // service the agent worker's buffer/approval requests + completion
         app.render(screen.back_mut(), &theme);
         screen.present(&mut out)?;
         out.flush()?;
 
-        // Poll quickly while a shell streams output (even when the editor is focused); idle
-        // longer when only editing.
-        let mut timeout = if app.terminal_running() {
+        // Poll quickly while a shell streams output or an agent turn is running (even when the editor
+        // is focused, so tool requests are serviced promptly); idle longer when only editing.
+        let mut timeout = if app.terminal_running() || app.agent_running() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(200)
@@ -2207,6 +2290,14 @@ fn is_agent_toggle(key: KeyPress) -> bool {
     key.mods.contains(Mods::CTRL)
         && key.mods.contains(Mods::SHIFT)
         && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a'))
+}
+
+/// Whether `key` is the agent-stop-all panic key (`Ctrl+Shift+K`) — engages the running agent's
+/// kill switch from any focus, the user's stop button (PRD #1 §5.2.4).
+fn is_agent_stop(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && key.mods.contains(Mods::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k'))
 }
 
 /// Whether `key` is `Shift+Alt+F` (reformat the document — the universal "Format Document"

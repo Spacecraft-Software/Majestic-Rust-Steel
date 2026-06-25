@@ -1782,8 +1782,10 @@ dependencies = [
 name = "majestic"
 version = "0.0.0"
 dependencies = [
+ "architect",
  "crossterm 0.28.1",
  "keymaker",
+ "majestic-agent",
  "majestic-config",
  "majestic-core",
  "majestic-daemon",
@@ -1792,6 +1794,7 @@ dependencies = [
  "majestic-term",
  "oracle",
  "penumbra",
+ "seraph",
  "serde",
 ]
 

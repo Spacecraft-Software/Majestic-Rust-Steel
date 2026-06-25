@@ -18,10 +18,13 @@ pub const AGENT_COLS: u16 = 36;
 const PROMPT: &str = "> ";
 const PROMPT_COLS: u16 = 2;
 
-/// Who authored a transcript line. (The live agent adds an `Agent` speaker in the next change.)
+/// Who authored a transcript line.
 #[derive(Clone, Copy)]
 enum Speaker {
     User,
+    /// An agent reply — only produced with the `agent` feature.
+    #[cfg(feature = "agent")]
+    Agent,
     System,
 }
 
@@ -62,6 +65,15 @@ impl AgentPanel {
     pub fn push_user(&mut self, text: impl Into<String>) {
         self.lines.push(ChatLine {
             speaker: Speaker::User,
+            text: text.into(),
+        });
+    }
+
+    /// Appends a line authored by the agent.
+    #[cfg(feature = "agent")]
+    pub fn push_agent(&mut self, text: impl Into<String>) {
+        self.lines.push(ChatLine {
+            speaker: Speaker::Agent,
             text: text.into(),
         });
     }
@@ -163,6 +175,8 @@ impl AgentPanel {
         for line in &self.lines {
             let (marker, style) = match line.speaker {
                 Speaker::User => ("you ", Style::new(theme.info, theme.background).bold()),
+                #[cfg(feature = "agent")]
+                Speaker::Agent => ("ai  ", theme.base_style()),
                 Speaker::System => ("    ", Style::new(theme.accent, theme.background)),
             };
             let body: Vec<char> = format!("{marker}{}", line.text).chars().collect();
