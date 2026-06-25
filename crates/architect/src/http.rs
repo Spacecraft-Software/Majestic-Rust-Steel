@@ -11,6 +11,8 @@
 //! local servers; cloud HTTPS is a later, opt-in addition. When an API key is used it comes from the
 //! **environment**, set by the host — never from the manifest.
 
+use std::io::{BufRead, BufReader};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -129,6 +131,129 @@ fn map_response(wire: WireResponse) -> Result<CompletionResponse, ProviderError>
     })
 }
 
+/// One Server-Sent-Events chunk of a streaming `/chat/completions` response.
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+/// One choice's incremental `delta` in a [`StreamChunk`].
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+/// The incremental fields of a streamed choice: a text fragment and/or tool-call fragments.
+#[derive(Debug, Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCallDelta>,
+}
+
+/// A streamed tool-call fragment, keyed by `index`; `id`/name arrive once, `arguments` in pieces.
+#[derive(Debug, Deserialize)]
+struct StreamToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunctionDelta>,
+}
+
+/// The function name and string-encoded argument fragments of a [`StreamToolCallDelta`].
+#[derive(Debug, Deserialize)]
+struct StreamFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// A tool call being reassembled from streamed fragments.
+#[derive(Default)]
+struct ToolCallAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Reads an OpenAI-compatible SSE stream, calling `on_token` with each assistant text fragment and
+/// reassembling the full reply (content + tool calls, whose `arguments` arrive as string fragments).
+///
+/// Each event line is `data: <json>`; the stream ends at `data: [DONE]` or EOF. Unparseable chunks
+/// are skipped (servers interleave keep-alives and non-choice events).
+///
+/// # Errors
+/// Returns a [`ProviderError::Backend`] if the underlying reader fails mid-stream.
+fn read_sse_stream(
+    reader: impl BufRead,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<CompletionResponse, ProviderError> {
+    let mut content = String::new();
+    let mut tools: Vec<ToolCallAccumulator> = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|error| ProviderError::Backend(error.to_string()))?;
+        let Some(data) = line.strip_prefix("data:") else {
+            continue; // blank separators, comments, and headers are not data events
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+            continue; // tolerate keep-alives / shapes we don't model
+        };
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            continue;
+        };
+        if let Some(token) = choice.delta.content {
+            if !token.is_empty() {
+                on_token(&token);
+                content.push_str(&token);
+            }
+        }
+        for fragment in choice.delta.tool_calls {
+            if tools.len() <= fragment.index {
+                tools.resize_with(fragment.index + 1, ToolCallAccumulator::default);
+            }
+            let slot = &mut tools[fragment.index];
+            if let Some(id) = fragment.id {
+                slot.id = id;
+            }
+            if let Some(function) = fragment.function {
+                if let Some(name) = function.name {
+                    slot.name.push_str(&name);
+                }
+                if let Some(arguments) = function.arguments {
+                    slot.arguments.push_str(&arguments);
+                }
+            }
+        }
+    }
+
+    let tool_calls = tools
+        .into_iter()
+        .map(|accumulated| ToolCall {
+            id: accumulated.id,
+            name: accumulated.name,
+            arguments: serde_json::from_str(&accumulated.arguments).unwrap_or(Value::Null),
+        })
+        .collect();
+    Ok(CompletionResponse {
+        content,
+        tool_calls,
+    })
+}
+
 /// An OpenAI-compatible completion provider over HTTP. Local-first (Ollama by default), synchronous,
 /// and HTTP-only in this build. Holds a reusable connection agent.
 #[derive(Debug)]
@@ -182,11 +307,33 @@ impl Provider for HttpProvider {
             .map_err(|error| ProviderError::Backend(error.to_string()))?;
         map_response(wire)
     }
+
+    fn complete_streaming(
+        &self,
+        request: &CompletionRequest,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<CompletionResponse, ProviderError> {
+        let mut body = build_request(request, &self.model);
+        body.stream = true; // ask the server for an SSE token stream
+        let mut http = self
+            .agent
+            .post(&self.endpoint)
+            .set("content-type", "application/json");
+        if let Some(key) = &self.api_key {
+            http = http.set("authorization", &format!("Bearer {key}"));
+        }
+        let response = http
+            .send_json(&body)
+            .map_err(|error| ProviderError::Backend(error.to_string()))?;
+        read_sse_stream(BufReader::new(response.into_reader()), on_token)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request, map_response, HttpProvider, WireResponse, DEFAULT_BASE_URL};
+    use super::{
+        build_request, map_response, read_sse_stream, HttpProvider, WireResponse, DEFAULT_BASE_URL,
+    };
     use crate::provider::{CompletionRequest, Message, Provider, ToolSpec};
     use serde_json::json;
 
@@ -259,6 +406,50 @@ mod tests {
         let wire: WireResponse =
             serde_json::from_value(json!({ "choices": [] })).expect("deserialize");
         map_response(wire).expect_err("no choices is an error");
+    }
+
+    #[test]
+    fn read_sse_stream_streams_content_and_reassembles_fragmented_tool_calls() {
+        // A representative SSE stream: two content tokens, then a tool call whose name and JSON
+        // arguments arrive across several `data:` chunks, then `[DONE]`. Built with `json!` so the
+        // per-chunk escaping is correct by construction.
+        let chunks = [
+            json!({ "choices": [{ "delta": { "content": "Hel" } }] }),
+            json!({ "choices": [{ "delta": { "content": "lo" } }] }),
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 0, "id": "call_1", "function": { "name": "re" } }
+            ] } }] }),
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 0, "function": { "name": "ad", "arguments": "{\"path\":" } }
+            ] } }] }),
+            json!({ "choices": [{ "delta": { "tool_calls": [
+                { "index": 0, "function": { "arguments": "\"foo.rs\"}" } }
+            ] } }] }),
+        ];
+        let mut sse = String::new();
+        for chunk in &chunks {
+            sse.push_str("data: ");
+            sse.push_str(&chunk.to_string());
+            sse.push('\n');
+            sse.push('\n'); // SSE event separator
+        }
+        sse.push_str("data: [DONE]\n");
+
+        let mut tokens = Vec::new();
+        let response = read_sse_stream(std::io::Cursor::new(sse), &mut |token| {
+            tokens.push(token.to_owned());
+        })
+        .expect("the SSE stream parses");
+
+        assert_eq!(tokens, vec!["Hel", "lo"], "content streamed token by token");
+        assert_eq!(response.content, "Hello");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "read", "name fragments joined");
+        assert_eq!(
+            response.tool_calls[0].arguments["path"], "foo.rs",
+            "argument fragments reassembled into valid JSON"
+        );
     }
 
     #[test]
