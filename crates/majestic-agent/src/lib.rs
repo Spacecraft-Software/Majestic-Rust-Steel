@@ -22,4 +22,4 @@ pub use runner::{AgentEvent, AgentRunner};
 #[doc(inline)]
 pub use session::AgentSession;
 #[doc(inline)]
-pub use tools::{buffer_tool_specs, BufferTools};
+pub use tools::{buffer_tool_specs, preview_edits, BufferTools, EditPreview};

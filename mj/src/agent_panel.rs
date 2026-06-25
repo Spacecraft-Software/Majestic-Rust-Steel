@@ -18,13 +18,19 @@ pub const AGENT_COLS: u16 = 36;
 const PROMPT: &str = "> ";
 const PROMPT_COLS: u16 = 2;
 
-/// Who authored a transcript line.
+/// Who authored a transcript line. (Agent and diff lines are only produced with the `agent` feature.)
 #[derive(Clone, Copy)]
 enum Speaker {
     User,
-    /// An agent reply — only produced with the `agent` feature.
+    /// An agent reply.
     #[cfg(feature = "agent")]
     Agent,
+    /// A removed (old) line in a proposed edit's diff.
+    #[cfg(feature = "agent")]
+    DiffRemoved,
+    /// An added (new) line in a proposed edit's diff.
+    #[cfg(feature = "agent")]
+    DiffAdded,
     System,
 }
 
@@ -74,6 +80,24 @@ impl AgentPanel {
     pub fn push_agent(&mut self, text: impl Into<String>) {
         self.lines.push(ChatLine {
             speaker: Speaker::Agent,
+            text: text.into(),
+        });
+    }
+
+    /// Appends a removed (old) line of a proposed edit's diff.
+    #[cfg(feature = "agent")]
+    pub fn push_diff_removed(&mut self, text: impl Into<String>) {
+        self.lines.push(ChatLine {
+            speaker: Speaker::DiffRemoved,
+            text: text.into(),
+        });
+    }
+
+    /// Appends an added (new) line of a proposed edit's diff.
+    #[cfg(feature = "agent")]
+    pub fn push_diff_added(&mut self, text: impl Into<String>) {
+        self.lines.push(ChatLine {
+            speaker: Speaker::DiffAdded,
             text: text.into(),
         });
     }
@@ -177,6 +201,10 @@ impl AgentPanel {
                 Speaker::User => ("you ", Style::new(theme.info, theme.background).bold()),
                 #[cfg(feature = "agent")]
                 Speaker::Agent => ("ai  ", theme.base_style()),
+                #[cfg(feature = "agent")]
+                Speaker::DiffRemoved => ("- ", Style::new(theme.error, theme.background)),
+                #[cfg(feature = "agent")]
+                Speaker::DiffAdded => ("+ ", Style::new(theme.success, theme.background)),
                 Speaker::System => ("    ", Style::new(theme.accent, theme.background)),
             };
             let body: Vec<char> = format!("{marker}{}", line.text).chars().collect();

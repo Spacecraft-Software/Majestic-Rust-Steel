@@ -103,6 +103,59 @@ impl Tools for BufferTools<'_> {
     }
 }
 
+/// One edit's before/after preview for the approval UI: the cited 1-based `line`, the line's current
+/// content (`old`, absent for an insertion), and the proposed content (`new`, absent for a deletion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditPreview {
+    /// The 1-based line the edit cites (as the model wrote it).
+    pub line: usize,
+    /// The line's current content — `Some` for replace/delete, `None` for an insertion.
+    pub old: Option<String>,
+    /// The proposed content — `Some` for replace/insert, `None` for a deletion.
+    pub new: Option<String>,
+}
+
+/// Previews the `edit` tool `call` against `buffer` for the approval dialog — the before/after of each
+/// edit, keyed by current line number (it does not re-check tags; the gated [`BufferTools::run`] does
+/// that on apply). Returns an empty list if `call` is not a well-formed `edit`.
+#[must_use]
+pub fn preview_edits(buffer: &Buffer, call: &ToolCall) -> Vec<EditPreview> {
+    if call.name != "edit" {
+        return Vec::new();
+    }
+    let Ok(args) = serde_json::from_value::<EditArgs>(call.arguments.clone()) else {
+        return Vec::new();
+    };
+    let rope = buffer.rope();
+    let line_count = rope.len_lines();
+    args.edits
+        .into_iter()
+        .map(|edit| {
+            // The agent cites 1-based lines; the rope is 0-based. Guard the lookup so a bad line
+            // number previews as an insertion-like change rather than panicking.
+            let row = edit.line.saturating_sub(1);
+            let current = (row < line_count).then(|| rope.line(row));
+            match edit.op {
+                EditOp::Replace => EditPreview {
+                    line: edit.line,
+                    old: current,
+                    new: Some(edit.text),
+                },
+                EditOp::InsertAfter => EditPreview {
+                    line: edit.line,
+                    old: None,
+                    new: Some(edit.text),
+                },
+                EditOp::Delete => EditPreview {
+                    line: edit.line,
+                    old: current,
+                    new: None,
+                },
+            }
+        })
+        .collect()
+}
+
 /// The function-calling specs the agent advertises for [`BufferTools`]: `read` and `edit`. The host
 /// passes these to the provider so the model knows the tools and the exact hashline edit shape.
 #[must_use]
@@ -146,7 +199,7 @@ pub fn buffer_tool_specs() -> Vec<ToolSpec> {
 
 #[cfg(test)]
 mod tests {
-    use super::BufferTools;
+    use super::{preview_edits, BufferTools, EditPreview};
     use architect::{ToolCall, Tools};
     use majestic_core::{tagged_read, Buffer};
     use seraph::AgentAction;
@@ -226,5 +279,46 @@ mod tests {
             tools.action(&call("read", json!({}))),
             AgentAction::ReadPath { .. }
         ));
+    }
+
+    #[test]
+    fn preview_edits_shows_before_and_after_per_op() {
+        let buffer = Buffer::from_text("alpha\nbeta\ngamma");
+        let edit = call(
+            "edit",
+            json!({ "edits": [
+                { "line": 1, "tag": "x", "op": "replace", "text": "ALPHA" },
+                { "line": 2, "tag": "y", "op": "insert_after", "text": "inserted" },
+                { "line": 3, "tag": "z", "op": "delete" }
+            ] }),
+        );
+        let preview = preview_edits(&buffer, &edit);
+        assert_eq!(
+            preview,
+            vec![
+                EditPreview {
+                    line: 1,
+                    old: Some("alpha".to_owned()),
+                    new: Some("ALPHA".to_owned()),
+                },
+                EditPreview {
+                    line: 2,
+                    old: None,
+                    new: Some("inserted".to_owned()),
+                },
+                EditPreview {
+                    line: 3,
+                    old: Some("gamma".to_owned()),
+                    new: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_edits_ignores_non_edit_and_malformed_calls() {
+        let buffer = Buffer::from_text("x");
+        assert!(preview_edits(&buffer, &call("read", json!({}))).is_empty());
+        assert!(preview_edits(&buffer, &call("edit", json!({ "wrong": 1 }))).is_empty());
     }
 }

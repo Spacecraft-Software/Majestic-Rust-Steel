@@ -17,7 +17,7 @@ use std::sync::Arc;
 use architect::{
     CompletionRequest, HttpProvider, Message, Outcome, Provider, ToolCall, ToolSpec, Tools,
 };
-use majestic_agent::{buffer_tool_specs, AgentEvent, AgentRunner, BufferTools};
+use majestic_agent::{buffer_tool_specs, preview_edits, AgentEvent, AgentRunner, BufferTools};
 use majestic_core::Buffer;
 use seraph::{KillSwitch, Policy};
 
@@ -147,7 +147,7 @@ impl AgentHost {
                     let _ = reply.send(BufferTools::new(buffer).run(&call));
                 }
                 AgentEvent::Approve { call, reply } => {
-                    panel.push_system(format!("approve `{}`? (y/n)", call.name));
+                    show_approval_diff(panel, buffer, &call);
                     self.pending_approval = Some((call, reply));
                     return; // the worker is blocked until we answer
                 }
@@ -173,6 +173,26 @@ fn build_provider() -> Arc<dyn Provider> {
         std::env::var("MAJESTIC_AGENT_URL").unwrap_or_else(|_| DEFAULT_AGENT_BASE_URL.to_owned());
     let key = std::env::var("MAJESTIC_AGENT_KEY").ok();
     Arc::new(HttpProvider::new(url, model, key))
+}
+
+/// Renders a proposed edit as a +/- diff in the panel and prompts for approval. Falls back to a plain
+/// confirmation for a call that is not a previewable edit.
+fn show_approval_diff(panel: &mut AgentPanel, buffer: &Buffer, call: &ToolCall) {
+    let preview = preview_edits(buffer, call);
+    if preview.is_empty() {
+        panel.push_system(format!("approve `{}`? (y = yes / n = no)", call.name));
+        return;
+    }
+    panel.push_system("apply this edit? (y = apply / n = reject)");
+    for change in preview {
+        panel.push_system(format!("@ line {}", change.line));
+        if let Some(old) = change.old {
+            panel.push_diff_removed(old);
+        }
+        if let Some(new) = change.new {
+            panel.push_diff_added(new);
+        }
+    }
 }
 
 /// The transcript text shown for a finished turn's [`Outcome`].
