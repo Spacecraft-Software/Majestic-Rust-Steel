@@ -11,5 +11,11 @@ license.workspace = true
 repository.workspace = true
 description = "Majestic GPU renderer (wgpu + cosmic-text)."
 
+[dependencies]
+# The shared layout layer: Nova renders the same cell `Buffer` Penumbra emits to a TTY
+# (PRD-01 §6.5 renderer parity). The heavy GPU stack (wgpu/winit/cosmic-text) lands behind a
+# default-off `gpu` feature in M4.2, so `--workspace` gates stay cheap (see docs/nova.md §4).
+penumbra = { version = "0.0.0", path = "../penumbra" }
+
 [lints]
 workspace = true
