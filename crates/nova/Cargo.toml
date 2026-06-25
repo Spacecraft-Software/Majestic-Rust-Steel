@@ -18,16 +18,18 @@ penumbra = { version = "0.0.0", path = "../penumbra" }
 
 # The GPU stack, behind the default-off `gpu` feature so `--workspace` gates don't rebuild it
 # (docs/nova.md §4). winit 0.30 (ApplicationHandler), wgpu's safe `create_surface` (no unsafe,
-# §6.1), pollster to block on wgpu's async init, bytemuck to cast vertex/instance data to bytes.
+# §6.1), pollster to block on wgpu's async init, bytemuck to cast vertex/instance data to bytes,
+# cosmic-text to shape + rasterise glyphs (M4.3). wgpu pinned to 26 — see docs/nova.md §3.
 wgpu = { version = "26", optional = true }
 winit = { version = "0.30", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
+cosmic-text = { version = "0.19", optional = true }
 
 [features]
 # Off by default: the cheap workspace gate builds only the pure `Scene` model. Build the GPU
 # renderer + the `mj-nova` binary deliberately with `cargo build -p nova --features gpu`.
-gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:cosmic-text"]
 
 # The GPU window front end. `required-features` keeps it out of a `gpu`-off (`--workspace`) build,
 # so the cheap gate never pulls wgpu/winit.

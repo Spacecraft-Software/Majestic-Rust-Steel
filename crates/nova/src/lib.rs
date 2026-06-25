@@ -153,10 +153,14 @@ pub fn build_scene(buffer: &Buffer, metrics: CellMetrics) -> Scene {
 // The GPU front end (M4.2+), behind the `gpu` feature so the pure model above stays in the cheap
 // `--workspace` gate (docs/nova.md §4). `mj-nova` (the binary) and these re-exports require it.
 #[cfg(feature = "gpu")]
+mod raster;
+#[cfg(feature = "gpu")]
 mod renderer;
 #[cfg(feature = "gpu")]
 mod window;
 
+#[cfg(feature = "gpu")]
+pub use raster::{GlyphRaster, RasterGlyph};
 #[cfg(feature = "gpu")]
 pub use renderer::Gpu;
 #[cfg(feature = "gpu")]
