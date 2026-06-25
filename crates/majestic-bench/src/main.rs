@@ -23,7 +23,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use keymaker::KeyPress;
-use majestic_core::{Buffer, Editor, Workspace};
+use majestic_core::{
+    apply_hashline, tagged_read, Buffer, Editor, HashlineEdit, LineRef, Workspace,
+};
 use penumbra::{Buffer as Surface, Theme};
 
 /// One rendered frame's budget — a 60 Hz refresh (PRD §7: keypress p99 and scroll ≤ 16 ms).
@@ -43,6 +45,7 @@ fn main() -> ExitCode {
         keypress("keypress (highlighted .rs, 800 lines)", true, 800, true),
         scroll_highlighted(5_000),
         open_large(32),
+        edit_format(),
     ];
 
     print_report(&outcomes);
@@ -245,6 +248,103 @@ fn open_large(megabytes: usize) -> Outcome {
     }
 }
 
+/// Edit-format robustness (PRD #1 M3 exit criterion): the hashline primitive must be **at least as
+/// correct as** a `str_replace` baseline. The decisive case is a buffer full of *identical* lines —
+/// the ambiguity a string match cannot resolve. Each intended edit targets one specific occurrence:
+/// hashline cites that line by number + BLAKE3 tag and lands on it; `str_replace` (replace-first) can
+/// only ever hit occurrence 0, so it clobbers the wrong line for every later target.
+///
+/// Informational latency, but the criterion itself is *gated* by the assertions below: the harness
+/// fails (non-zero exit) if hashline ever misapplies or falls behind `str_replace`.
+fn edit_format() -> Outcome {
+    const GROUPS: usize = 64;
+    // Interleave a unique line and an identical "    step();" so the ambiguous line recurs GROUPS
+    // times at distinct positions (its 0-based index for group g is `2 * g + 1`).
+    let mut lines = Vec::with_capacity(GROUPS * 2);
+    for g in 0..GROUPS {
+        lines.push(format!("uniq_{g}"));
+        lines.push("    step();".to_owned());
+    }
+    let original = lines.join("\n");
+    let target_index = |g: usize| 2 * g + 1;
+    let replacement = |g: usize| format!("    step_{g}();");
+
+    // hashline: cite the exact line + tag, so the intended occurrence is the one that changes.
+    let start = Instant::now();
+    let mut hashline_correct = 0usize;
+    for g in 0..GROUPS {
+        let mut buffer = Buffer::from_text(&original);
+        let index = target_index(g);
+        let edit = HashlineEdit::Replace {
+            at: LineRef::new(index, tag_at(&buffer, index)),
+            text: replacement(g),
+        };
+        if apply_hashline(&mut buffer, &[edit]).is_ok()
+            && only_line_changed(&buffer, &original, index, &replacement(g))
+        {
+            hashline_correct += 1;
+        }
+    }
+    let hashline_elapsed = start.elapsed();
+
+    // str_replace baseline: replace the first textual occurrence — always occurrence 0.
+    let start = Instant::now();
+    let mut str_replace_correct = 0usize;
+    for g in 0..GROUPS {
+        let edited = original.replacen("    step();", &replacement(g), 1);
+        let buffer = Buffer::from_text(&edited);
+        if only_line_changed(&buffer, &original, target_index(g), &replacement(g)) {
+            str_replace_correct += 1;
+        }
+    }
+    let str_replace_elapsed = start.elapsed();
+
+    // The gate: hashline applies every edit to the intended line, and is never less correct.
+    assert!(
+        hashline_correct == GROUPS,
+        "hashline must apply every edit to the cited line ({hashline_correct}/{GROUPS})"
+    );
+    assert!(
+        hashline_correct >= str_replace_correct,
+        "M3 exit criterion: hashline ({hashline_correct}) must be at least as correct as str_replace ({str_replace_correct})"
+    );
+
+    Outcome {
+        name: "edit format: hashline vs str_replace (disambiguation)",
+        headline: hashline_elapsed,
+        budget: FRAME_BUDGET,
+        gated: false, // the gate is the correctness assertion above, not a latency budget
+        detail: format!(
+            "hashline {hashline_correct}/{GROUPS} correct ({}) | str_replace {str_replace_correct}/{GROUPS} correct ({}) — hashline disambiguates identical lines str_replace cannot",
+            micros(hashline_elapsed),
+            micros(str_replace_elapsed),
+        ),
+    }
+}
+
+/// The hashline tag `tagged_read` assigns to 0-based `index` of `buffer` (as the agent would cite it).
+fn tag_at(buffer: &Buffer, index: usize) -> String {
+    let read = tagged_read(buffer);
+    let row = read.lines().nth(index).expect("line present");
+    let after_colon = row.split_once(':').expect("colon").1;
+    after_colon.split_once('│').expect("separator").0.to_owned()
+}
+
+/// Whether `buffer` differs from `original` in exactly one line — line `index`, now equal to `text`.
+fn only_line_changed(buffer: &Buffer, original: &str, index: usize, text: &str) -> bool {
+    let after = buffer.text();
+    let before: Vec<&str> = original.lines().collect();
+    let now: Vec<&str> = after.lines().collect();
+    before.len() == now.len()
+        && now.get(index) == Some(&text)
+        && before
+            .iter()
+            .zip(&now)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .all(|(line, _)| line == index)
+}
+
 /// A blank editor-sized framebuffer.
 fn blank_surface(theme: &Theme) -> Surface {
     Surface::new(WIDTH, HEIGHT, theme.base_style())
@@ -269,6 +369,11 @@ fn quantile(sorted: &[Duration], permille: usize) -> Duration {
 /// Formats a duration as milliseconds with microsecond precision.
 fn millis(duration: Duration) -> String {
     format!("{:.3} ms", duration.as_secs_f64() * 1000.0)
+}
+
+/// Formats a duration as microseconds (for sub-millisecond comparisons).
+fn micros(duration: Duration) -> String {
+    format!("{:.1} µs", duration.as_secs_f64() * 1_000_000.0)
 }
 
 /// Prints the scenario table.
