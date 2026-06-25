@@ -1796,6 +1796,7 @@ dependencies = [
  "penumbra",
  "seraph",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

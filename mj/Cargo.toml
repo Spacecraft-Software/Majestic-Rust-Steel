@@ -55,3 +55,5 @@ oracle = { version = "0.0.0", path = "../crates/oracle" }
 penumbra = { version = "0.0.0", path = "../crates/penumbra" }
 # The attach wire messages (AttachInput / ServerFrame) derive serde.
 serde = { version = "1.0.228", features = ["derive"] }
+# Reads the `command` field out of a `shell` tool call's JSON arguments for the approval prompt.
+serde_json = "1"

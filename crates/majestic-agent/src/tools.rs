@@ -156,6 +156,31 @@ pub fn preview_edits(buffer: &Buffer, call: &ToolCall) -> Vec<EditPreview> {
         .collect()
 }
 
+/// The function-calling spec for the `shell` tool: run one program (no shell features) in the project
+/// directory. The host advertises it only when the policy permits some shell (a non-empty allow-list);
+/// every invocation is still policy-gated and user-approved, and runs in the [`seraph::Sandbox`].
+#[must_use]
+pub fn shell_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "shell".to_owned(),
+        description: "Run a single program in the project directory and return its output. There is \
+                      NO shell: pipes, redirects, `;`/`&&` chaining, globs, and `$(…)` do not work — \
+                      pass one program and its arguments. The program must be on the allow-list and \
+                      the user approves every command."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "the command line, e.g. `cargo test` or `git status`"
+                }
+            },
+            "required": ["command"]
+        }),
+    }
+}
+
 /// The function-calling specs the agent advertises for [`BufferTools`]: `read` and `edit`. The host
 /// passes these to the provider so the model knows the tools and the exact hashline edit shape.
 #[must_use]
