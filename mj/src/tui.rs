@@ -170,6 +170,9 @@ enum PromptAction {
     GotoLine,
     /// Go to symbol in the project: the typed text queries `workspace/symbol`; matches open the picker.
     WorkspaceSymbol,
+    /// Ask the Architect agent: the typed natural-language request starts an agent turn (`Ctrl+Shift+N`).
+    #[cfg(feature = "agent")]
+    AskAgent,
 }
 
 /// The running application: the editor workspace, an optional explorer sidebar, and an optional
@@ -899,12 +902,7 @@ impl App {
             self.toggle_sidebar();
             return Ok(());
         }
-        if is_agent_toggle(key) {
-            self.toggle_agent();
-            return Ok(());
-        }
-        if is_agent_stop(key) {
-            self.stop_agent();
+        if self.try_agent_key(key) {
             return Ok(());
         }
         match self.focus {
@@ -1521,6 +1519,8 @@ impl App {
                     self.lsp.request_workspace_symbols(&path, input);
                 }
             }
+            #[cfg(feature = "agent")]
+            PromptAction::AskAgent => self.ask_agent(&input),
         }
     }
 
@@ -1786,6 +1786,26 @@ impl App {
         }
     }
 
+    /// Dispatches the agent control keys: toggle the panel (`Ctrl+Shift+A`), stop the agent
+    /// (`Ctrl+Shift+K`), or open the quake "Ask Architect" prompt (`Ctrl+Shift+N`). Returns `true` when
+    /// `key` triggered one (the caller then returns). Kept out of `handle_key` for its line budget.
+    fn try_agent_key(&mut self, key: KeyPress) -> bool {
+        if is_agent_toggle(key) {
+            self.toggle_agent();
+            return true;
+        }
+        if is_agent_stop(key) {
+            self.stop_agent();
+            return true;
+        }
+        #[cfg(feature = "agent")]
+        if is_agent_prompt(key) {
+            self.open_agent_prompt();
+            return true;
+        }
+        false
+    }
+
     /// Toggles the Architect agent sidebar (`Ctrl+Shift+A`): shows and focuses it, hides it when it is
     /// already focused, or just focuses it when shown but unfocused — mirroring the explorer toggle.
     fn toggle_agent(&mut self) {
@@ -1798,6 +1818,30 @@ impl App {
         } else {
             self.focus = Focus::Architect;
         }
+    }
+
+    /// Opens the quake "Ask Architect" minibuffer (`Ctrl+Shift+N`): a one-line natural-language request
+    /// that starts an agent turn from anywhere, without first focusing the sidebar.
+    #[cfg(feature = "agent")]
+    fn open_agent_prompt(&mut self) {
+        self.prompt = Some(Prompt::new("Ask Architect", ""));
+        self.prompt_action = Some(PromptAction::AskAgent);
+    }
+
+    /// Starts an agent turn from the quake prompt: shows and focuses the panel and submits `message`,
+    /// so the streaming reply (and any approval prompt) lands in the now-visible sidebar.
+    #[cfg(feature = "agent")]
+    fn ask_agent(&mut self, message: &str) {
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            return;
+        }
+        if !self.agent.is_visible() {
+            self.agent.toggle();
+        }
+        self.focus = Focus::Architect;
+        self.agent.push_user(message.clone());
+        self.agent_host.start_turn(&mut self.agent, &message);
     }
 
     /// Routes a key to the agent panel while it is focused. While an approval is pending, `y` approves
@@ -2301,6 +2345,14 @@ fn is_agent_stop(key: KeyPress) -> bool {
     key.mods.contains(Mods::CTRL)
         && key.mods.contains(Mods::SHIFT)
         && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k'))
+}
+
+/// Whether `key` is the quake "Ask Architect" NL-prompt key (`Ctrl+Shift+N`).
+#[cfg(feature = "agent")]
+fn is_agent_prompt(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && key.mods.contains(Mods::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'n'))
 }
 
 /// Whether `key` is `Shift+Alt+F` (reformat the document — the universal "Format Document"
