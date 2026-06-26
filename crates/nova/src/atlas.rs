@@ -100,7 +100,7 @@ pub struct GlyphAtlas {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     packer: ShelfPacker,
-    cache: HashMap<char, Option<AtlasEntry>>,
+    cache: HashMap<(char, bool), Option<AtlasEntry>>,
     raster: GlyphRaster,
     ascent: f32,
     cell_metrics: CellMetrics,
@@ -187,20 +187,22 @@ impl GlyphAtlas {
         &self.bind_group
     }
 
-    /// Returns the atlas entry for `ch`, rasterising + uploading it on first use. `None` if the font
-    /// has no glyph for `ch` or the atlas is full (the glyph is then simply not drawn). Cached per char.
-    pub fn entry(&mut self, queue: &wgpu::Queue, ch: char) -> Option<AtlasEntry> {
-        if let Some(cached) = self.cache.get(&ch) {
+    /// Returns the atlas entry for `ch`, rasterising + uploading it on first use. When `icon`, `ch` is
+    /// a Material icon codepoint drawn from the icon font (M4.6). `None` if the font has no glyph for it
+    /// or the atlas is full (the glyph is then simply not drawn). Cached per `(char, icon)`.
+    pub fn entry(&mut self, queue: &wgpu::Queue, ch: char, icon: bool) -> Option<AtlasEntry> {
+        if let Some(cached) = self.cache.get(&(ch, icon)) {
             return *cached;
         }
-        let entry = self.rasterise_and_pack(queue, ch);
-        self.cache.insert(ch, entry);
+        let entry = self.rasterise_and_pack(queue, ch, icon);
+        self.cache.insert((ch, icon), entry);
         entry
     }
 
-    /// Rasterises `ch`, packs it into the atlas texture, and returns its [`AtlasEntry`].
-    fn rasterise_and_pack(&mut self, queue: &wgpu::Queue, ch: char) -> Option<AtlasEntry> {
-        let glyph = self.raster.rasterize(ch)?;
+    /// Rasterises `ch` (from the icon font when `icon`), packs it into the atlas texture, and returns
+    /// its [`AtlasEntry`].
+    fn rasterise_and_pack(&mut self, queue: &wgpu::Queue, ch: char, icon: bool) -> Option<AtlasEntry> {
+        let glyph = self.raster.rasterize(ch, icon)?;
         if glyph.width == 0 || glyph.height == 0 {
             return None; // whitespace etc. — an advance but nothing to draw
         }

@@ -31,20 +31,42 @@ pub fn char_width(ch: char) -> u16 {
     }
 }
 
-/// A single screen cell: a character and its [`Style`].
+/// A semantic icon a cell can carry for richer rendering. The TTY renderer ignores it and shows the
+/// cell's [`symbol`](Cell::symbol); the GPU renderer (Nova, M4.6) draws the matching Material icon in
+/// the cell instead. So a folder row reads `▸ src` in the terminal and shows a folder glyph in the
+/// GUI — same layout either way (PRD §6.5 parity: the GUI is *richer*, not *different*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icon {
+    /// A collapsed directory.
+    Folder,
+    /// An expanded directory.
+    FolderOpen,
+    /// A generic file.
+    File,
+    /// A source-code file.
+    Code,
+}
+
+/// A single screen cell: a character, its [`Style`], and an optional semantic [`Icon`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     /// The displayed character.
     pub symbol: char,
     /// The cell's colors and attributes.
     pub style: Style,
+    /// An optional semantic icon for richer (GPU) rendering; the TTY path ignores it. See [`Icon`].
+    pub icon: Option<Icon>,
 }
 
 impl Cell {
-    /// Creates a cell with `symbol` and `style`.
+    /// Creates a cell with `symbol` and `style` (no icon).
     #[must_use]
     pub const fn new(symbol: char, style: Style) -> Self {
-        Self { symbol, style }
+        Self {
+            symbol,
+            style,
+            icon: None,
+        }
     }
 
     /// Creates a blank (space) cell in `style`.
@@ -154,6 +176,15 @@ impl Buffer {
         self.set(x, y, Cell::new(symbol, style));
         if char_width(symbol) == 2 {
             self.set(x.saturating_add(1), y, Cell::continuation(style));
+        }
+    }
+
+    /// Sets (or clears) the semantic [`Icon`] of the cell at `(x, y)`, leaving its symbol and style
+    /// untouched (clipped — out-of-bounds is a no-op). The TTY renderer ignores it; the GPU renderer
+    /// draws the icon glyph in the cell. A front end sets this after writing the cell's text.
+    pub fn set_icon(&mut self, x: u16, y: u16, icon: Option<Icon>) {
+        if let Some(index) = self.index(x, y) {
+            self.cells[index].icon = icon;
         }
     }
 

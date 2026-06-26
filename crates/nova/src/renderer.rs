@@ -253,7 +253,7 @@ impl Gpu {
         let ascent = self.atlas.ascent();
         let mut instances = Vec::with_capacity(scene.glyphs.len());
         for glyph in &scene.glyphs {
-            if let Some(entry) = self.atlas.entry(&self.queue, glyph.ch) {
+            if let Some(entry) = self.atlas.entry(&self.queue, glyph.ch, glyph.icon) {
                 instances.push(GlyphInstance {
                     pos: [glyph.x + entry.left, glyph.y + ascent - entry.top],
                     size: [entry.width, entry.height],

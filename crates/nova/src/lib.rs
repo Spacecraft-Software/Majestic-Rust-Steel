@@ -20,7 +20,7 @@
 //! wgpu surface + `cosmic-text` atlas that consume a [`Scene`] land in M4.2 / M4.3 behind the `gpu`
 //! feature, so this model stays in the cheap `--workspace` gate.
 
-use penumbra::{char_width, Buffer, Rgb};
+use penumbra::{char_width, Buffer, Icon, Rgb};
 
 /// The font size in pixels Nova renders cells at (M4.3). Shared so the cell grid the demo lays out
 /// (via [`GlyphRaster::cell_metrics`](crate::GlyphRaster)) matches the glyph atlas the renderer fills.
@@ -77,6 +77,9 @@ pub struct Glyph {
     pub bold: bool,
     /// Whether the cell is underlined.
     pub underline: bool,
+    /// Whether `ch` is a Material icon codepoint — rasterised from the bundled icon font rather than
+    /// the text font (M4.6). Set when the source cell carried a [`penumbra::Icon`].
+    pub icon: bool,
 }
 
 /// A renderer-agnostic draw list for one frame: background [`Quad`]s and [`Glyph`] placements, in
@@ -98,6 +101,17 @@ fn normalized(rgb: Rgb) -> [f32; 4] {
         f32::from(rgb.b) / 255.0,
         1.0,
     ]
+}
+
+/// The bundled Material Icons codepoint for a semantic [`Icon`] (M4.6). The icon *vocabulary* is
+/// penumbra's (shared by both renderers); these private codepoints are this font's encoding of it.
+fn icon_codepoint(icon: Icon) -> char {
+    match icon {
+        Icon::Folder => '\u{e2c7}',     // folder
+        Icon::FolderOpen => '\u{e2c8}', // folder_open
+        Icon::File => '\u{e24d}',       // insert_drive_file
+        Icon::Code => '\u{e86f}',       // code
+    }
 }
 
 /// Translates a cell [`Buffer`] into a [`Scene`] of background quads + glyph placements, at
@@ -138,7 +152,19 @@ pub fn build_scene(buffer: &Buffer, metrics: CellMetrics) -> Scene {
                 height: metrics.height,
                 color: normalized(fill),
             });
-            if cell.symbol != ' ' {
+            if let Some(icon) = cell.icon {
+                // A semantic icon overrides the cell's character: Nova draws the Material glyph in the
+                // cell (even a blank cell with an icon), from the icon font (M4.6).
+                scene.glyphs.push(Glyph {
+                    ch: icon_codepoint(icon),
+                    x,
+                    y,
+                    color: normalized(ink),
+                    bold: false,
+                    underline: false,
+                    icon: true,
+                });
+            } else if cell.symbol != ' ' {
                 scene.glyphs.push(Glyph {
                     ch: cell.symbol,
                     x,
@@ -146,6 +172,7 @@ pub fn build_scene(buffer: &Buffer, metrics: CellMetrics) -> Scene {
                     color: normalized(ink),
                     bold: cell.style.attrs.bold,
                     underline: cell.style.attrs.underline,
+                    icon: false,
                 });
             }
             col = col.saturating_add(cells_wide);
@@ -223,6 +250,7 @@ mod tests {
                 color: normalized(fg),
                 bold: false,
                 underline: false,
+                icon: false,
             }]
         );
     }
@@ -258,6 +286,7 @@ mod tests {
                 color: normalized(bg),
                 bold: false,
                 underline: false,
+                icon: false,
             }]
         );
     }
@@ -319,8 +348,8 @@ mod tests {
 /// same picture out": divergence is a test failure, not a rendering surprise.
 #[cfg(test)]
 mod parity {
-    use super::{build_scene, normalized, CellMetrics, Glyph, Quad};
-    use penumbra::{char_width, Buffer, Rgb, Style};
+    use super::{build_scene, icon_codepoint, normalized, CellMetrics, Glyph, Quad};
+    use penumbra::{char_width, Buffer, Icon, Rgb, Style};
 
     const METRICS: CellMetrics = CellMetrics::new(8.0, 16.0);
 
@@ -357,7 +386,17 @@ mod parity {
                     height: metrics.height,
                     color: normalized(fill),
                 });
-                if cell.symbol != ' ' {
+                if let Some(icon) = cell.icon {
+                    glyphs.push(Glyph {
+                        ch: icon_codepoint(icon),
+                        x,
+                        y,
+                        color: normalized(ink),
+                        bold: false,
+                        underline: false,
+                        icon: true,
+                    });
+                } else if cell.symbol != ' ' {
                     glyphs.push(Glyph {
                         ch: cell.symbol,
                         x,
@@ -365,6 +404,7 @@ mod parity {
                         color: normalized(ink),
                         bold: cell.style.attrs.bold,
                         underline: cell.style.attrs.underline,
+                        icon: false,
                     });
                 }
                 col = col.saturating_add(wide);
@@ -412,6 +452,22 @@ mod parity {
         let mut buffer = Buffer::new(4, 1, style);
         buffer.set_char(1, 0, '好', style); // wide glyph at col 1, continuation at col 2
         assert_parity(&buffer, METRICS);
+    }
+
+    #[test]
+    fn an_icon_cell_draws_the_material_glyph_not_the_character() {
+        let style = Style::new(Rgb { r: 0xD9, g: 0x8E, b: 0x32 }, Rgb { r: 0, g: 0, b: 0x27 });
+        let mut buffer = Buffer::new(6, 1, style);
+        buffer.set_str(0, 0, "▸ src", style); // a collapsed-folder row, as the explorer writes it…
+        buffer.set_icon(0, 0, Some(Icon::Folder)); // …with a semantic folder icon on the marker cell
+        let scene = build_scene(&buffer, METRICS);
+
+        // The icon overrides the marker character: the first glyph is the Material folder codepoint,
+        // flagged for the icon font — not '▸'.
+        assert!(scene.glyphs[0].icon, "the marker glyph is drawn from the icon font");
+        assert_eq!(scene.glyphs[0].ch, '\u{e2c7}', "the Material `folder` codepoint");
+        assert_eq!(scene.glyphs[1].ch, 's', "the label still follows in the text font");
+        assert_parity(&buffer, METRICS); // the whole scene still matches the reference walk
     }
 
     /// The flagship case: a *real* editor frame. A live [`App`](majestic::App) renders a typed line +
