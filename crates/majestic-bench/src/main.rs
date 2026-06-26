@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         scroll_highlighted(5_000),
         open_large(32),
         edit_format(),
+        nova_scene(),
     ];
 
     print_report(&outcomes);
@@ -171,6 +172,52 @@ fn keypress(name: &'static str, highlighted: bool, lines: usize, gated: bool) ->
         gated,
         detail: format!(
             "p50 {} | p99 {} | max {} over {} keystrokes{note}",
+            millis(quantile(&samples, 500)),
+            millis(p99),
+            millis(quantile(&samples, 1000)),
+            samples.len(),
+        ),
+    }
+}
+
+/// Nova's per-frame translation latency (M4.5, the GUI half of the §7 frame budget): `build_scene`
+/// turning a full editor-sized cell buffer into the renderer-agnostic draw list.
+///
+/// The GUI frame is `App::render` (the keypress scenarios, shared with the TTY) + this translation +
+/// the GPU submit. This isolates the Nova-specific CPU cost, which must stay a small fraction of the
+/// 16 ms frame; a dense, nearly-all-glyph screen is its worst case.
+fn nova_scene() -> Outcome {
+    let theme = Theme::steelbore();
+    let base = theme.base_style();
+    let (cols, rows) = (120_u16, 40_u16);
+    let mut buffer = penumbra::Buffer::new(cols, rows, base);
+    let line = "    let scene = build_scene(&buffer, metrics); // representative editor content";
+    for row in 0..rows {
+        for (index, ch) in line.chars().enumerate() {
+            let col = u16::try_from(index).unwrap_or(u16::MAX);
+            if col < cols {
+                buffer.set_char(col, row, ch, base);
+            }
+        }
+    }
+    let metrics = nova::CellMetrics::new(8.0, 16.0);
+
+    let mut samples = Vec::with_capacity(500);
+    for _ in 0..500 {
+        let start = Instant::now();
+        let scene = nova::build_scene(&buffer, metrics);
+        samples.push(start.elapsed());
+        std::hint::black_box(&scene);
+    }
+    samples.sort_unstable();
+    let p99 = quantile(&samples, 990);
+    Outcome {
+        name: "nova build_scene (120×40 dense)",
+        headline: p99,
+        budget: FRAME_BUDGET,
+        gated: true,
+        detail: format!(
+            "p50 {} | p99 {} | max {} over {} translations",
             millis(quantile(&samples, 500)),
             millis(p99),
             millis(quantile(&samples, 1000)),

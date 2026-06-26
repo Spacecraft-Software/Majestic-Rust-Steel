@@ -24,3 +24,5 @@ workspace = true
 keymaker = { version = "0.0.0", path = "../keymaker" }
 majestic-core = { version = "0.0.0", path = "../majestic-core" }
 penumbra = { version = "0.0.0", path = "../penumbra" }
+# The pure (GPU-free) Nova `Scene` model, for the M4.5 GUI-frame latency scenario (`build_scene`).
+nova = { version = "0.0.0", path = "../nova" }
