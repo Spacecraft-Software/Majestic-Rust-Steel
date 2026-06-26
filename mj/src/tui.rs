@@ -613,6 +613,19 @@ impl App {
         self.poll_agent();
     }
 
+    /// The shared clipboard's current contents — what a paste inserts. A GUI front end mirrors this
+    /// out to the system clipboard after a copy/cut (M4).
+    #[must_use]
+    pub fn clipboard(&self) -> &str {
+        self.workspace.clipboard()
+    }
+
+    /// Replaces the shared clipboard (e.g. from the system clipboard, in the GUI), so the next paste
+    /// in any pane inserts it (M4).
+    pub fn set_clipboard(&mut self, text: &str) {
+        self.workspace.set_clipboard(text);
+    }
+
     /// The editing workspace (so the daemon can snapshot it into a session on detach).
     pub(crate) fn workspace(&self) -> &Workspace {
         &self.workspace

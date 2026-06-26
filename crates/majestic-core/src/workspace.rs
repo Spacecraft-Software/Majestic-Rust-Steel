@@ -709,6 +709,25 @@ impl Workspace {
         }
     }
 
+    /// The shared clipboard's current contents (the kill-ring head) — what a paste would insert. A
+    /// front end mirrors this *out* to the system clipboard after a copy/cut (the GUI, M4).
+    #[must_use]
+    pub fn clipboard(&self) -> &str {
+        &self.clipboard
+    }
+
+    /// Replaces the shared clipboard — e.g. mirroring the system clipboard *in* (the GUI, M4) — and
+    /// propagates it to every pane, so the next paste in any pane inserts it.
+    pub fn set_clipboard(&mut self, text: &str) {
+        if self.clipboard == text {
+            return;
+        }
+        text.clone_into(&mut self.clipboard);
+        for editor in &mut self.editors {
+            editor.set_clipboard(&self.clipboard);
+        }
+    }
+
     /// Splits the focused pane along `dir`, opening a **second view of the same buffer** in the
     /// new pane (Emacs `C-x 2`/`C-x 3`): shared text + undo, independent cursor and scroll. The
     /// new pane becomes focused; `Alt+←/→` re-points it at another buffer if desired.

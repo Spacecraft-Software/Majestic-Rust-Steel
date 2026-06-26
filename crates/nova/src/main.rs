@@ -28,7 +28,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if editors.is_empty() {
         editors.push(Editor::new()); // a scratch buffer when no files are given
     }
-    let app = App::new(Workspace::from_editors(editors));
+    // Honour the user's configuration — the keymap profile (Emacs/Vim/CUA/Spacemacs) and tab width —
+    // just as the TTY `mj` does, so the GUI is the same editor (M4 polish). Fail-soft: a bad manifest
+    // keeps the defaults.
+    let mut workspace = Workspace::from_editors(editors);
+    majestic::load_config(&mut workspace);
+    let app = App::new(workspace);
     nova::run_editor(app)?;
     Ok(())
 }

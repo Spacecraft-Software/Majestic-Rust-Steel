@@ -33,6 +33,10 @@ majestic = { version = "0.0.0", path = "../../mj", optional = true }
 majestic-core = { version = "0.0.0", path = "../majestic-core", optional = true }
 keymaker = { version = "0.0.0", path = "../keymaker", optional = true }
 
+# System-clipboard integration for the GUI (M4 polish): mirror copies/cuts out and pastes in. Best
+# effort — if it cannot reach the compositor's clipboard, the editor's own kill-ring still works.
+arboard = { version = "3", optional = true }
+
 [features]
 # Off by default: the cheap workspace gate builds only the pure `Scene` model. Build the GPU
 # renderer + the `mj-nova` binary deliberately with `cargo build -p nova --features gpu`.
@@ -45,6 +49,7 @@ gpu = [
     "dep:majestic",
     "dep:majestic-core",
     "dep:keymaker",
+    "dep:arboard",
 ]
 
 # The GPU window front end. `required-features` keeps it out of a `gpu`-off (`--workspace`) build,

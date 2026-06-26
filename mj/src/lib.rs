@@ -509,9 +509,11 @@ fn apply_config(workspace: &mut Workspace) -> Vec<String> {
     notices
 }
 
-/// Loads the configuration at startup and surfaces any problems as a status notice (startup
-/// phrasing: defaults stand, `--safe` skips). A thin wrapper over [`apply_config`].
-fn load_config(workspace: &mut Workspace) {
+/// Loads the hybrid configuration (Nickel manifest + Steel `config.scm`) and applies it to
+/// `workspace` — the keymap profile, tab width, and pinned extensions — surfacing any problems as a
+/// status notice (defaults stand; fail-soft). A front end calls this after building the workspace and
+/// before handing it to [`App::new`]; `mj-nova` uses it so the GUI honours the user's config (M4).
+pub fn load_config(workspace: &mut Workspace) {
     let notices = apply_config(workspace);
     if !notices.is_empty() {
         workspace.set_status(format!(
