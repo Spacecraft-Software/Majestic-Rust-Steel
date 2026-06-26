@@ -36,7 +36,7 @@ const WAKE: Token = Token(1);
 pub struct PtyTerminal {
     terminal: Arc<Mutex<Terminal>>,
     pty: Option<tty::Pty>,
-    writer: File,
+    writer: Arc<Mutex<File>>,
     reader: Option<JoinHandle<()>>,
     waker: Waker,
     stop: Arc<AtomicBool>,
@@ -81,8 +81,11 @@ impl PtyTerminal {
         let pty = tty::new(options, window_size(columns, screen_lines), 0)?;
 
         let reader_file = pty.file().try_clone()?;
-        let writer = pty.file().try_clone()?;
+        // The PTY write side is shared (`Arc<Mutex>`): the UI thread writes keystrokes, and the reader
+        // thread writes the emulator's replies to terminal queries — serialized so they never interleave.
+        let writer = Arc::new(Mutex::new(pty.file().try_clone()?));
         let reader_terminal = Arc::clone(&terminal);
+        let reader_writer = Arc::clone(&writer);
 
         // Build the poller on the UI thread so the shutdown `Waker` is available to `Drop`; the
         // `Poll` itself moves into the reader thread.
@@ -90,7 +93,8 @@ impl PtyTerminal {
         let waker = Waker::new(poll.registry(), WAKE)?;
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = Arc::clone(&stop);
-        let reader = thread::spawn(move || pump(poll, reader_file, &reader_terminal, &reader_stop));
+        let reader =
+            thread::spawn(move || pump(poll, reader_file, &reader_terminal, &reader_stop, &reader_writer));
 
         Ok(Self {
             terminal,
@@ -109,8 +113,9 @@ impl PtyTerminal {
     /// # Errors
     /// Returns an I/O error if writing to the PTY fails.
     pub fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writer.write_all(bytes)?;
+        writer.flush()
     }
 
     /// Resizes the terminal grid and informs the child via the PTY.
@@ -197,7 +202,13 @@ fn window_size(columns: usize, screen_lines: usize) -> WindowSize {
 /// `WouldBlock`, the reader blocks in `mio`'s readiness poll and only runs when the master has
 /// output or the [`Waker`] fires for shutdown. On each readable wake it drains all available
 /// bytes; when the child exits, the master reports EOF/`EIO` and the loop ends.
-fn pump(mut poll: Poll, mut reader: File, terminal: &Arc<Mutex<Terminal>>, stop: &AtomicBool) {
+fn pump(
+    mut poll: Poll,
+    mut reader: File,
+    terminal: &Arc<Mutex<Terminal>>,
+    stop: &AtomicBool,
+    writer: &Mutex<File>,
+) {
     let fd = reader.as_raw_fd();
     if poll
         .registry()
@@ -224,6 +235,15 @@ fn pump(mut poll: Poll, mut reader: File, terminal: &Arc<Mutex<Terminal>>, stop:
                 Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(ref error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return, // EIO etc. — the child is gone
+            }
+        }
+        // Answer any terminal queries the child made while we fed it (cursor-position report, device
+        // attributes, …) so query-driven programs (nu/reedline, vim, …) don't block on the reply.
+        let responses = lock(terminal).take_responses();
+        if !responses.is_empty() {
+            let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            if writer.write_all(&responses).is_ok() {
+                let _ = writer.flush();
             }
         }
     }
