@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 
 use crate::raster::GlyphRaster;
+use crate::CellMetrics;
 
 /// The square atlas texture's side in pixels — room for the ASCII set (and then some) at editor sizes.
 pub const ATLAS_SIZE: u32 = 1024;
@@ -102,6 +103,7 @@ pub struct GlyphAtlas {
     cache: HashMap<char, Option<AtlasEntry>>,
     raster: GlyphRaster,
     ascent: f32,
+    cell_metrics: CellMetrics,
 }
 
 impl GlyphAtlas {
@@ -154,6 +156,7 @@ impl GlyphAtlas {
 
         let mut raster = GlyphRaster::new(font_size);
         let ascent = raster.ascent();
+        let cell_metrics = raster.cell_metrics();
         Self {
             texture,
             bind_group,
@@ -161,6 +164,7 @@ impl GlyphAtlas {
             cache: HashMap::new(),
             raster,
             ascent,
+            cell_metrics,
         }
     }
 
@@ -168,6 +172,13 @@ impl GlyphAtlas {
     #[must_use]
     pub fn ascent(&self) -> f32 {
         self.ascent
+    }
+
+    /// The pixel-exact cell box (advance × line height) for this atlas's font — what a front end
+    /// divides the window by to get the cell grid, and feeds to `build_scene`.
+    #[must_use]
+    pub fn cell_metrics(&self) -> CellMetrics {
+        self.cell_metrics
     }
 
     /// The atlas texture's bind group (group 1 of the glyph pipeline).

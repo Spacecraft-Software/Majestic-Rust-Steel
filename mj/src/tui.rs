@@ -282,7 +282,10 @@ pub struct App {
 }
 
 impl App {
-    fn new(workspace: Workspace) -> Self {
+    /// Creates the editor over `workspace` — its open buffers, splits, and tabs — with the default
+    /// keymap profile and no sidebar/terminal/agent panel shown. A front end then drives it.
+    #[must_use]
+    pub fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
             explorer: None,
@@ -596,8 +599,18 @@ impl App {
         }
     }
 
-    fn should_quit(&self) -> bool {
+    /// Whether the editor has been told to quit (e.g. the last buffer was closed via the keymap).
+    #[must_use]
+    pub fn should_quit(&self) -> bool {
         self.workspace.should_quit()
+    }
+
+    /// Per-frame servicing a front end calls once before each [`Self::render`]: reaps a dead
+    /// integrated terminal and services the agent worker's buffer/approval requests + completion.
+    /// (The LSP sync runs inside [`Self::render`].)
+    pub fn tick(&mut self) {
+        self.reap_dead_terminal();
+        self.poll_agent();
     }
 
     /// The editing workspace (so the daemon can snapshot it into a session on detach).
@@ -605,9 +618,10 @@ impl App {
         &self.workspace
     }
 
-    /// Draws the sidebar, the editor area, the bottom terminal panel (when present), and the
-    /// status bar — the full UI.md layout.
-    fn render(&mut self, surface: &mut Buffer, theme: &Theme) {
+    /// Draws the sidebar, the editor area, the bottom terminal panel (when present), and the status
+    /// bar — the full UI.md layout — into `surface`, a cell buffer sized to the viewport. Also
+    /// reconciles LSP document sync + diagnostics before drawing.
+    pub fn render(&mut self, surface: &mut Buffer, theme: &Theme) {
         self.sync_lsp(); // reconcile document sync + apply diagnostics before drawing
         surface.clear(theme.base_style());
         let (body, status) = surface.area().split_bottom(1);
@@ -930,7 +944,12 @@ impl App {
         self.finder = Some(Finder::commands(&commands));
     }
 
-    fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
+    /// Routes a key press into the editor at the given viewport size (`columns` × `lines` cells):
+    /// global chords first, then the focused surface (editor / terminal / agent / explorer).
+    ///
+    /// # Errors
+    /// Propagates I/O errors from writing to the integrated terminal's PTY.
+    pub fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
         // The first-run selector is modal and outranks everything: it captures every key until
         // the user has chosen a keybinding profile.
         if self.selector.is_some() {
@@ -2497,8 +2516,7 @@ pub(crate) fn run(
     }
 
     loop {
-        app.reap_dead_terminal();
-        app.poll_agent(); // service the agent worker's buffer/approval requests + completion
+        app.tick(); // reap a dead terminal + service the agent worker's requests/completion
         app.render(screen.back_mut(), &theme);
         screen.present(&mut out)?;
         out.flush()?;

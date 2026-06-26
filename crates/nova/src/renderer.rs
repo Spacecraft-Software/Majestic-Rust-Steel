@@ -507,6 +507,13 @@ impl Gpu {
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
+
+    /// The pixel-exact cell box of the glyph font — the front end divides the surface by this to get
+    /// the cell grid, and feeds it to [`build_scene`](crate::build_scene).
+    #[must_use]
+    pub fn cell_metrics(&self) -> crate::CellMetrics {
+        self.atlas.cell_metrics()
+    }
 }
 
 #[cfg(test)]
