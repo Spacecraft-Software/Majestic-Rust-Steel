@@ -304,3 +304,137 @@ mod tests {
         );
     }
 }
+
+/// The Penumbra↔Nova parity suite (M4.5, exit criterion ①).
+///
+/// The renderer-parity rule (PRD-01 §6.5) is that Penumbra and Nova produce logically identical output
+/// for the same document state. Both consume the one shared layer — the cell [`Buffer`] that
+/// `App::render` fills. Penumbra renders that buffer to VT faithfully (its own tests); so the remaining
+/// question is whether Nova's [`Scene`] reflects the *same* buffer faithfully. [`assert_parity`] answers
+/// it: it walks the buffer cell-by-cell — the canonical reading both renderers must agree on — and
+/// asserts [`build_scene`]'s output matches exactly (a background quad per visible cell with the cell's
+/// effective background; a glyph per non-blank cell with its character + effective foreground +
+/// attributes; reverse swaps fg/bg; double-width glyphs span two cells and skip their continuation).
+/// Run over hand-built buffers *and* a real live [`App`](majestic::App) frame, that is "same buffer in →
+/// same picture out": divergence is a test failure, not a rendering surprise.
+#[cfg(test)]
+mod parity {
+    use super::{build_scene, normalized, CellMetrics, Glyph, Quad};
+    use penumbra::{char_width, Buffer, Rgb, Style};
+
+    const METRICS: CellMetrics = CellMetrics::new(8.0, 16.0);
+
+    /// Asserts Nova's `Scene` for `buffer` equals a cell-by-cell reference walk of it — the heart of the
+    /// parity suite. The reference is the buffer's canonical reading (what Penumbra also displays), so
+    /// equality means the two renderers agree.
+    fn assert_parity(buffer: &Buffer, metrics: CellMetrics) {
+        let scene = build_scene(buffer, metrics);
+        let mut quads = Vec::new();
+        let mut glyphs = Vec::new();
+        for row in 0..buffer.height() {
+            let mut col = 0;
+            while col < buffer.width() {
+                let Some(cell) = buffer.cell(col, row) else {
+                    col = col.saturating_add(1);
+                    continue;
+                };
+                if cell.symbol == '\0' {
+                    col = col.saturating_add(1); // continuation half of a wide glyph — nothing of its own
+                    continue;
+                }
+                let wide = char_width(cell.symbol).max(1);
+                let (ink, fill) = if cell.style.attrs.reverse {
+                    (cell.style.bg, cell.style.fg)
+                } else {
+                    (cell.style.fg, cell.style.bg)
+                };
+                let x = f32::from(col) * metrics.width;
+                let y = f32::from(row) * metrics.height;
+                quads.push(Quad {
+                    x,
+                    y,
+                    width: f32::from(wide) * metrics.width,
+                    height: metrics.height,
+                    color: normalized(fill),
+                });
+                if cell.symbol != ' ' {
+                    glyphs.push(Glyph {
+                        ch: cell.symbol,
+                        x,
+                        y,
+                        color: normalized(ink),
+                        bold: cell.style.attrs.bold,
+                        underline: cell.style.attrs.underline,
+                    });
+                }
+                col = col.saturating_add(wide);
+            }
+        }
+        // Whole-`Vec` comparisons (the derived `PartialEq`, not a bare float `==`) check order, count,
+        // position, colour, and attributes in one — any divergence is a concrete mismatch.
+        assert_eq!(
+            scene.quads, quads,
+            "Nova's background quads must match the buffer cell-for-cell"
+        );
+        assert_eq!(
+            scene.glyphs, glyphs,
+            "Nova's glyphs must match the buffer's visible text cell-for-cell"
+        );
+    }
+
+    /// Writes `text` into `buffer` from `(col0, row)` left-to-right (ASCII; one cell per char).
+    fn write(buffer: &mut Buffer, col0: u16, row: u16, text: &str, style: Style) {
+        for (index, ch) in text.chars().enumerate() {
+            let col = col0.saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+            buffer.set_char(col, row, ch, style);
+        }
+    }
+
+    #[test]
+    fn a_mixed_editor_buffer_reflects_faithfully_in_the_scene() {
+        let fg = Rgb { r: 0xD9, g: 0x8E, b: 0x32 };
+        let bg = Rgb { r: 0, g: 0, b: 0x27 };
+        let base = Style::new(fg, bg);
+        let mut buffer = Buffer::new(16, 4, base);
+        write(&mut buffer, 0, 0, "fn main() {", base);
+        let mut selected = base;
+        selected.attrs.reverse = true;
+        write(&mut buffer, 3, 0, "main", selected); // a reverse-video selection mid-line
+        write(&mut buffer, 0, 1, "    body();", base);
+        write(&mut buffer, 0, 2, "}", base);
+        // Row 3 and the line tails stay blank — quads, no glyphs.
+        assert_parity(&buffer, METRICS);
+    }
+
+    #[test]
+    fn a_double_width_glyph_reflects_faithfully_in_the_scene() {
+        let style = Style::new(Rgb { r: 0xD9, g: 0x8E, b: 0x32 }, Rgb { r: 0, g: 0, b: 0x27 });
+        let mut buffer = Buffer::new(4, 1, style);
+        buffer.set_char(1, 0, '好', style); // wide glyph at col 1, continuation at col 2
+        assert_parity(&buffer, METRICS);
+    }
+
+    /// The flagship case: a *real* editor frame. A live [`App`](majestic::App) renders a typed line +
+    /// the status bar + UI chrome into the shared buffer; Nova's scene must reflect every cell — the
+    /// representative editor state the parity rule is really about. (gpu feature: needs the `majestic`
+    /// editor library.)
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_live_app_frame_reflects_faithfully_in_the_scene() {
+        use keymaker::{KeyCode, KeyPress};
+        use majestic::App;
+        use majestic_core::{Editor, Workspace};
+        use penumbra::Theme;
+
+        let (cols, rows) = (80_u16, 24_u16);
+        let theme = Theme::steelbore();
+        let mut app = App::new(Workspace::from_editors(vec![Editor::new()]));
+        for ch in "fn main() { body(); }".chars() {
+            app.handle_key(KeyPress::key(KeyCode::Char(ch)), cols, rows)
+                .expect("typing into a scratch buffer never does terminal I/O");
+        }
+        let mut buffer = Buffer::new(cols, rows, theme.base_style());
+        app.render(&mut buffer, &theme);
+        assert_parity(&buffer, METRICS);
+    }
+}

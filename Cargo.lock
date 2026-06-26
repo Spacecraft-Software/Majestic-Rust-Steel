@@ -2375,6 +2375,7 @@ version = "0.0.0"
 dependencies = [
  "keymaker",
  "majestic-core",
+ "nova",
  "penumbra",
 ]
 
