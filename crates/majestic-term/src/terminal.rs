@@ -10,8 +10,9 @@
 //! the next majestic-term step; this layer is the headless-testable emulation core.
 
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -43,12 +44,35 @@ impl Dimensions for GridSize {
     }
 }
 
+/// Captures the bytes the emulator must write *back* to the child — the replies to terminal queries
+/// (cursor-position report for `ESC[6n`, device attributes for `ESC[c`, …). `alacritty_terminal` hands
+/// these to the [`EventListener`] as [`Event::PtyWrite`]; without forwarding them, query-driven
+/// programs (nu/reedline, vim, …) block forever waiting for a reply. The host drains them with
+/// [`Terminal::take_responses`] and writes them to the PTY.
+#[derive(Clone, Default)]
+struct ResponseSink {
+    pending: Arc<Mutex<Vec<u8>>>,
+}
+
+impl EventListener for ResponseSink {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event {
+            // The lock is only ever taken to push/drain a short reply; recover from a poisoned lock
+            // (a panicked holder) rather than dropping the reply, which would hang the child.
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.extend_from_slice(text.as_bytes());
+        }
+    }
+}
+
 /// An embedded terminal emulator: feed it child-program bytes, render its grid.
 pub struct Terminal {
-    term: Term<VoidListener>,
+    term: Term<ResponseSink>,
     parser: Processor,
     columns: usize,
     screen_lines: usize,
+    /// Replies the emulator owes the child (see [`ResponseSink`]); shared with the [`Term`]'s listener.
+    responses: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Terminal {
@@ -61,25 +85,37 @@ impl Terminal {
             scrolling_history: SCROLLBACK_LINES,
             ..Config::default()
         };
+        let responses = Arc::new(Mutex::new(Vec::new()));
         let term = Term::new(
             config,
             &GridSize {
                 columns,
                 screen_lines,
             },
-            VoidListener,
+            ResponseSink {
+                pending: Arc::clone(&responses),
+            },
         );
         Self {
             term,
             parser: Processor::new(),
             columns,
             screen_lines,
+            responses,
         }
     }
 
-    /// Feeds `bytes` (child-program output) through the VT parser into the grid.
+    /// Feeds `bytes` (child-program output) through the VT parser into the grid. May queue replies to
+    /// terminal queries the bytes contained — drain them with [`Self::take_responses`].
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Takes the replies the emulator owes the child (the answers to cursor-position / device-attribute
+    /// queries seen by [`Self::feed`]) — empty when there are none. The host writes these to the PTY.
+    pub fn take_responses(&self) -> Vec<u8> {
+        let mut pending = self.responses.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut pending)
     }
 
     /// Resizes the terminal grid (clamped to at least one column and line).
@@ -102,12 +138,6 @@ impl Terminal {
     #[must_use]
     pub fn screen_lines(&self) -> usize {
         self.screen_lines
-    }
-
-    /// The underlying `alacritty_terminal` term (advanced escape hatch).
-    #[must_use]
-    pub fn term(&self) -> &Term<VoidListener> {
-        &self.term
     }
 
     /// Renders the visible grid into `surface` using `theme` for default colors (no cursor).
@@ -220,6 +250,20 @@ mod tests {
         let mut terminal = Terminal::new(10, 3);
         terminal.feed(b"hello");
         assert_eq!(row_text(&rendered(&terminal, &theme), 0), "hello     ");
+    }
+
+    #[test]
+    fn a_cursor_position_query_is_answered() {
+        // A Device Status Report for the cursor position (`ESC[6n`) must be answered with a cursor
+        // position report (`ESC[<row>;<col>R`). Dropping it is what hung nu/reedline; now the host can
+        // drain the reply and write it back to the PTY.
+        let mut terminal = Terminal::new(20, 5);
+        terminal.feed(b"hi"); // cursor now at row 1, column 3 (1-based)
+        terminal.feed(b"\x1b[6n");
+        let reply = terminal.take_responses();
+        assert_eq!(reply, b"\x1b[1;3R", "the cursor-position report for row 1, col 3");
+        // …and a drained reply is not handed out twice.
+        assert!(terminal.take_responses().is_empty());
     }
 
     #[test]
