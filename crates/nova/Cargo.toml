@@ -26,10 +26,26 @@ pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 cosmic-text = { version = "0.19", optional = true }
 
+# The live editor (M4.4): `mj-nova` drives the same `App` the TTY does (the `majestic` lib), building a
+# workspace (`majestic-core`) and mapping winit keys to `keymaker::KeyPress`. wasm-bindgen-compatible
+# with wgpu 26 (both admit the 0.2.100 Nickel pins) — see docs/nova.md §3.
+majestic = { version = "0.0.0", path = "../../mj", optional = true }
+majestic-core = { version = "0.0.0", path = "../majestic-core", optional = true }
+keymaker = { version = "0.0.0", path = "../keymaker", optional = true }
+
 [features]
 # Off by default: the cheap workspace gate builds only the pure `Scene` model. Build the GPU
 # renderer + the `mj-nova` binary deliberately with `cargo build -p nova --features gpu`.
-gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:cosmic-text"]
+gpu = [
+    "dep:wgpu",
+    "dep:winit",
+    "dep:pollster",
+    "dep:bytemuck",
+    "dep:cosmic-text",
+    "dep:majestic",
+    "dep:majestic-core",
+    "dep:keymaker",
+]
 
 # The GPU window front end. `required-features` keeps it out of a `gpu`-off (`--workspace`) build,
 # so the cheap gate never pulls wgpu/winit.

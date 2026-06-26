@@ -172,7 +172,7 @@ pub use raster::{GlyphRaster, RasterGlyph};
 #[cfg(feature = "gpu")]
 pub use renderer::Gpu;
 #[cfg(feature = "gpu")]
-pub use window::run;
+pub use window::run_editor;
 
 #[cfg(test)]
 mod tests {
