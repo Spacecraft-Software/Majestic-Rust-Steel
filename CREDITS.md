@@ -43,6 +43,8 @@ designs and ideas directly informed it:
 | `two-face` (+ bat's `.sublime-syntax` set) | 314eter & contributors; syntax authors via bat | MIT OR Apache-2.0 (crate); bundled syntaxes are mixed upstream licenses | <https://github.com/CosmicHorrorDev/two-face> | Supplies bat's extended ~150-language syntax set to syntect, giving the broad tier its reach as data (no compiled grammar per language). Per-syntax upstream licenses are enumerated by `two_face::acknowledgement` (§4.2). Integrated M1. |
 | `nickel-lang-core` | Nickel contributors (Tweag) | MIT | <https://github.com/tweag/nickel> | The Nickel language evaluator behind `majestic-config` — evaluates the user manifest (merged onto a schema contract) and deserializes it into the typed settings. Integrated M1. Its tree carries weak-copyleft/unmaintained transitives accepted per `deny.toml` (see `license/ALLOWED_LICENSES.md`) and raises the workspace MSRV to 1.90. |
 | `steel-core` (Steel) | Matthew Paras and Steel contributors | Apache-2.0 / MIT | <https://github.com/mattwparas/steel> | The embedded Scheme VM behind `majestic-steel` — runs the user's `config.scm` with the fault-isolated `(majestic …)` API. Integrated M1. Clean tree (no new licenses/advisories; MSRV ≤ 1.90). |
+| `cosmic-text` | System76 (Pop!_OS) and contributors | MIT | <https://github.com/pop-os/cosmic-text> | Glyph shaping + rasterisation behind Nova's GPU renderer — turns the bundled font into the alpha bitmaps the glyph atlas uploads. Integrated M4 (`gpu` feature only). |
+| Material Icons (icon font) | Google LLC | Apache-2.0 | <https://github.com/google/material-design-icons> | The bundled GUI icon font for Nova (M4.6) — the codepoint-compatible static predecessor of Material Symbols; `cosmic-text` rasterises its folder/file/code glyphs for the explorer. Vendored in-tree, never fetched at runtime (§7 PFA). Integrated M4. |
 
 The `crossterm` crate (MIT, <https://github.com/crossterm-rs/crossterm>) provides the `mj`
 binary's terminal raw mode, input decoding, and screen control. It is a routine dependency
@@ -57,8 +59,6 @@ filled in here:
 | Dependency | License | Milestone | Role |
 |---|---|---|---|
 | `blake3` | CC0-1.0 / Apache-2.0 | M0 | Hashline line tags. |
-| `cosmic-text` | MIT | M4 | GPU text shaping (Nova). |
-| Material Symbols (icon font) | Apache-2.0 | M4 | GUI iconography, vendored in-tree (no runtime fetch). |
 
 ---
 

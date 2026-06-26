@@ -43,7 +43,7 @@ mod render;
 mod theme;
 
 #[doc(inline)]
-pub use buffer::{char_width, Buffer, Cell};
+pub use buffer::{char_width, Buffer, Cell, Icon};
 #[doc(inline)]
 pub use layout::Rect;
 #[doc(inline)]

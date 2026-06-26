@@ -17,7 +17,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use penumbra::{Buffer as Surface, Rect, Style, Theme};
+use penumbra::{Buffer as Surface, Icon, Rect, Style, Theme};
 
 use crate::git::{self, GitStatus};
 
@@ -199,6 +199,23 @@ impl FileTree {
             };
             let label = format!("{}{marker}{}", "  ".repeat(row.depth), file_name(&row.path));
             surface.set_str(list.x, y, &label, style);
+            // M4.6: a semantic icon on the marker cell. The TTY keeps the marker char (`▾`/`▸`/space);
+            // Nova draws the Material glyph in its place. Same layout, richer in the GUI (§6.5).
+            let icon = if row.is_dir {
+                if self.is_expanded(&row.path) {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                }
+            } else if is_code_file(&row.path) {
+                Icon::Code
+            } else {
+                Icon::File
+            };
+            let icon_col = list
+                .x
+                .saturating_add(u16::try_from(row.depth * 2).unwrap_or(u16::MAX));
+            surface.set_icon(icon_col, y, Some(icon));
         }
     }
 
@@ -266,6 +283,22 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Whether `path` is a source-code file (drives the explorer's code vs. generic-file icon, M4.6).
+fn is_code_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "rs" | "py"
+                    | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cpp" | "cc" | "hpp" | "rb"
+                    | "java" | "kt" | "ex" | "exs" | "erl" | "clj" | "cljs" | "scm" | "ss" | "el"
+                    | "sh" | "bash" | "lua" | "nix" | "zig" | "hs" | "ml" | "swift" | "dart" | "php"
+                    | "cs" | "scala" | "jl" | "r" | "pl" | "ncl"
+            )
+        })
 }
 
 /// Collects up to `limit` file paths under `root` (recursive, dot-entries skipped).

@@ -23,6 +23,13 @@ const FONT: &[u8] = include_bytes!("../assets/fonts/AdwaitaMono-Regular.ttf");
 /// The font family name, used to select the vendored font when shaping.
 const FAMILY: &str = "Adwaita Mono";
 
+/// The vendored Material Icons font (Apache-2.0; see the `.license` sidecar) — the GUI icon set
+/// (M4.6). Embedded alongside the text font so icon cells render without a system or fetched font.
+const ICON_FONT: &[u8] = include_bytes!("../assets/fonts/MaterialIcons-Regular.ttf");
+
+/// The icon font's family name, used to select it when shaping an icon glyph.
+const ICON_FAMILY: &str = "Material Icons";
+
 /// The line-height multiple of the font size, giving the cell height (a little leading above the
 /// glyph box, the terminal convention).
 const LINE_HEIGHT_RATIO: f32 = 1.25;
@@ -61,6 +68,7 @@ impl GlyphRaster {
     pub fn new(font_size: f32) -> Self {
         let mut db = fontdb::Database::new();
         db.load_font_data(FONT.to_vec());
+        db.load_font_data(ICON_FONT.to_vec()); // the icon font, selected by family when shaping (M4.6)
         Self {
             font_system: FontSystem::new_with_locale_and_db("en-US".to_owned(), db),
             swash_cache: SwashCache::new(),
@@ -90,14 +98,17 @@ impl GlyphRaster {
 
     /// The pixel-exact cell box for this font: the monospace advance × the line height.
     pub fn cell_metrics(&mut self) -> CellMetrics {
-        let advance = self.shape('M').map_or(self.font_size * 0.6, |(advance, _)| advance);
+        let advance = self
+            .shape('M', false)
+            .map_or(self.font_size * 0.6, |(advance, _)| advance);
         CellMetrics::new(advance, self.line_height)
     }
 
     /// Rasterises `ch` to an alpha bitmap + placement, or `None` if the font has no (mask) glyph for
-    /// it (e.g. an unmapped codepoint, or a colour/emoji glyph — handled later).
-    pub fn rasterize(&mut self, ch: char) -> Option<RasterGlyph> {
-        let (advance, cache_key) = self.shape(ch)?;
+    /// it (e.g. an unmapped codepoint, or a colour/emoji glyph — handled later). When `icon`, `ch` is
+    /// shaped with the Material Icons font instead of the text font (M4.6).
+    pub fn rasterize(&mut self, ch: char, icon: bool) -> Option<RasterGlyph> {
+        let (advance, cache_key) = self.shape(ch, icon)?;
         let image = self.swash_cache.get_image(&mut self.font_system, cache_key).as_ref()?;
         if !matches!(image.content, SwashContent::Mask) {
             return None; // colour (emoji) glyphs are an M4.3+ follow-up; M4.3 handles mask glyphs
@@ -113,8 +124,10 @@ impl GlyphRaster {
     }
 
     /// Shapes a single character and returns its `(advance, cache_key)`, or `None` if it produced no
-    /// glyph. The advance is the monospace cell width; the cache key drives [`SwashCache`].
-    fn shape(&mut self, ch: char) -> Option<(f32, CacheKey)> {
+    /// glyph. The advance is the monospace cell width; the cache key drives [`SwashCache`]. `icon`
+    /// selects the Material Icons family instead of the text family (M4.6).
+    fn shape(&mut self, ch: char, icon: bool) -> Option<(f32, CacheKey)> {
+        let family = if icon { ICON_FAMILY } else { FAMILY };
         let mut buffer =
             Buffer::new(&mut self.font_system, Metrics::new(self.font_size, self.line_height));
         // `borrowed` holds `&mut buffer` + `&mut self.font_system`; NLL ends those borrows at its last
@@ -122,7 +135,7 @@ impl GlyphRaster {
         let mut borrowed = buffer.borrow_with(&mut self.font_system);
         borrowed.set_text(
             ch.encode_utf8(&mut [0u8; 4]),
-            &Attrs::new().family(Family::Name(FAMILY)),
+            &Attrs::new().family(Family::Name(family)),
             Shaping::Advanced,
             None,
         );
@@ -139,7 +152,7 @@ mod tests {
     #[test]
     fn rasterises_a_glyph_to_an_alpha_bitmap_with_ink() {
         let mut raster = GlyphRaster::new(16.0);
-        let glyph = raster.rasterize('M').expect("the font has an 'M'");
+        let glyph = raster.rasterize('M', false).expect("the font has an 'M'");
         assert!(glyph.width > 0 && glyph.height > 0, "'M' has a non-empty box");
         assert_eq!(
             glyph.coverage.len(),
@@ -162,7 +175,19 @@ mod tests {
     fn every_ascii_letter_and_digit_rasterises() {
         let mut raster = GlyphRaster::new(16.0);
         for ch in ('A'..='Z').chain('a'..='z').chain('0'..='9') {
-            assert!(raster.rasterize(ch).is_some(), "the font covers {ch}");
+            assert!(raster.rasterize(ch, false).is_some(), "the font covers {ch}");
         }
+    }
+
+    #[test]
+    fn rasterises_a_material_icon_from_the_icon_font() {
+        // The `folder` codepoint (U+E2C7) has no glyph in the text font but is an icon in the Material
+        // Icons font — selecting it by `icon = true` rasterises real ink (M4.6).
+        let mut raster = GlyphRaster::new(16.0);
+        let glyph = raster
+            .rasterize('\u{e2c7}', true)
+            .expect("the icon font has a `folder` glyph");
+        assert!(glyph.width > 0 && glyph.height > 0, "the folder icon has a box");
+        assert!(glyph.coverage.iter().any(|&a| a > 0), "and some ink");
     }
 }

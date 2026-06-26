@@ -1,0 +1,6 @@
+SPDX-FileCopyrightText: Copyright Google LLC
+SPDX-License-Identifier: Apache-2.0
+
+Material Icons (the codepoint-compatible static predecessor of Material Symbols) — the bundled icon
+font for Nova's GPU renderer (M4.6). Vendored in-tree (Standard §7 PFA / offline-first; never fetched
+at runtime). Licensed under the Apache License 2.0; the license text is in LICENSES/Apache-2.0.txt.
