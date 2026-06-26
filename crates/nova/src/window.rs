@@ -37,6 +37,8 @@ pub fn run_editor(app: App) -> Result<(), winit::error::EventLoopError> {
         buffer: Buffer::new(1, 1, Theme::steelbore().base_style()),
         modifiers: ModifiersState::empty(),
         state: None,
+        clipboard: arboard::Clipboard::new().ok(),
+        last_clipboard: String::new(),
     };
     event_loop.run_app(&mut nova)
 }
@@ -51,7 +53,8 @@ struct WindowState {
 }
 
 /// The winit application: the live editor, the theme + clear colour, the cell buffer it renders into,
-/// the tracked modifier state, and the window/GPU state (absent until `resumed`).
+/// the tracked modifier state, the window/GPU state (absent until `resumed`), and the system-clipboard
+/// bridge (absent if the compositor's clipboard is unreachable — the editor's kill-ring still works).
 struct NovaApp {
     app: App,
     theme: Theme,
@@ -59,6 +62,8 @@ struct NovaApp {
     buffer: Buffer,
     modifiers: ModifiersState,
     state: Option<WindowState>,
+    clipboard: Option<arboard::Clipboard>,
+    last_clipboard: String,
 }
 
 impl ApplicationHandler for NovaApp {
@@ -101,6 +106,7 @@ impl ApplicationHandler for NovaApp {
             gpu,
             config,
         });
+        self.sync_clipboard_in(); // seed the kill-ring from the system clipboard at startup
     }
 
     fn window_event(
@@ -112,6 +118,9 @@ impl ApplicationHandler for NovaApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            // On (re)focus, pull the system clipboard in, so a paste inserts whatever was copied
+            // elsewhere — the common "copy in another app, paste here" flow.
+            WindowEvent::Focused(true) => self.sync_clipboard_in(),
             WindowEvent::Resized(size) => {
                 if let Some(state) = self.state.as_mut() {
                     state.config.width = size.width.max(1);
@@ -151,8 +160,33 @@ impl NovaApp {
         if let Err(error) = self.app.handle_key(press, cols, rows) {
             eprintln!("nova: key handling error: {error}");
         }
+        self.sync_clipboard_out(); // a copy/cut chord just ran? push it to the system clipboard
         if self.app.should_quit() {
             event_loop.exit();
+        }
+    }
+
+    /// Pulls the system clipboard into the editor's shared clipboard, so the next paste inserts it.
+    /// Best effort: a clipboard that is absent or unreadable simply leaves the kill-ring as it was.
+    fn sync_clipboard_in(&mut self) {
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            if let Ok(text) = clipboard.get_text() {
+                self.app.set_clipboard(&text);
+                self.last_clipboard = text;
+            }
+        }
+    }
+
+    /// Pushes the editor's shared clipboard out to the system clipboard when it has changed (after a
+    /// copy or cut), so other applications can paste it. Best effort; writes only on a real change.
+    fn sync_clipboard_out(&mut self) {
+        if self.app.clipboard() == self.last_clipboard {
+            return;
+        }
+        self.last_clipboard.clear();
+        self.last_clipboard.push_str(self.app.clipboard());
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            let _ = clipboard.set_text(self.last_clipboard.clone());
         }
     }
 
