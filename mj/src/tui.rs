@@ -34,8 +34,8 @@ use crate::agent_host::AgentHost;
 use crate::agent_panel::{AgentPanel, AGENT_COLS};
 use majestic_core::{
     Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
-    Occurrence, ProfileSelector, Prompt, References, RenameEdit, Search, Session, SignatureHelp,
-    Symbols, Workspace,
+    MarkdownPreview, Occurrence, ProfileSelector, Prompt, References, RenameEdit, Search, Session,
+    SignatureHelp, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome, ServerHealth};
 use majestic_term::PtyTerminal;
@@ -156,6 +156,11 @@ const RENAME_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(6));
 /// jumps to the previous one (matched via [`is_prev_diagnostic_key`], tolerant of the chord).
 const NEXT_DIAGNOSTIC_KEY: KeyPress = KeyPress::key(KeyCode::Function(8));
 
+/// `F7` — toggle the Markdown (GFM) preview of the current buffer (M4). A function key so it is
+/// unambiguous in every terminal (a `Ctrl+Shift` chord would collapse to `Ctrl+…` without the Kitty
+/// protocol). The preview is a modal pane (like the Info reader); `F7`/`q`/`Esc` close it.
+const MARKDOWN_PREVIEW_KEY: KeyPress = KeyPress::key(KeyCode::Function(7));
+
 /// How long the cursor / typing must settle before a debounced LSP request fires. Short enough that
 /// the signature/highlight still feels live, long enough to coalesce a burst of cursor moves or
 /// keystrokes into a single request (so holding an arrow key or typing fast never floods the server).
@@ -229,6 +234,8 @@ pub struct App {
     finder: Option<Finder>,
     help: Option<HelpOverlay>,
     info: Option<InfoReader>,
+    /// The Markdown (GFM) preview of the current buffer; `Some` while showing (modal, M4).
+    markdown: Option<MarkdownPreview>,
     /// The first-run profile picker; `Some` until the user chooses (modal while open).
     selector: Option<ProfileSelector>,
     /// The LSP completion popup; `Some` while candidates are shown over the editor.
@@ -297,6 +304,7 @@ impl App {
             finder: None,
             help: None,
             info: None,
+            markdown: None,
             selector: None,
             completion: None,
             completion_anchor: 0,
@@ -645,7 +653,10 @@ impl App {
         // used to anchor the completion popup at the cursor.
         let mut editor_rect: Option<Rect> = None;
 
-        if let Some(info) = self.info.as_mut() {
+        if let Some(preview) = self.markdown.as_mut() {
+            // The Markdown preview takes over the editor region (sidebar + status bar remain).
+            preview.render(surface, main, theme);
+        } else if let Some(info) = self.info.as_mut() {
             // The Info reader takes over the editor region (the sidebar + status bar remain).
             info.render(surface, main, theme);
         } else if self.architect_terminal_visible
@@ -692,6 +703,7 @@ impl App {
             && self.finder.is_none()
             && self.help.is_none()
             && self.info.is_none()
+            && self.markdown.is_none()
             && self.selector.is_none()
         {
             if let Some(which_key) = self.workspace.which_key() {
@@ -957,34 +969,36 @@ impl App {
         self.finder = Some(Finder::commands(&commands));
     }
 
+    /// Routes a key to a full-capture modal if one is open (first-run selector, help, finder,
+    /// Markdown preview, Info reader, rename prompt), returning whether it was consumed.
+    fn try_modal_key(&mut self, key: KeyPress) -> bool {
+        if self.selector.is_some() {
+            self.selector_key(key);
+        } else if self.help.is_some() {
+            self.help_key(key);
+        } else if self.finder.is_some() {
+            self.finder_key(key);
+        } else if self.markdown.is_some() {
+            self.markdown_key(key);
+        } else if self.info.is_some() {
+            self.info_key(key);
+        } else if self.prompt.is_some() {
+            self.prompt_key(key);
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// Routes a key press into the editor at the given viewport size (`columns` × `lines` cells):
     /// global chords first, then the focused surface (editor / terminal / agent / explorer).
     ///
     /// # Errors
     /// Propagates I/O errors from writing to the integrated terminal's PTY.
     pub fn handle_key(&mut self, key: KeyPress, columns: u16, lines: u16) -> io::Result<()> {
-        // The first-run selector is modal and outranks everything: it captures every key until
-        // the user has chosen a keybinding profile.
-        if self.selector.is_some() {
-            self.selector_key(key);
-            return Ok(());
-        }
-        // The help overlay and the fuzzy finder are modal: while open they capture every key.
-        if self.help.is_some() {
-            self.help_key(key);
-            return Ok(());
-        }
-        if self.finder.is_some() {
-            self.finder_key(key);
-            return Ok(());
-        }
-        if self.info.is_some() {
-            self.info_key(key);
-            return Ok(());
-        }
-        // The rename prompt is modal: while open it captures every key (the user is typing a name).
-        if self.prompt.is_some() {
-            self.prompt_key(key);
+        // Full-capture modals (first-run selector, help overlay, fuzzy finder, Markdown preview,
+        // Info reader, rename prompt) outrank everything: while open, each captures every key.
+        if self.try_modal_key(key) {
             return Ok(());
         }
         // The completion and hover popups are light modals: each captures its navigation/accept
@@ -1041,6 +1055,10 @@ impl App {
         }
         if key == SIDEBAR_TOGGLE {
             self.toggle_sidebar();
+            return Ok(());
+        }
+        if key == MARKDOWN_PREVIEW_KEY {
+            self.open_markdown_preview();
             return Ok(());
         }
         if self.try_agent_key(key) {
@@ -2179,6 +2197,33 @@ impl App {
 
     /// Routes a key to the open Info reader: `n`/`p`/`u` navigate, Enter follows the selected
     /// menu entry, `l` goes back, arrows/Page scroll and move the menu selection, `q`/Esc closes.
+    /// Opens the Markdown (GFM) preview of the current buffer (`F7`). The buffer's text is parsed and
+    /// rendered into the modal preview pane; most useful on `.md`, but it previews any buffer's text.
+    fn open_markdown_preview(&mut self) {
+        let editor = self.workspace.active();
+        let title = editor.display_name();
+        let source = editor.buffer().text();
+        self.markdown = Some(MarkdownPreview::new(source, title));
+    }
+
+    /// Routes a key to the Markdown preview: `F7`/`q`/`Esc` close it; arrows / page keys scroll.
+    fn markdown_key(&mut self, key: KeyPress) {
+        if key == MARKDOWN_PREVIEW_KEY || key.code == KeyCode::Escape || key == KeyPress::char('q') {
+            self.markdown = None;
+            return;
+        }
+        let Some(preview) = self.markdown.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => preview.scroll_up(1),
+            KeyCode::Down => preview.scroll_down(1),
+            KeyCode::PageUp => preview.scroll_up(10),
+            KeyCode::PageDown | KeyCode::Char(' ') => preview.scroll_down(10),
+            _ => {}
+        }
+    }
+
     fn info_key(&mut self, key: KeyPress) {
         if key.code == KeyCode::Escape || key == KeyPress::char('q') {
             self.info = None;
