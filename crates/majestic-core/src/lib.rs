@@ -44,6 +44,7 @@ mod hashline;
 mod hover;
 mod info;
 mod inlay;
+mod markdown;
 mod occurrence;
 mod prompt;
 mod references;
@@ -81,6 +82,7 @@ pub use hashline::{apply as apply_hashline, tagged_read, HashlineEdit, HashlineE
 pub use hover::Hover;
 #[doc(inline)]
 pub use info::{InfoDocument, InfoReader};
+pub use markdown::MarkdownPreview;
 #[doc(inline)]
 pub use inlay::InlayHint;
 #[doc(inline)]
