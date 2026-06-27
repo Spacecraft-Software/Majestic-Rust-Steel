@@ -34,8 +34,8 @@ use crate::agent_host::AgentHost;
 use crate::agent_panel::{AgentPanel, AGENT_COLS};
 use majestic_core::{
     Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
-    MarkdownPreview, Occurrence, ProfileSelector, Prompt, References, RenameEdit, Search, Session,
-    SignatureHelp, Symbols, Workspace,
+    Occurrence, Preview, PreviewKind, ProfileSelector, Prompt, References, RenameEdit, Search,
+    Session, SignatureHelp, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome, ServerHealth};
 use majestic_term::PtyTerminal;
@@ -156,10 +156,10 @@ const RENAME_KEY: KeyPress = KeyPress::new(Mods::SHIFT, KeyCode::Function(6));
 /// jumps to the previous one (matched via [`is_prev_diagnostic_key`], tolerant of the chord).
 const NEXT_DIAGNOSTIC_KEY: KeyPress = KeyPress::key(KeyCode::Function(8));
 
-/// `F7` — toggle the Markdown (GFM) preview of the current buffer (M4). A function key so it is
+/// `F7` — toggle the rendered preview (Markdown or Texinfo) of the current buffer (M4). A function key so it is
 /// unambiguous in every terminal (a `Ctrl+Shift` chord would collapse to `Ctrl+…` without the Kitty
 /// protocol). The preview is a modal pane (like the Info reader); `F7`/`q`/`Esc` close it.
-const MARKDOWN_PREVIEW_KEY: KeyPress = KeyPress::key(KeyCode::Function(7));
+const PREVIEW_KEY: KeyPress = KeyPress::key(KeyCode::Function(7));
 
 /// How long the cursor / typing must settle before a debounced LSP request fires. Short enough that
 /// the signature/highlight still feels live, long enough to coalesce a burst of cursor moves or
@@ -234,8 +234,8 @@ pub struct App {
     finder: Option<Finder>,
     help: Option<HelpOverlay>,
     info: Option<InfoReader>,
-    /// The Markdown (GFM) preview of the current buffer; `Some` while showing (modal, M4).
-    markdown: Option<MarkdownPreview>,
+    /// The rendered preview (Markdown/Texinfo) of the current buffer; `Some` while showing (modal, M4).
+    preview: Option<Preview>,
     /// The first-run profile picker; `Some` until the user chooses (modal while open).
     selector: Option<ProfileSelector>,
     /// The LSP completion popup; `Some` while candidates are shown over the editor.
@@ -304,7 +304,7 @@ impl App {
             finder: None,
             help: None,
             info: None,
-            markdown: None,
+            preview: None,
             selector: None,
             completion: None,
             completion_anchor: 0,
@@ -653,8 +653,8 @@ impl App {
         // used to anchor the completion popup at the cursor.
         let mut editor_rect: Option<Rect> = None;
 
-        if let Some(preview) = self.markdown.as_mut() {
-            // The Markdown preview takes over the editor region (sidebar + status bar remain).
+        if let Some(preview) = self.preview.as_mut() {
+            // The rendered preview takes over the editor region (sidebar + status bar remain).
             preview.render(surface, main, theme);
         } else if let Some(info) = self.info.as_mut() {
             // The Info reader takes over the editor region (the sidebar + status bar remain).
@@ -703,7 +703,7 @@ impl App {
             && self.finder.is_none()
             && self.help.is_none()
             && self.info.is_none()
-            && self.markdown.is_none()
+            && self.preview.is_none()
             && self.selector.is_none()
         {
             if let Some(which_key) = self.workspace.which_key() {
@@ -807,7 +807,12 @@ impl App {
 
     /// Draws the Architect drop-down terminal across the top of `main` — a header row, the shell grid, and
     /// (in NL mode) a natural-language input row — with the editor below it. Returns the editor region.
-    fn render_architect_terminal(&mut self, surface: &mut Buffer, main: Rect, theme: &Theme) -> Rect {
+    fn render_architect_terminal(
+        &mut self,
+        surface: &mut Buffer,
+        main: Rect,
+        theme: &Theme,
+    ) -> Rect {
         let pane_rows = ARCHITECT_TERMINAL_ROWS.min(main.height - (MIN_EDITOR_ROWS + 1));
         let (block, editor_area) = main.split_top(pane_rows);
         let focused = self.focus == Focus::ArchitectTerminal;
@@ -839,10 +844,21 @@ impl App {
         );
         if let Some(term) = self.terminal.as_ref() {
             // The shell shows its cursor only when the pane is focused *and* in shell mode.
-            term.render_in(surface, term_area, theme, focused && !self.architect_terminal_nl);
+            term.render_in(
+                surface,
+                term_area,
+                theme,
+                focused && !self.architect_terminal_nl,
+            );
         }
         if let Some(input) = input_area {
-            draw_architect_terminal_input(surface, input, theme, &self.architect_terminal_input, focused);
+            draw_architect_terminal_input(
+                surface,
+                input,
+                theme,
+                &self.architect_terminal_input,
+                focused,
+            );
         }
 
         self.workspace
@@ -978,8 +994,8 @@ impl App {
             self.help_key(key);
         } else if self.finder.is_some() {
             self.finder_key(key);
-        } else if self.markdown.is_some() {
-            self.markdown_key(key);
+        } else if self.preview.is_some() {
+            self.preview_key(key);
         } else if self.info.is_some() {
             self.info_key(key);
         } else if self.prompt.is_some() {
@@ -1057,8 +1073,8 @@ impl App {
             self.toggle_sidebar();
             return Ok(());
         }
-        if key == MARKDOWN_PREVIEW_KEY {
-            self.open_markdown_preview();
+        if key == PREVIEW_KEY {
+            self.open_preview();
             return Ok(());
         }
         if self.try_agent_key(key) {
@@ -2197,22 +2213,33 @@ impl App {
 
     /// Routes a key to the open Info reader: `n`/`p`/`u` navigate, Enter follows the selected
     /// menu entry, `l` goes back, arrows/Page scroll and move the menu selection, `q`/Esc closes.
-    /// Opens the Markdown (GFM) preview of the current buffer (`F7`). The buffer's text is parsed and
-    /// rendered into the modal preview pane; most useful on `.md`, but it previews any buffer's text.
-    fn open_markdown_preview(&mut self) {
+    /// Opens the rendered preview of the current buffer (`F7`): Texinfo for `.texi`/`.texinfo`/`.txi`,
+    /// Markdown otherwise. The buffer's text is parsed and rendered into the modal preview pane.
+    fn open_preview(&mut self) {
         let editor = self.workspace.active();
         let title = editor.display_name();
         let source = editor.buffer().text();
-        self.markdown = Some(MarkdownPreview::new(source, title));
+        let is_texinfo = editor.buffer().path().is_some_and(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("texi" | "texinfo" | "txi")
+            )
+        });
+        let kind = if is_texinfo {
+            PreviewKind::Texinfo
+        } else {
+            PreviewKind::Markdown
+        };
+        self.preview = Some(Preview::new(source, title, kind));
     }
 
-    /// Routes a key to the Markdown preview: `F7`/`q`/`Esc` close it; arrows / page keys scroll.
-    fn markdown_key(&mut self, key: KeyPress) {
-        if key == MARKDOWN_PREVIEW_KEY || key.code == KeyCode::Escape || key == KeyPress::char('q') {
-            self.markdown = None;
+    /// Routes a key to the rendered preview: `F7`/`q`/`Esc` close it; arrows / page keys scroll.
+    fn preview_key(&mut self, key: KeyPress) {
+        if key == PREVIEW_KEY || key.code == KeyCode::Escape || key == KeyPress::char('q') {
+            self.preview = None;
             return;
         }
-        let Some(preview) = self.markdown.as_mut() else {
+        let Some(preview) = self.preview.as_mut() else {
             return;
         };
         match key.code {
@@ -2448,7 +2475,13 @@ fn draw_architect_terminal_header(
 
 /// Draws the Architect terminal's natural-language input row: a `›` prompt and the typed text, truncated to the
 /// row. Drawn only while the pane is in NL mode.
-fn draw_architect_terminal_input(surface: &mut Buffer, area: Rect, theme: &Theme, input: &str, focused: bool) {
+fn draw_architect_terminal_input(
+    surface: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    input: &str,
+    focused: bool,
+) {
     if area.is_empty() {
         return;
     }
@@ -2460,7 +2493,12 @@ fn draw_architect_terminal_input(surface: &mut Buffer, area: Rect, theme: &Theme
     for x in area.x..area.right() {
         surface.set_char(x, area.y, ' ', text_style);
     }
-    surface.set_str(area.x, area.y, "› ", Style::new(theme.info, theme.background));
+    surface.set_str(
+        area.x,
+        area.y,
+        "› ",
+        Style::new(theme.info, theme.background),
+    );
     let avail = usize::from(area.width.saturating_sub(2));
     let shown: String = input.chars().take(avail).collect();
     surface.set_str(area.x.saturating_add(2), area.y, &shown, text_style);
@@ -2977,7 +3015,10 @@ mod tests {
         // that into the toggle key. This is the routing the protocol-enable made reachable.
         use crossterm::event::{KeyCode as TermKey, KeyEvent, KeyModifiers};
         let event = KeyEvent::new(TermKey::Char('`'), KeyModifiers::CONTROL);
-        assert_eq!(super::translate(event), Some(super::ARCHITECT_TERMINAL_TOGGLE));
+        assert_eq!(
+            super::translate(event),
+            Some(super::ARCHITECT_TERMINAL_TOGGLE)
+        );
     }
 
     #[cfg(feature = "agent")]
@@ -2995,7 +3036,10 @@ mod tests {
         assert_eq!(app.architect_terminal_input, "fix i");
         app.architect_terminal_nl_key(KeyPress::key(KeyCode::Tab));
         assert!(!app.architect_terminal_nl, "Tab returns to shell input");
-        assert!(app.architect_terminal_input.is_empty(), "the NL line is cleared");
+        assert!(
+            app.architect_terminal_input.is_empty(),
+            "the NL line is cleared"
+        );
     }
 
     #[test]
