@@ -46,6 +46,7 @@ mod info;
 mod inlay;
 mod markdown;
 mod occurrence;
+mod preview;
 mod prompt;
 mod references;
 mod rename;
@@ -57,6 +58,7 @@ mod symbols;
 mod syntax;
 #[cfg(feature = "syntect-highlighting")]
 mod syntect_hl;
+mod texinfo;
 mod whichkey;
 mod workspace;
 
@@ -82,11 +84,11 @@ pub use hashline::{apply as apply_hashline, tagged_read, HashlineEdit, HashlineE
 pub use hover::Hover;
 #[doc(inline)]
 pub use info::{InfoDocument, InfoReader};
-pub use markdown::MarkdownPreview;
 #[doc(inline)]
 pub use inlay::InlayHint;
 #[doc(inline)]
 pub use occurrence::Occurrence;
+pub use preview::{Preview, PreviewKind};
 #[doc(inline)]
 pub use prompt::Prompt;
 #[doc(inline)]
