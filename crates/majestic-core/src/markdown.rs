@@ -9,7 +9,7 @@
 //! `code` in Steel Blue, links in Liquid Coolant underlined, blockquotes barred, checked task items in
 //! Radium Green. Covers headings, word-wrapped paragraphs, strong/emphasis/inline-code/strikethrough/
 //! links, bullet + ordered + task lists (nested), fenced/indented code blocks, blockquotes, thematic
-//! breaks, and image alt-text. Tables render a placeholder for now (a clearly-marked follow-up).
+//! breaks, image alt-text, and GFM tables as aligned columns.
 //
 // Rust guideline compliant 2026-05-18
 
@@ -48,8 +48,8 @@ struct Layouter<'a> {
     quote_depth: usize,
     /// Ordered-list counters (next number) or `None` for a bullet list, innermost last.
     list_stack: Vec<Option<u64>>,
-    /// Table-nesting depth; while `> 0`, content is skipped (a placeholder was already emitted).
-    table_depth: u32,
+    /// The GFM table currently being collected (cells gathered until `TagEnd::Table`, then rendered).
+    table: Option<TableState>,
 }
 
 impl<'a> Layouter<'a> {
@@ -64,18 +64,13 @@ impl<'a> Layouter<'a> {
             in_code_block: false,
             quote_depth: 0,
             list_stack: Vec::new(),
-            table_depth: 0,
+            table: None,
         }
     }
 
     fn event(&mut self, event: &Event<'_>) {
-        if self.table_depth > 0 {
-            // v1: skip the table body — the placeholder was emitted at the table's start.
-            match event {
-                Event::Start(Tag::Table(_)) => self.table_depth += 1,
-                Event::End(TagEnd::Table) => self.table_depth -= 1,
-                _ => {}
-            }
+        if self.table.is_some() {
+            self.table_event(event);
             return;
         }
         match event {
@@ -86,10 +81,10 @@ impl<'a> Layouter<'a> {
                     self.code_text(text);
                 } else {
                     let style = self.inline_style();
-                    self.builder.push_text(text, style);
+                    self.builder.push_span(text, style);
                 }
             }
-            Event::Code(text) => self.builder.push_text(text, self.builder.palette().code),
+            Event::Code(text) => self.builder.push_span(text, self.builder.palette().code),
             Event::HardBreak => self.builder.end_line(),
             Event::Rule => {
                 self.builder.blank();
@@ -97,7 +92,8 @@ impl<'a> Layouter<'a> {
                 self.builder.blank();
             }
             Event::TaskListMarker(checked) => self.task_marker(*checked),
-            // SoftBreak is handled by inter-word spacing; HTML/footnotes/math are ignored in v1.
+            Event::SoftBreak => self.builder.soft_break(),
+            // HTML / footnotes / math are ignored in v1.
             _ => {}
         }
     }
@@ -128,15 +124,7 @@ impl<'a> Layouter<'a> {
                 self.quote_depth += 1;
                 self.builder.set_quote_depth(self.quote_depth);
             }
-            Tag::Table(_) => {
-                self.builder.blank();
-                self.builder.append(
-                    "[table — rich rendering pending]",
-                    self.builder.palette().quote,
-                );
-                self.builder.end_line();
-                self.table_depth = 1;
-            }
+            Tag::Table(_) => self.table = Some(TableState::default()),
             _ => {}
         }
     }
@@ -245,6 +233,50 @@ impl<'a> Layouter<'a> {
         }
         style
     }
+
+    /// Collects a GFM table's cells from its events; renders it when the table ends.
+    fn table_event(&mut self, event: &Event<'_>) {
+        if matches!(event, Event::End(TagEnd::Table)) {
+            if let Some(table) = self.table.take() {
+                self.render_table(&table);
+            }
+            return;
+        }
+        let Some(table) = self.table.as_mut() else {
+            return;
+        };
+        match event {
+            Event::Start(Tag::TableHead | Tag::TableRow) => table.row = Vec::new(),
+            Event::Start(Tag::TableCell) => table.cell = String::new(),
+            // Cells collect plain text (inline styling within a cell is dropped in v1).
+            Event::Text(text) | Event::Code(text) => table.cell.push_str(text),
+            Event::End(TagEnd::TableCell) => {
+                let cell = std::mem::take(&mut table.cell);
+                table.row.push(cell);
+            }
+            Event::End(TagEnd::TableHead) => {
+                table.rows.push(std::mem::take(&mut table.row));
+                table.head_rows = table.rows.len();
+            }
+            Event::End(TagEnd::TableRow) => table.rows.push(std::mem::take(&mut table.row)),
+            _ => {}
+        }
+    }
+
+    /// Renders a collected table as aligned columns separated by `│`, with a rule under the header.
+    fn render_table(&mut self, table: &TableState) {
+        crate::preview::render_table(&mut self.builder, &table.rows, table.head_rows);
+    }
+}
+
+/// A GFM table collected from `pulldown-cmark` events: rows of plain-text cells (the header first).
+#[derive(Default)]
+struct TableState {
+    rows: Vec<Vec<String>>,
+    /// How many leading rows are header rows (for bold + the separator rule).
+    head_rows: usize,
+    row: Vec<String>,
+    cell: String,
 }
 
 /// The 1-based level of a heading (`#` = 1 … `######` = 6).
@@ -311,6 +343,31 @@ mod tests {
     fn a_long_paragraph_wraps_at_the_width() {
         let lines = rendered("alpha beta gamma delta epsilon", 12);
         assert!(lines.len() > 1, "the paragraph wraps: {lines:?}");
+    }
+
+    #[test]
+    fn inline_runs_keep_exact_spacing_around_punctuation() {
+        // An inline run followed by punctuation has no spurious space; adjacent runs don't gain one.
+        assert_eq!(rendered("see `code`.", 40), ["see code."]);
+        assert_eq!(rendered("a`b`c", 40), ["abc"]);
+        assert_eq!(rendered("**bold**, then more", 40), ["bold, then more"]);
+    }
+
+    #[test]
+    fn a_gfm_table_renders_aligned_columns() {
+        let lines = rendered("| Name | Qty |\n|------|-----|\n| mj | 1 |\n", 40);
+        assert_eq!(
+            lines[0], "Name │ Qty",
+            "header cells padded to the column width"
+        );
+        assert!(
+            lines[1].starts_with('─') && lines[1].contains('┼'),
+            "a rule under the header"
+        );
+        assert_eq!(
+            lines[2], "mj   │ 1",
+            "body cells padded to align under the header"
+        );
     }
 
     #[test]

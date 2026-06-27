@@ -13,7 +13,7 @@
 //! `@`-escapes (`@@`, `@{`, `@}`, `@*`) are handled.
 //!
 //! Deferred (rendered minimally / as text for now): `@def…` definition blocks (signature shown bold,
-//! body indented), `@multitable`, `@value` expansion, footnotes — clearly-marked follow-ups.
+//! body indented), `@value` expansion + footnotes (`@multitable` renders as aligned columns) — clearly-marked follow-ups.
 //
 // Rust guideline compliant 2026-05-18
 
@@ -53,12 +53,22 @@ enum Block {
     Definition,
 }
 
+/// An `@multitable` collected as rows of plain-text cells (`@item`/`@headitem`, split on `@tab`).
+#[derive(Default)]
+struct Multitable {
+    rows: Vec<Vec<String>>,
+    /// How many leading rows are `@headitem` header rows (for bold + the separator rule).
+    head_rows: usize,
+}
+
 /// A line-oriented Texinfo reader driving a [`LineBuilder`].
 struct Texinfo<'a> {
     builder: LineBuilder<'a>,
     blocks: Vec<Block>,
     /// Environments whose content is skipped (`@iftex`, `@tex`, `@html`, `@ignore`, …), innermost last.
     skip: Vec<String>,
+    /// The `@multitable` currently being collected (rows of cells), rendered at `@end multitable`.
+    multitable: Option<Multitable>,
 }
 
 impl<'a> Texinfo<'a> {
@@ -67,6 +77,7 @@ impl<'a> Texinfo<'a> {
             builder: LineBuilder::new(width, palette),
             blocks: Vec::new(),
             skip: Vec::new(),
+            multitable: None,
         }
     }
 
@@ -87,6 +98,11 @@ impl<'a> Texinfo<'a> {
                     .append(raw.trim_end(), self.builder.palette().code);
                 self.builder.end_line();
             }
+            return;
+        }
+        // Inside an @multitable, only @item/@headitem/@end multitable matter (cells split on @tab).
+        if self.multitable.is_some() {
+            self.multitable_line(raw.trim());
             return;
         }
 
@@ -119,6 +135,10 @@ impl<'a> Texinfo<'a> {
         match word {
             "c" | "comment" => {}
             "end" => self.end_named(arg),
+            "multitable" => {
+                self.builder.blank();
+                self.multitable = Some(Multitable::default());
+            }
             "example" | "smallexample" | "verbatim" | "lisp" | "smalllisp" | "display"
             | "format" => {
                 self.push_block(Block::Verbatim);
@@ -303,6 +323,35 @@ impl<'a> Texinfo<'a> {
         self.builder.end_line();
     }
 
+    /// Collects an `@multitable` row (`@item`/`@headitem`, cells split on `@tab`); renders at `@end
+    /// multitable`. Other lines (including multi-line cell continuations) are ignored in v1.
+    fn multitable_line(&mut self, trimmed: &str) {
+        let Some(rest) = trimmed.strip_prefix('@') else {
+            return;
+        };
+        let (word, arg) = split_command(rest);
+        match word {
+            "item" | "headitem" => {
+                let cells: Vec<String> = arg
+                    .split("@tab")
+                    .map(|cell| cell.trim().to_owned())
+                    .collect();
+                if let Some(table) = self.multitable.as_mut() {
+                    if word == "headitem" {
+                        table.head_rows += 1;
+                    }
+                    table.rows.push(cells);
+                }
+            }
+            "end" if arg == "multitable" => {
+                if let Some(table) = self.multitable.take() {
+                    crate::preview::render_table(&mut self.builder, &table.rows, table.head_rows);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Renders inline text, styling `@`-commands and resolving `@`-escapes onto `base`.
     fn render_inline(&mut self, text: &str, base: Style) {
         let chars: Vec<char> = text.chars().collect();
@@ -373,7 +422,7 @@ impl<'a> Texinfo<'a> {
                 self.brace_command(&command, &arg, base);
             } else {
                 // A no-brace command mid-line — fall back to its name as text.
-                self.builder.push_text(&command, base);
+                self.builder.push_span(&command, base);
             }
         }
         self.flush_plain(&mut plain, base);
@@ -384,7 +433,7 @@ impl<'a> Texinfo<'a> {
         let palette = self.builder.palette();
         match command {
             "code" | "samp" | "file" | "command" | "option" | "env" | "kbd" | "key" | "verb"
-            | "t" | "sc" | "indicateurl" | "math" => self.builder.push_text(arg, palette.code),
+            | "t" | "sc" | "indicateurl" | "math" => self.builder.push_span(arg, palette.code),
             "emph" | "i" | "var" | "dfn" | "cite" | "slanted" => {
                 let mut style = base;
                 style.attrs.italic = true;
@@ -398,13 +447,13 @@ impl<'a> Texinfo<'a> {
             "email" | "url" | "uref" | "ref" | "xref" | "pxref" => {
                 // The display text is the last comma-field for url/uref/email, else the node name.
                 let text = arg.split(',').next_back().unwrap_or(arg).trim();
-                self.builder.push_text(text, palette.link);
+                self.builder.push_span(text, palette.link);
             }
             "w" | "asis" | "r" | "footnote" | "dmn" => self.render_inline(arg, base),
             "value" | "anchor" | "today" => {} // no @set tracking / not rendered in v1
             _ => {
                 if let Some(glyph) = symbol(command) {
-                    self.builder.push_text(glyph, base);
+                    self.builder.push_span(glyph, base);
                 } else {
                     // Unknown command — keep its content as text rather than dropping it.
                     self.render_inline(arg, base);
@@ -416,7 +465,7 @@ impl<'a> Texinfo<'a> {
     /// Pushes accumulated plain text (if any) and clears the buffer.
     fn flush_plain(&mut self, plain: &mut String, base: Style) {
         if !plain.is_empty() {
-            self.builder.push_text(plain, base);
+            self.builder.push_span(plain, base);
             plain.clear();
         }
     }
@@ -592,6 +641,25 @@ mod tests {
         assert_eq!(bullets, ["• one", "• two"]);
         let numbered = rendered("@enumerate\n@item a\n@item b\n@end enumerate\n", 30);
         assert_eq!(numbered, ["1. a", "2. b"]);
+    }
+
+    #[test]
+    fn a_multitable_renders_aligned_columns() {
+        let texi = "@multitable @columnfractions .5 .5\n@headitem Key @tab Action\n\
+                    @item F7 @tab Preview\n@end multitable\n";
+        let lines = rendered(texi, 40);
+        assert_eq!(lines[0], "Key │ Action", "@headitem is the header row");
+        assert!(lines[1].contains('┼'), "a rule under the header");
+        assert_eq!(
+            lines[2], "F7  │ Preview",
+            "@item cells align under the header"
+        );
+    }
+
+    #[test]
+    fn an_inline_command_before_punctuation_has_no_spurious_space() {
+        // The space-preserving layout: `@code{F7}.` renders as `F7.`, not `F7 .`.
+        assert_eq!(rendered("Press @code{F7}.", 40), ["Press F7."]);
     }
 
     #[test]
