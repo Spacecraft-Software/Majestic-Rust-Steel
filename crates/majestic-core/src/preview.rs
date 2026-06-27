@@ -182,6 +182,8 @@ pub(crate) struct LineBuilder<'a> {
     quote_depth: usize,
     /// One-shot first-line prefix (e.g. a list-item marker), replacing the indent on the next line.
     pending_marker: Option<Line>,
+    /// Whether the next placed word should be preceded by an inter-word space (carried across spans).
+    space_pending: bool,
 }
 
 impl<'a> LineBuilder<'a> {
@@ -197,6 +199,7 @@ impl<'a> LineBuilder<'a> {
             indent: 0,
             quote_depth: 0,
             pending_marker: None,
+            space_pending: false,
         }
     }
 
@@ -221,24 +224,58 @@ impl<'a> LineBuilder<'a> {
         self.pending_marker = Some(prefix);
     }
 
-    /// Word-wraps `text` (styled) onto the current line, breaking at the width.
-    pub(crate) fn push_text(&mut self, text: &str, style: Style) {
-        for word in text.split_whitespace() {
-            self.ensure_line();
-            let word_width = text_width(word);
-            let mid_line = self.col > self.prefix_width;
-            if mid_line && self.col + 1 + word_width > self.width {
-                self.end_line();
-                self.ensure_line();
-            } else if mid_line {
-                self.append(" ", self.palette.body);
+    /// Appends `text` onto the current line, word-wrapping at the width and **preserving exact
+    /// spacing**: consecutive calls insert no space between them, so an inline run followed by
+    /// punctuation (`@code{x}` then `.`) renders as `x.`, not `x .`. Whitespace within `text` is
+    /// collapsed to single inter-word spaces (prose), carried across calls via `space_pending`.
+    pub(crate) fn push_span(&mut self, text: &str, style: Style) {
+        let mut word = String::new();
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                if !word.is_empty() {
+                    self.emit_word(&word, style);
+                    word.clear();
+                }
+                self.space_pending = true;
+            } else {
+                word.push(ch);
             }
-            self.append(word, style);
+        }
+        if !word.is_empty() {
+            self.emit_word(&word, style);
         }
     }
 
-    /// Appends one styled run verbatim (no wrapping), starting a line if needed.
+    /// Places one whitespace-free `word`, honoring a pending inter-word space and wrapping at the width.
+    fn emit_word(&mut self, word: &str, style: Style) {
+        self.ensure_line();
+        let word_width = text_width(word);
+        let mid_line = self.col > self.prefix_width;
+        let space = self.space_pending && mid_line;
+        let advance = if space { word_width + 1 } else { word_width };
+        if mid_line && self.col + advance > self.width {
+            self.end_line();
+            self.ensure_line();
+        } else if space {
+            self.append_raw(" ", self.palette.body);
+        }
+        self.space_pending = false;
+        self.append_raw(word, style);
+    }
+
+    /// Records that the next word should be preceded by a space (e.g. a Markdown soft break).
+    pub(crate) fn soft_break(&mut self) {
+        self.space_pending = true;
+    }
+
+    /// Appends one styled run verbatim — no wrapping, no auto-spacing (for code lines and tables).
     pub(crate) fn append(&mut self, text: &str, style: Style) {
+        self.space_pending = false;
+        self.append_raw(text, style);
+    }
+
+    /// Pushes a run onto the current line (starting it if needed), advancing the column.
+    fn append_raw(&mut self, text: &str, style: Style) {
         self.ensure_line();
         self.col += text_width(text);
         self.line.push((text.to_owned(), style));
@@ -265,6 +302,7 @@ impl<'a> LineBuilder<'a> {
         }
         self.prefix_width = self.col;
         self.line_started = true;
+        self.space_pending = false; // a fresh line never owes a leading space
     }
 
     /// Ends the current line (if started), pushing it to the output.
@@ -305,4 +343,52 @@ impl<'a> LineBuilder<'a> {
 /// The display width of `text` in terminal cells (wide glyphs count as two).
 pub(crate) fn text_width(text: &str) -> usize {
     text.chars().map(|c| usize::from(char_width(c))).sum()
+}
+
+/// Renders `rows` of plain-text cells as aligned columns separated by `│`, with a `─┼─` rule under the
+/// first `head_rows` header rows (header cells bold). Shared by the Markdown (GFM) and Texinfo
+/// (`@multitable`) parsers. Columns are sized to their widest cell; an over-wide table is clipped by
+/// the pane rather than wrapped (a follow-up).
+pub(crate) fn render_table(builder: &mut LineBuilder<'_>, rows: &[Vec<String>], head_rows: usize) {
+    if rows.is_empty() {
+        return;
+    }
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![0_usize; columns];
+    for row in rows {
+        for (column, cell) in row.iter().enumerate() {
+            widths[column] = widths[column].max(text_width(cell));
+        }
+    }
+    let (heading, body, rule) = {
+        let palette = builder.palette();
+        (palette.heading, palette.body, palette.rule)
+    };
+    builder.blank();
+    for (index, row) in rows.iter().enumerate() {
+        let style = if index < head_rows { heading } else { body };
+        for (column, &width) in widths.iter().enumerate() {
+            if column > 0 {
+                builder.append(" │ ", rule);
+            }
+            let cell = row.get(column).map_or("", String::as_str);
+            let padding = if column + 1 == columns {
+                String::new() // the last column needs no trailing padding
+            } else {
+                " ".repeat(width.saturating_sub(text_width(cell)))
+            };
+            builder.append(&format!("{cell}{padding}"), style);
+        }
+        builder.end_line();
+        if index + 1 == head_rows {
+            for (column, &width) in widths.iter().enumerate() {
+                if column > 0 {
+                    builder.append("─┼─", rule);
+                }
+                builder.append(&"─".repeat(width), rule);
+            }
+            builder.end_line();
+        }
+    }
+    builder.blank();
 }
