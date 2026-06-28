@@ -33,9 +33,9 @@ use keymaker::{KeyCode, KeyPress, Mods, Profile};
 use crate::agent_host::AgentHost;
 use crate::agent_panel::{AgentPanel, AGENT_COLS};
 use majestic_core::{
-    Action, CodeActions, Completion, Editor, FileTree, Finder, HelpOverlay, Hover, InfoReader,
-    Occurrence, Preview, PreviewKind, ProfileSelector, Prompt, References, RenameEdit, Search,
-    Session, SignatureHelp, Symbols, Workspace,
+    Action, CodeActions, Completion, Editor, FileTree, Finder, GitPanel, HelpOverlay, Hover,
+    InfoReader, Occurrence, Preview, PreviewKind, ProfileSelector, Prompt, References, RenameEdit,
+    Search, Session, SignatureHelp, Symbols, Workspace,
 };
 use majestic_lsp::{LspManager, LspOutcome, ServerHealth};
 use majestic_term::PtyTerminal;
@@ -202,6 +202,8 @@ enum PromptAction {
     GotoLine,
     /// Go to symbol in the project: the typed text queries `workspace/symbol`; matches open the picker.
     WorkspaceSymbol,
+    /// Commit the staged changes with the typed message (the Git panel's `c`).
+    GitCommit,
     /// Ask the Architect agent: the typed natural-language request starts an agent turn (`Ctrl+Shift+N`).
     #[cfg(feature = "agent")]
     AskAgent,
@@ -236,6 +238,8 @@ pub struct App {
     info: Option<InfoReader>,
     /// The rendered preview (Markdown/Texinfo) of the current buffer; `Some` while showing (modal, M4).
     preview: Option<Preview>,
+    /// The Magit-role Git status panel; `Some` while showing (modal, M4).
+    git: Option<GitPanel>,
     /// The first-run profile picker; `Some` until the user chooses (modal while open).
     selector: Option<ProfileSelector>,
     /// The LSP completion popup; `Some` while candidates are shown over the editor.
@@ -305,6 +309,7 @@ impl App {
             help: None,
             info: None,
             preview: None,
+            git: None,
             selector: None,
             completion: None,
             completion_anchor: 0,
@@ -656,6 +661,9 @@ impl App {
         if let Some(preview) = self.preview.as_mut() {
             // The rendered preview takes over the editor region (sidebar + status bar remain).
             preview.render(surface, main, theme);
+        } else if let Some(git) = self.git.as_mut() {
+            // The Git status panel takes over the editor region (sidebar + status bar remain).
+            git.render(surface, main, theme);
         } else if let Some(info) = self.info.as_mut() {
             // The Info reader takes over the editor region (the sidebar + status bar remain).
             info.render(surface, main, theme);
@@ -704,6 +712,7 @@ impl App {
             && self.help.is_none()
             && self.info.is_none()
             && self.preview.is_none()
+            && self.git.is_none()
             && self.selector.is_none()
         {
             if let Some(which_key) = self.workspace.which_key() {
@@ -1000,6 +1009,8 @@ impl App {
             self.info_key(key);
         } else if self.prompt.is_some() {
             self.prompt_key(key);
+        } else if self.git.is_some() {
+            self.git_key(key);
         } else {
             return false;
         }
@@ -1075,6 +1086,10 @@ impl App {
         }
         if key == PREVIEW_KEY {
             self.open_preview();
+            return Ok(());
+        }
+        if is_git_panel(key) {
+            self.open_git_panel();
             return Ok(());
         }
         if self.try_agent_key(key) {
@@ -1695,6 +1710,11 @@ impl App {
                     self.lsp.request_workspace_symbols(&path, input);
                 }
             }
+            PromptAction::GitCommit => {
+                if let Some(git) = self.git.as_mut() {
+                    git.commit(&input);
+                }
+            }
             #[cfg(feature = "agent")]
             PromptAction::AskAgent => self.ask_agent(&input),
             #[cfg(feature = "agent")]
@@ -2233,6 +2253,63 @@ impl App {
         self.preview = Some(Preview::new(source, title, kind));
     }
 
+    /// Opens (or refreshes) the Magit-role Git status panel (`Ctrl+Shift+G`). A no-op notice when the
+    /// project root is not a git work tree.
+    fn open_git_panel(&mut self) {
+        if let Some(git) = self.git.as_mut() {
+            git.refresh();
+            return;
+        }
+        let root = self.project_root();
+        match GitPanel::open(&root) {
+            Some(panel) => self.git = Some(panel),
+            None => self.workspace.set_status("not a git repository".to_owned()),
+        }
+    }
+
+    /// Routes a key to the Git panel: navigation, stage/unstage (`s`/`u`, `S`/`U` for all), commit
+    /// (`c`), diff (`d`), refresh (`g`/`r`), and close (`q`/`Esc`). The diff sub-view captures scroll.
+    fn git_key(&mut self, key: KeyPress) {
+        if self.git.as_ref().is_some_and(GitPanel::diff_open) {
+            if let Some(git) = self.git.as_mut() {
+                match key.code {
+                    KeyCode::Up => git.scroll_diff(-1),
+                    KeyCode::Down => git.scroll_diff(1),
+                    KeyCode::PageUp => git.scroll_diff(-10),
+                    KeyCode::PageDown | KeyCode::Char(' ') => git.scroll_diff(10),
+                    KeyCode::Char('q') | KeyCode::Escape => git.close_diff(),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Escape => self.git = None,
+            KeyCode::Char('c') => self.start_git_commit(),
+            _ => {
+                if let Some(git) = self.git.as_mut() {
+                    match key.code {
+                        KeyCode::Up => git.select(false),
+                        KeyCode::Down => git.select(true),
+                        KeyCode::Char('s') => git.stage(),
+                        KeyCode::Char('S') => git.stage_all(),
+                        KeyCode::Char('u') => git.unstage(),
+                        KeyCode::Char('U') => git.unstage_all(),
+                        KeyCode::Char('d') => git.show_diff(),
+                        KeyCode::Char('g' | 'r') => git.refresh(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Opens the commit-message prompt for the Git panel (`c`); confirming runs `git commit`.
+    fn start_git_commit(&mut self) {
+        self.prompt = Some(Prompt::new("Commit message", ""));
+        self.prompt_action = Some(PromptAction::GitCommit);
+    }
+
     /// Routes a key to the rendered preview: `F7`/`q`/`Esc` close it; arrows / page keys scroll.
     fn preview_key(&mut self, key: KeyPress) {
         if key == PREVIEW_KEY || key.code == KeyCode::Escape || key == KeyPress::char('q') {
@@ -2698,6 +2775,14 @@ fn is_agent_toggle(key: KeyPress) -> bool {
     key.mods.contains(Mods::CTRL)
         && key.mods.contains(Mods::SHIFT)
         && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a'))
+}
+
+/// Whether `key` opens the Magit-role Git status panel (`Ctrl+Shift+G`) — mnemonic, mirroring the
+/// agent's `Ctrl+Shift+A` (both rely on the Kitty keyboard protocol to disambiguate the chord).
+fn is_git_panel(key: KeyPress) -> bool {
+    key.mods.contains(Mods::CTRL)
+        && key.mods.contains(Mods::SHIFT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'g'))
 }
 
 /// Whether `key` is the agent-stop-all panic key (`Ctrl+Shift+K`) — engages the running agent's
