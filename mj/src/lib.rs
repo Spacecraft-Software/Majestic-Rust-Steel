@@ -23,6 +23,7 @@ mod agent_host;
 mod agent_panel;
 #[cfg(unix)]
 mod daemon_host;
+mod ed;
 mod tui;
 
 #[doc(inline)]
@@ -55,6 +56,8 @@ enum Action {
     Daemon(Option<String>),
     /// `attach`: attach this terminal to the running session daemon (WS3).
     Attach,
+    /// `ed [FILE]`: the classic line editor (M4).
+    Ed(Option<String>),
     /// A recognized subcommand that is not yet implemented.
     Pending(String),
     /// No arguments: would open an empty editor (not yet implemented).
@@ -80,10 +83,11 @@ fn classify(args: &[String]) -> Action {
         "session" => Action::Session(args.get(1).cloned()),
         "daemon" => Action::Daemon(args.get(1).cloned()),
         "attach" => Action::Attach,
+        "ed" => Action::Ed(args.get(1).cloned()),
         // `mj --daemon` is an alias for `mj daemon start` (the spelling in PRD §6.8).
         "--daemon" => Action::Daemon(Some("start".to_owned())),
         // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
-        "config" | "ed" => Action::Pending(first.clone()),
+        "config" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
         "--" => Action::Open(args[1..].to_vec()),
         other if other.starts_with('-') => Action::Unknown(other.to_owned()),
@@ -160,6 +164,7 @@ pub fn run() -> ExitCode {
         Action::Session(sub) => run_session(sub.as_deref()),
         Action::Daemon(sub) => run_daemon(sub.as_deref()),
         Action::Attach => run_attach(),
+        Action::Ed(file) => run_ed(file.as_deref()),
         Action::Pending(cmd) => {
             eprintln!("{PROGRAM}: subcommand `{cmd}` is not yet implemented (later milestone).");
             ExitCode::FAILURE
@@ -365,6 +370,17 @@ fn run_attach() -> ExitCode {
     {
         eprintln!("{PROGRAM}: attach requires a Unix platform");
         ExitCode::FAILURE
+    }
+}
+
+/// `mj ed [FILE]` — runs the classic line editor over stdin/stdout (M4), optionally loading `FILE`.
+fn run_ed(file: Option<&str>) -> ExitCode {
+    match ed::run(file) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{PROGRAM}: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -589,6 +605,11 @@ mod tests {
         assert_eq!(
             classify(&owned(&["config", "check"])),
             Action::Pending("config".to_owned())
+        );
+        assert_eq!(classify(&owned(&["ed"])), Action::Ed(None));
+        assert_eq!(
+            classify(&owned(&["ed", "notes.txt"])),
+            Action::Ed(Some("notes.txt".to_owned()))
         );
         assert_eq!(classify(&owned(&["session"])), Action::Session(None));
         assert_eq!(

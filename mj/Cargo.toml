@@ -59,6 +59,9 @@ majestic-steel = { version = "0.0.0", path = "../crates/majestic-steel" }
 majestic-term = { version = "0.0.0", path = "../crates/majestic-term" }
 oracle = { version = "0.0.0", path = "../crates/oracle" }
 penumbra = { version = "0.0.0", path = "../crates/penumbra" }
+# `mj ed` (the line editor, M4) compiles patterns for `/re/` addressing and `s///`. Already linked
+# transitively (syntect → fancy-regex → regex), so a direct dependency adds ~no binary size.
+regex = "1"
 # The attach wire messages (AttachInput / ServerFrame) derive serde.
 serde = { version = "1.0.228", features = ["derive"] }
 # Reads the `command` field out of a `shell` tool call's JSON arguments for the approval prompt.

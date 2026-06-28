@@ -2417,6 +2417,7 @@ dependencies = [
  "majestic-term",
  "oracle",
  "penumbra",
+ "regex",
  "seraph",
  "serde",
  "serde_json",
