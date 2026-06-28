@@ -14,7 +14,7 @@ description = "Majestic GPU renderer (wgpu + cosmic-text)."
 [dependencies]
 # The shared layout layer: Nova renders the same cell `Buffer` Penumbra emits to a TTY
 # (PRD-01 §6.5 renderer parity). Always built — the pure `Scene` model keeps `--workspace` cheap.
-penumbra = { version = "0.0.0", path = "../penumbra" }
+penumbra = { version = "0.1.0", path = "../penumbra" }
 
 # The GPU stack, behind the default-off `gpu` feature so `--workspace` gates don't rebuild it
 # (docs/nova.md §4). winit 0.30 (ApplicationHandler), wgpu's safe `create_surface` (no unsafe,
@@ -29,9 +29,9 @@ cosmic-text = { version = "0.19", optional = true }
 # The live editor (M4.4): `mj-nova` drives the same `App` the TTY does (the `majestic` lib), building a
 # workspace (`majestic-core`) and mapping winit keys to `keymaker::KeyPress`. wasm-bindgen-compatible
 # with wgpu 26 (both admit the 0.2.100 Nickel pins) — see docs/nova.md §3.
-majestic = { version = "0.0.0", path = "../../mj", optional = true }
-majestic-core = { version = "0.0.0", path = "../majestic-core", optional = true }
-keymaker = { version = "0.0.0", path = "../keymaker", optional = true }
+majestic = { version = "0.1.0", path = "../../mj", optional = true }
+majestic-core = { version = "0.1.0", path = "../majestic-core", optional = true }
+keymaker = { version = "0.1.0", path = "../keymaker", optional = true }
 
 # System-clipboard integration for the GUI (M4 polish): mirror copies/cuts out and pastes in. Best
 # effort — if it cannot reach the compositor's clipboard, the editor's own kill-ring still works.

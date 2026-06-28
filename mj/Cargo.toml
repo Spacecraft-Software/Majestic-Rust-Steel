@@ -44,21 +44,21 @@ grammars-all = ["majestic-core/grammars-all"]
 # the buffer tool bridge + off-thread runner, and Seraph's policy/kill switch. `http-provider` pulls
 # `ureq` (HTTP-only, small) — the chief reason the default binary sits just over the §7 25 MB target
 # while staying far under the 40 MB CI ceiling; `--no-default-features` drops all of this.
-architect = { version = "0.0.0", path = "../crates/architect", optional = true }
-majestic-agent = { version = "0.0.0", path = "../crates/majestic-agent", optional = true }
-seraph = { version = "0.0.0", path = "../crates/seraph", optional = true }
+architect = { version = "0.1.0", path = "../crates/architect", optional = true }
+majestic-agent = { version = "0.1.0", path = "../crates/majestic-agent", optional = true }
+seraph = { version = "0.1.0", path = "../crates/seraph", optional = true }
 # `serde` derives Serialize/Deserialize on the event types, so the attach client can forward
 # key/resize events to the daemon over the wire.
 crossterm = { version = "0.28", features = ["serde"] }
-keymaker = { version = "0.0.0", path = "../crates/keymaker" }
-majestic-config = { version = "0.0.0", path = "../crates/majestic-config" }
-majestic-core = { version = "0.0.0", path = "../crates/majestic-core" }
-majestic-daemon = { version = "0.0.0", path = "../crates/majestic-daemon" }
-majestic-lsp = { version = "0.0.0", path = "../crates/majestic-lsp" }
-majestic-steel = { version = "0.0.0", path = "../crates/majestic-steel" }
-majestic-term = { version = "0.0.0", path = "../crates/majestic-term" }
-oracle = { version = "0.0.0", path = "../crates/oracle" }
-penumbra = { version = "0.0.0", path = "../crates/penumbra" }
+keymaker = { version = "0.1.0", path = "../crates/keymaker" }
+majestic-config = { version = "0.1.0", path = "../crates/majestic-config" }
+majestic-core = { version = "0.1.0", path = "../crates/majestic-core" }
+majestic-daemon = { version = "0.1.0", path = "../crates/majestic-daemon" }
+majestic-lsp = { version = "0.1.0", path = "../crates/majestic-lsp" }
+majestic-steel = { version = "0.1.0", path = "../crates/majestic-steel" }
+majestic-term = { version = "0.1.0", path = "../crates/majestic-term" }
+oracle = { version = "0.1.0", path = "../crates/oracle" }
+penumbra = { version = "0.1.0", path = "../crates/penumbra" }
 # `mj ed` (the line editor, M4) compiles patterns for `/re/` addressing and `s///`. Already linked
 # transitively (syntect → fancy-regex → regex), so a direct dependency adds ~no binary size.
 regex = "1"

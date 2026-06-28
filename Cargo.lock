@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "architect"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "jiff",
  "seraph",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "keymaker"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "khronos-egl"
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "majestic"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "architect",
  "crossterm 0.28.1",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "majestic-agent"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "architect",
  "jiff",
@@ -2437,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "majestic-bench"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "keymaker",
  "majestic-core",
@@ -2447,11 +2447,11 @@ dependencies = [
 
 [[package]]
 name = "majestic-cli"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "majestic-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "nickel-lang-core",
  "seraph",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "majestic-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "keymaker",
  "oracle",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "majestic-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "majestic-core",
  "serde",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "majestic-lsp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lsp-types",
  "majestic-core",
@@ -2509,14 +2509,14 @@ dependencies = [
 
 [[package]]
 name = "majestic-steel"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "steel-core",
 ]
 
 [[package]]
 name = "majestic-term"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "mio",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "morpheus"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "moxcms"
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "nova"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "oracle"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "keymaker",
 ]
@@ -3402,7 +3402,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "penumbra"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "unicode-width 0.1.14",
 ]
@@ -4111,7 +4111,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "seraph"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "jiff",
@@ -4552,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "stratum"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
 ]

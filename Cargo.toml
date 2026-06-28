@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"                      # pre-M0; semver discipline begins at 1.0 (PRD §10 non-goal 6)
+version = "0.1.0"                      # first release (M0→M4 complete); semver discipline begins at 1.0 (PRD §10 non-goal 6)
 authors = ["Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>"]
 edition = "2021"
 rust-version = "1.90.0"               # MSRV — pinned and CI-enforced (PRD §6.1); stable toolchain only.
