@@ -12,9 +12,9 @@ repository.workspace = true
 description = "Bridges Architect's governed agent loop to the Majestic editor core: the tool surface."
 
 [dependencies]
-architect = { version = "0.0.0", path = "../architect" }
-majestic-core = { version = "0.0.0", path = "../majestic-core" }
-seraph = { version = "0.0.0", path = "../seraph" }
+architect = { version = "0.1.0", path = "../architect" }
+majestic-core = { version = "0.1.0", path = "../majestic-core" }
+seraph = { version = "0.1.0", path = "../seraph" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `AgentSession::run` stamps audit entries with the wall-clock time (Steelbore §12.5 UTC).

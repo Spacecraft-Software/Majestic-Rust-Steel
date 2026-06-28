@@ -14,8 +14,8 @@ description = "Majestic LSP client: JSON-RPC over a language server's stdio (PRD
 [dependencies]
 # The manager converts server diagnostics into the editor's `Diagnostic` (byte ranges). No cycle:
 # majestic-core does not depend on majestic-lsp.
-majestic-core = { version = "0.0.0", path = "../majestic-core" }
-morpheus = { version = "0.0.0", path = "../morpheus" }
+majestic-core = { version = "0.1.0", path = "../majestic-core" }
+morpheus = { version = "0.1.0", path = "../morpheus" }
 # The canonical LSP type definitions (initialize, sync, diagnostics, hover, …). Types-only.
 lsp-types = "0.97"
 serde = { version = "1.0.228", features = ["derive"] }

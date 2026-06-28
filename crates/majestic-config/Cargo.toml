@@ -19,4 +19,4 @@ nickel-lang-core = "0.18"
 serde = { version = "1.0.228", features = ["derive"] }
 # Seraph's agent-governance policy is part of the declarative manifest (PRD #1 §5.2.4); the loader
 # deserializes the manifest's `seraph` section straight into `seraph::Policy`.
-seraph = { version = "0.0.0", path = "../seraph" }
+seraph = { version = "0.1.0", path = "../seraph" }
