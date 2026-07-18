@@ -63,7 +63,7 @@ shared spine across all five concepts; C1 implements it in Rust + Steel.
 - **TUI (Penumbra) — primary, *is* the product.** Full-screen terminal UI working on the
   bare Linux console, every mainstream emulator, and over SSH (`emacs -nw`/`msedit` class).
 - **CLI line-editor mode (M4)** — `ed`-style non-visual surface for agentic/scripted use,
-  governed by the Spacecraft Dual-Mode CLI Standard (SFRS): `--json`, structured errors,
+  governed by the Spacecraft Software Dual-Mode Self-Documenting CLI Standard (v1.0.0): `--json`, structured errors,
   agent env-var detection.
 - **GUI (Nova, M4)** — wgpu-rendered; same document model, keymaps, config. In GUI mode the
   embedded terminal makes Majestic a standalone terminal emulator.
@@ -169,7 +169,7 @@ majestic/                       # Cargo workspace — GPL-3.0-or-later, REUSE-cl
 │   ├── majestic-config/        # Nickel manifest schema + Steel config loader, safe mode
 │   ├── majestic-steel/         # Steel runtime embedding + extension API surface
 │   ├── majestic-core/          # Buffers, windows, modes, commands, sessions (composes above)
-│   └── majestic-cli/           # SFRS CLI plumbing (--json, errors, agent detection)
+│   └── majestic-cli/           # CLI-Standard-compliant CLI plumbing (--json, errors, agent detection)
 ├── mj/                         # The thin binary crate
 ├── extensions/                 # First-party Steel extensions (shipped, pinned)
 ├── themes/steelbore.*          # §9.1 named theme (canonical)
@@ -248,7 +248,7 @@ Implements Standard §3.2 (concurrency designed-in):
   resurrection. **Local-only — no TCP listener in v1** (keeps GPL-vs-AGPL & PFA trivial).
 - **IDE (M2):** LSP client (Helix-grade), tree-sitter incremental parsing on background
   snapshots, fuzzy finder + file tree as built-in extensions.
-- **CLI (SFRS):** `mj [FILE...]`; subcommands noun-verb, dual-mode, `--json`:
+- **CLI (per the CLI Standard):** `mj [FILE...]`; subcommands noun-verb, dual-mode, `--json`:
   `mj config check`, `mj session list|attach|kill`, `mj describe key|function <name>`,
   `--version`/`--help` with §13.2 attribution. Agent env-var detection (`AI_AGENT`,
   `CLAUDECODE`, …) switches to machine-friendly output. `mj ed` line mode at M4.
@@ -327,7 +327,7 @@ dependency-ordered build order for a fresh implementation.
    test executor** (gates every later concurrent feature).
 4. **`penumbra`:** cell framebuffer + frame diff + crossterm input decode; single window.
 5. **`keymaker`:** prefix-tree keymaps + **CUA profile only**.
-6. **`majestic-core`** (compose) + **`majestic-cli`** (minimal SFRS plumbing) → **`mj FILE`**
+6. **`majestic-core`** (compose) + **`majestic-cli`** (minimal CLI-Standard plumbing) → **`mj FILE`**
    opens/edits/saves. (`majestic-cli`'s `--json`/subcommand surface grows M1→M4.)
 **Exit:** all §3.2 stability gates pass; SIGKILL test passes; maintainer dogfoods for one
 week without data loss.

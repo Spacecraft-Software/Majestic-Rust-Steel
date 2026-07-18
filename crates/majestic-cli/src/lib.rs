@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Majestic SFRS CLI plumbing: --json, structured errors, agent detection.
+//! Majestic CLI-Standard-compliant CLI plumbing: --json, structured errors, agent detection.
 //!
 //! Part of [Majestic](https://Majestic.SpacecraftSoftware.org/) — Concept #1 (Rust + Steel).
 //! Grows M1 to M4.

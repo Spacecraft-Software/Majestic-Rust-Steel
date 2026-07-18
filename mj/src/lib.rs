@@ -86,7 +86,7 @@ fn classify(args: &[String]) -> Action {
         "ed" => Action::Ed(args.get(1).cloned()),
         // `mj --daemon` is an alias for `mj daemon start` (the spelling in PRD §6.8).
         "--daemon" => Action::Daemon(Some("start".to_owned())),
-        // Recognized noun-verb subcommands (SFRS); implemented in later milestones.
+        // Recognized noun-verb subcommands (per the CLI Standard); implemented in later milestones.
         "config" => Action::Pending(first.clone()),
         // `--` terminates option parsing; everything after is a file path.
         "--" => Action::Open(args[1..].to_vec()),

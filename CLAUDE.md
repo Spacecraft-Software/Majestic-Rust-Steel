@@ -62,7 +62,7 @@ Known breaches are tracked, not enforced (see the harness output). Debug `--chec
 
 **Engine crates** (reusable libraries; Concepts #3/#4 reuse these): `stratum` (rope, snapshots, anchors, undo tree, append-only journal) · `penumbra` (TTY framebuffer-diff renderer over crossterm/ratatui) · `nova` (wgpu GPU stub, M4) · `keymaker` (prefix-tree keymaps, profiles, runtime-rebindable) · `oracle` (live help/introspection) · `seraph` (AI guardrail/policy/audit, M3) · `architect` (agent loop, M3) · `morpheus` (foreground/background executors, event bus, deterministic test executor).
 
-**Integration crates:** `majestic-core` (composes the engine into buffers/windows/modes/commands/sessions) · `majestic-term` (alacritty_terminal PTY widget) · `majestic-config` (Nickel manifest + Steel loader + safe mode) · `majestic-steel` (Steel embedding + extension API) · `majestic-cli` (SFRS CLI plumbing). **Binary:** `mj/` (thin; package `majestic`).
+**Integration crates:** `majestic-core` (composes the engine into buffers/windows/modes/commands/sessions) · `majestic-term` (alacritty_terminal PTY widget) · `majestic-config` (Nickel manifest + Steel loader + safe mode) · `majestic-steel` (Steel embedding + extension API) · `majestic-cli` (CLI-Standard-compliant CLI plumbing). **Binary:** `mj/` (thin; package `majestic`).
 
 **Core data model** (`crates/majestic-core/src/`):
 - `Document` (`buffer.rs`) — `Rc<RefCell<>>` shared text: rope + `UndoTree` (branching, persisted) + WAL journal + revision counter.
