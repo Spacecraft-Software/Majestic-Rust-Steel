@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Mohamed Hammad <Mohamed.Hammad@SpacecraftSoftware.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Steelbore Standard §6.5 — Text File Format.
+#
+# .gitattributes and .editorconfig are advisory to the tools that read them,
+# and neither stops CRLF committed by a tool that reads neither. §6.5 makes
+# the gate the binding part.
+#
+# The gate reads the INDEX, not the working tree. `git ls-files --eol` reports
+# the stored line ending as i/lf, i/crlf or i/mixed; anything but i/lf is CRLF
+# in the repository. Grepping the working tree for a CR byte is wrong: a file
+# pinned `eol=crlf` is stored LF and checked out CRLF by design, so a
+# working-tree grep fails the very exception §6.5 grants. A path pinned
+# `-text` is declared binary and is not a text file at all, so it is skipped:
+# its blob keeps whatever bytes it has.
+name: Text file format
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  line-endings:
+    name: LF line endings (§6.5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No CRLF stored in tracked text files
+        run: |
+          bad=$(git ls-files --eol | awk -F'\t' '$1 ~ /i\/(crlf|mixed)/ && $1 !~ /-text/ {print $2}')
+          if [ -n "$bad" ]; then
+            echo "::error::CRLF stored in tracked text files — §6.5 requires LF"
+            echo "$bad"
+            exit 1
+          fi
